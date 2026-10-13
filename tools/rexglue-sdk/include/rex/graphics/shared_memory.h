@@ -10,12 +10,8 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <atomic>
 #include <cstdint>
-#include <memory>
 #include <mutex>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -79,43 +75,9 @@ class SharedMemory {
 
   // Checks if the range has been updated, uploads new data if needed and
   // ensures the host GPU memory backing the range are resident. Returns true if
-  // the range has been fully updated and is usable. allow_streamed is for
-  // vertex and index data that only the current draw reads: with
-  // gpu_stream_dynamic_pages, pages the game rewrites every frame are then
-  // uploaded without being made valid or write-protected (so they're uploaded
-  // again on every such request, and never go stale).
-  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count,
-                     bool allow_streamed = false);
-  bool RequestRange(uint32_t start, uint32_t length, bool allow_streamed = false);
-  // Detect changes to a native upload without declaring the mirror valid.
-  bool WatchCpuMemoryRange(uint32_t start, uint32_t length);
-  // Force CPU-owned texture inputs to be captured again by a new trace.
-  void InvalidateCpuMemoryRangeForTrace(uint32_t start, uint32_t length);
-
-  // Call once per guest frame, on the command processor thread, to update
-  // which pages count as streamed (see RequestRanges).
-  void OnGuestFrameEnd();
-
-  // Diagnostics (shared_memory_census): records a use of the mirror by the
-  // code at the return address caller, with a kind (1 + the backend's usage,
-  // or one of the kinds below for the scaled resolve buffer and copies of
-  // native resolve results into either).
-  static constexpr uint32_t kCensusKindScaledRead = 16;
-  static constexpr uint32_t kCensusKindScaledWrite = 17;
-  static constexpr uint32_t kCensusKindWriteBack = 18;
-  static constexpr uint32_t kCensusKindScaledWriteBack = 19;
-  static bool CensusEnabled();
-  static void CensusRecord(const void* caller, uint32_t kind, uint64_t bytes);
-  // The code a copy of native resolve results into a mirror is attributed to
-  // (set around the call that makes the copy happen).
-  static const void*& CensusTrigger();
-  // Diagnostics: the function at a code address, with the offset into it.
-  static std::string DescribeCodeAddress(const void* address);
-
-  // For the trace player, which reports the memory it writes with exact
-  // invalidations (no write faults): counts the writes as write faults, so
-  // pages the trace rewrites every frame become streamed like in the game.
-  void MarkRangeFaultedForStreaming(uint32_t start, uint32_t length);
+  // the range has been fully updated and is usable.
+  bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+  bool RequestRange(uint32_t start, uint32_t length);
 
   // Marks the range and, if not exact_range, potentially its surroundings
   // (to up to the first GPU-written page, as an access violation exception
@@ -132,33 +94,25 @@ class SharedMemory {
   // the pages they touch, the CPU data is properly loaded to the unmodified
   // regions in those pages.
   void RangeWrittenByGpu(uint32_t start, uint32_t length);
-  // A CPU snapshot cannot replace GPU-generated data that has not been read
-  // back. Checks whole pages, so a neighboring GPU write also keeps the range
-  // on the shared-memory path.
-  bool IsRangeGpuWritten(uint32_t start, uint32_t length);
-  // Whether the host GPU buffer has memory behind a guest physical address
-  // (always with a non-sparse buffer).
-  uint32_t host_gpu_memory_sparse_granularity_log2_public() const {
-    return host_gpu_memory_sparse_granularity_log2_;
-  }
-  bool IsHostGpuMemoryAllocated(uint32_t address) const {
-    if (host_gpu_memory_sparse_granularity_log2_ == UINT32_MAX) {
-      return true;
-    }
-    uint32_t allocation = address >> host_gpu_memory_sparse_granularity_log2_;
-    return (host_gpu_memory_sparse_allocated_[allocation >> 6] >> (allocation & 63)) & 1;
+
+  // Pages the CPU rewrote after the GPU last used them, uploaded in one batch
+  // at a moment the caller picks (a render pass boundary on tiled GPUs), so a
+  // draw in the middle of a pass rarely finds its pages stale. Only pages that
+  // draws requested this frame or the previous one are uploaded, so memory the
+  // title has moved on from is not re-uploaded and re-protected.
+  bool UploadDirtyPages();
+  // Ages the "requested recently" set; call once per guest frame.
+  void NewFrameUsage();
+
+  // Read tracking for backends that can write the GPU copy directly (unified
+  // memory): RequestRanges records the submission that last read each page.
+  void EnableReadTracking();
+  void SetReadTrackingSubmission(uint64_t submission, uint64_t completed) {
+    read_tracking_submission_ = submission;
+    read_tracking_completed_ = completed;
   }
 
  protected:
-  // Creates the host GPU buffer if the implementation creates it only when
-  // first needed. Called before anything uses the mirror.
-  virtual bool EnsureHostBuffer() { return true; }
-  // Native GPU resources may hold newer bytes than the compatibility mirror.
-  // Called before requesting or overwriting a mirror range.
-  virtual bool FlushGpuWrittenRange(uint32_t /*start*/, uint32_t /*length*/,
-                                    bool /*writing*/ = false) {
-    return true;
-  }
   SharedMemory(memory::Memory& memory);
   // Call in implementation-specific initialization.
   void InitializeCommon();
@@ -192,6 +146,34 @@ class SharedMemory {
   // Mark the memory range as updated and protect it.
   void MakeRangeValid(uint32_t start, uint32_t length, bool written_by_gpu);
 
+  // Whether the GPU copy of a page may be overwritten from the CPU right now:
+  // no queued copy targets it, and any queued or in-flight reader only reads
+  // bytes whose content is unchanged (needs EnableReadTracking). gpu_page is
+  // the page's current contents in the host-visible GPU buffer.
+  bool PageDirectWritable(uint32_t page, uint64_t completed_submission,
+                          const uint8_t* gpu_page) const;
+  // Whether work recorded in the current submission already reads the page or
+  // copies into it - a CPU write applied before the submission starts would
+  // then be seen by commands recorded before the write.
+  // Latest submission that reads or copies into the page (0 without tracking).
+  uint64_t PageLastGpuUse(uint32_t page) const {
+    return page < page_last_read_submission_.size()
+               ? std::max(page_last_read_submission_[page],
+                          page_last_staged_copy_submission_[page])
+               : 0;
+  }
+  uint64_t read_tracking_submission() const { return read_tracking_submission_; }
+  bool PageTouchedInCurrentSubmission(uint32_t page) const {
+    return page < page_last_read_submission_.size() &&
+           (page_last_read_submission_[page] >= read_tracking_submission_ ||
+            page_last_staged_copy_submission_[page] >= read_tracking_submission_);
+  }
+  void MarkPagesStagedCopy(uint32_t page_first, uint32_t page_count) {
+    for (uint32_t i = 0; i < page_count; ++i) {
+      page_last_staged_copy_submission_[page_first + i] = read_tracking_submission_;
+    }
+  }
+
   // Uploads a range of host pages - only called if host GPU sparse memory
   // allocation succeeded if needed. While uploading, MakeRangeValid must be
   // called for each successfully uploaded range as early as possible, before
@@ -202,27 +184,6 @@ class SharedMemory {
   // overall bounds of pages to be uploaded.
   virtual bool UploadRanges(
       const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) = 0;
-  static void CensusLog();
-  // For UploadRanges, after MakeRangeValid: copies guest pages to the upload
-  // buffer, remembering what streamed pages were uploaded with (see
-  // streamed_page_shadows_).
-  void CopyPagesForUpload(uint32_t page_first, uint32_t page_count, uint8_t* dest);
-  // Set by implementations whose UploadRanges copies with CopyPagesForUpload.
-  bool streamed_page_shadows_supported_ = false;
-
-  const std::vector<std::pair<uint32_t, uint32_t>>& trace_download_ranges() {
-    return trace_download_ranges_;
-  }
-  uint32_t trace_download_page_count() const { return trace_download_page_count_; }
-  // Fills trace_download_ranges() and trace_download_page_count() with
-  // GPU-written ranges that need to be downloaded, and also invalidates
-  // non-GPU-written ranges so only the needed data - not the all the collected
-  // data - will be written in the trace. trace_download_page_count() will be 0
-  // if nothing to download.
-  void PrepareForTraceDownload();
-  // Release memory used for trace download ranges, to be called after
-  // downloading or in cases when download is dropped.
-  void ReleaseTraceDownloadRanges();
 
  private:
   memory::Memory& memory_;
@@ -233,12 +194,6 @@ class SharedMemory {
   uint32_t page_size_log2_;
 
   bool EnsureHostGpuMemoryAllocated(uint32_t start, uint32_t length);
-
-  // Shared tail of RequestRanges, taking ranges that are already bounds-checked,
-  // merged and backed by host GPU memory. Lets a single-range request skip
-  // building and sorting a vector. original_count is only for the profiler.
-  bool RequestValidatedRanges(const std::pair<uint32_t, uint32_t>* merged_ranges,
-                              size_t merged_count, size_t original_count, bool allow_streamed);
   uint32_t host_gpu_memory_sparse_granularity_log2_ = UINT32_MAX;
   std::vector<uint64_t> host_gpu_memory_sparse_allocated_;
   uint32_t host_gpu_memory_sparse_allocations_ = 0;
@@ -251,10 +206,6 @@ class SharedMemory {
   // persistently allocated vector).
   std::vector<std::pair<uint32_t, uint32_t>> upload_ranges_;
 
-  // GPU-written memory downloading for traces. <Start address, length>.
-  std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
-  uint32_t trace_download_page_count_ = 0;
-
   // Mutex between the guest memory subsystem and the command processor, to be
   // locked when checking or updating validity of pages/ranges and when firing
   // watches.
@@ -264,64 +215,23 @@ class SharedMemory {
   // Things below should be fully protected by global_critical_region.
   // ***************************************************************************
 
-  // Valid-page flags. Every mutation happens under global_critical_region;
-  // the all-valid fast path in RequestRanges reads them without the lock,
-  // which is why the storage is a stable allocation whose address never
-  // changes for the lifetime of the buffer.
-  //
-  // This used to be double-buffered with an active/staging pointer swap at
-  // frame end so the frame-end refresh could run lock-free. That was unsound:
-  // the swap raced guest-thread invalidations (which load the active pointer
-  // under the lock, then clear bits through it), so a clear could land in the
-  // buffer being retired while the promoted buffer kept a stale VALID bit for
-  // a page the guest had just rewritten. RequestRanges then took its
-  // all-valid fast path and skipped the upload entirely, leaving the GPU
-  // reading the previous frame's bytes for that page. Refreshing only "dirty"
-  // 16 MB superblocks made it worse: untouched superblocks of the promoted
-  // buffer were a two-frame-old snapshot.
+  // Submission that last read each page, and the byte span of the page read
+  // since it last had no pending readers (empty without read tracking).
+  std::vector<uint64_t> page_last_read_submission_;
+  std::vector<uint64_t> page_last_staged_copy_submission_;
+  std::vector<uint32_t> page_read_span_;  // low 16 bits: first byte, high 16: end
+  uint64_t read_tracking_submission_ = 0;
+  uint64_t read_tracking_completed_ = 0;
+  // Pages that were valid and got invalidated by a CPU write since.
+  std::vector<uint64_t> system_page_flags_dirty_;
+  // Pages requested by draws this frame and the previous one (GPU thread).
+  std::vector<uint64_t> system_page_flags_used_current_;
+  std::vector<uint64_t> system_page_flags_used_previous_;
+  // Pages whose contents in the buffer are in sync with guest memory.
   std::vector<uint64_t> system_page_flags_valid_;
-  std::atomic<uint64_t*> valid_flags_{nullptr};
   // Subset of valid pages containing data written by the GPU.
   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
   uint32_t num_system_page_flags_ = 0;
-
-  // gpu_stream_dynamic_pages: pages the game rewrites every frame. Requests
-  // with allow_streamed upload them without making them valid or protecting
-  // them, saving a protection change and a guest write fault per page per
-  // frame. A page is streamed after write faults in two frames in a row, and
-  // the set is re-learned every kStreamedPagesResetFrames frames. Only the
-  // command processor thread changes the streamed set (under the global
-  // critical region); guest threads set the faulted bits.
-  static constexpr uint32_t kStreamedPagesResetFrames = 600;
-  // A streamed page uploaded more times than this in one frame (used by very
-  // many draws) is cheaper to protect: it goes back to being watched, and
-  // can't be streamed again until the next reset. An extra 4 KB upload costs
-  // well under a microsecond, a protection change plus the write fault that
-  // undoes it about 25. A cap of 4 sent enough Springfield pages back to
-  // being watched to cost about 1 FPS there.
-  static constexpr uint8_t kStreamedPageMaxUploadsPerFrame = 64;
-  std::vector<uint64_t> system_page_flags_streamed_;
-  std::vector<uint64_t> system_page_flags_streamed_blocked_;
-  std::vector<uint64_t> system_page_flags_faulted_;
-  std::vector<uint64_t> system_page_flags_faulted_previous_;
-  std::vector<uint8_t> streamed_page_uploads_this_frame_;
-  uint32_t streamed_pages_frames_ = 0;
-  bool streamed_pages_active_ = false;
-  // Set while RequestValidatedRanges uploads for an allow_streamed request,
-  // read by MakeRangeValid (both on the command processor thread).
-  bool upload_allow_streamed_ = false;
-  // gpu_stream_skip_unchanged: the bytes each streamed page was last uploaded
-  // with, which is what the GPU copy of the page holds until anything else
-  // changes it (another upload, or a GPU write, which erase the copy here). A
-  // streamed request whose bytes in the page still match skips the page's
-  // upload: a streamed page usually changes because of other data sharing it,
-  // and draws reusing a buffer would otherwise upload it again each time (each
-  // upload waits for the GPU to finish all earlier work). Only touched on the
-  // command processor thread.
-  std::unordered_map<uint32_t, std::unique_ptr<uint8_t[]>> streamed_page_shadows_;
-  std::vector<std::pair<uint32_t, uint32_t>> kept_upload_ranges_;
-  void DropUnchangedStreamedPages(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
-  void EraseStreamedPageShadows(uint32_t page_first, uint32_t page_last);
 
   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
       void* context_ptr, uint32_t physical_address_start, uint32_t length, bool exact_range);
@@ -380,13 +290,6 @@ class SharedMemory {
   // Triggers the watches (global and per-range), removing triggered range
   // watches.
   void FireWatches(uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
-  // Same, for callers already holding the global critical region (pass the
-  // held lock as proof) -- avoids a redundant recursive re-acquire on the
-  // CPU-write-fault invalidation path, which fires tens of thousands of
-  // times during level streaming (see mmio_handler.cpp's exception-handler
-  // comment).
-  void FireWatchesLocked(const std::unique_lock<std::recursive_mutex>& global_lock,
-                         uint32_t page_first, uint32_t page_last, bool invalidated_by_gpu);
   // Unlinks and frees the range and its nodes. Call this in the global critical
   // region.
   void UnlinkWatchRange(WatchRange* range);

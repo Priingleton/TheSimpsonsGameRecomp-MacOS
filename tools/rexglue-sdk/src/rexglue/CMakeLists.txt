@@ -6,10 +6,12 @@ add_executable(rexglue
     ui/progress.cpp
     commands/codegen_command.cpp
     commands/init_command.cpp
+    commands/dump_command.cpp
     commands/test_recompiler.cpp
-    commands/migration_scan.cpp
-    commands/legacy_config.cpp
+    commands/project_scan.cpp
 )
+
+rex_config_postfix(rexglue)
 
 target_include_directories(rexglue
     PRIVATE
@@ -21,7 +23,10 @@ target_include_directories(rexglue
 target_link_libraries(rexglue
     PRIVATE
         rexcodegen
+        rexfilesystem
 )
+
+rex_target_pch(rexglue <CLI/CLI.hpp>)
 
 # Delay-load FidelityFX DLLs so rexglue can run in tool mode without them.
 if(WIN32)

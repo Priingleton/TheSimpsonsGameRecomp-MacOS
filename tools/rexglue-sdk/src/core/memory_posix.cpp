@@ -6,7 +6,7 @@
  * Released under the BSD license - see LICENSE in the root for more details. *
  ******************************************************************************
  *
- * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Tom Clay & Rien Gupta, 2026 - Adapted for ReXGlue runtime (POSIX + macOS)
  */
 
 #include <cerrno>
@@ -14,17 +14,44 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <string>
 
+#include <cstdlib>
+
 #include <fcntl.h>
+
+#if REX_PLATFORM_MAC
+#include <mach/mach.h>
+#if !REX_PLATFORM_IOS
+// iOS ships mach/mach_vm.h as a hard "#error mach_vm.h unsupported." The
+// mach_vm_* entry points it declares are unavailable there; vm_region_64 from
+// mach/vm_map.h (pulled in by mach/mach.h) is public, and is the same call for
+// a 64-bit process since vm_address_t/vm_size_t are 64-bit on arm64.
+#include <mach/mach_vm.h>
+#endif
+#include <mach/vm_region.h>
+#endif  // REX_PLATFORM_MAC
+
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory/utils.h>
 #include <rex/platform.h>
 #include <rex/string.h>
+
+// macOS off_t is 64-bit with no *64 large-file variants; Linux keeps the
+// explicit *64 forms for legacy 32-bit off_t distributions.
+#if defined(__APPLE__)
+#define rex_mmap64 mmap
+#define rex_ftruncate64 ftruncate
+#else
+#define rex_mmap64 mmap64
+#define rex_ftruncate64 ftruncate64
+#endif
 
 #if REX_PLATFORM_ANDROID
 #include <string.h>
@@ -34,23 +61,33 @@
 
 #include <linux/ashmem.h>
 
-// TODO(tomc): Android or maybe na. idk
-// #include "xenia/base/main_android.h"
+#include <rex/main_android.h>
 #endif
 
 namespace rex {
 namespace memory {
 
-// Convert filesystem path to valid shm_open name (must start with /, no other slashes)
+// Convert a filesystem path to a valid shm_open name (must start with /, no other slashes).
+// macOS enforces a 31-character total limit, so long names are folded from the full path rather
+// than only the filename. This keeps equal filenames in different directories distinct.
 static std::string MakeShmName(const std::filesystem::path& path) {
   std::string name = path.string();
   for (char& c : name) {
-    if (c == '/')
+    if (c == '/') {
       c = '_';
+    }
   }
   if (name.empty() || name[0] != '/') {
     name.insert(name.begin(), '/');
   }
+#if REX_PLATFORM_MAC
+  if (name.size() > 30) {
+    const std::size_t h = std::hash<std::string>{}(name);
+    char hash_buf[24];
+    std::snprintf(hash_buf, sizeof(hash_buf), "/%016zx", h);
+    name = hash_buf;
+  }
+#endif
   return name;
 }
 
@@ -107,7 +144,13 @@ uint32_t ToPosixProtectFlags(PageAccess access) {
 }
 
 bool IsWritableExecutableMemorySupported() {
+#if REX_PLATFORM_MAC
+  // macOS enforces W^X on Apple Silicon. Shared file mappings cannot be both
+  // writable and executable. The code cache must use separate RW and RX views.
+  return false;
+#else
   return true;
+#endif
 }
 
 // TODO(tomc): this needs to go somewhere else. we should utilize the platform namespace more.
@@ -222,9 +265,33 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
       break;
   }
 
-  // Build flags - always use MAP_FIXED_NOREPLACE for fixed addresses
+    // On macOS, MAP_FIXED_NOREPLACE is unavailable. kCommit on a pre-reserved
+    // range uses mprotect to avoid clobbering the existing reservation. Do not
+    // widen sub-host-page requests here - higher-level guest heaps must reconcile
+    // all guest permissions sharing a host page first.
+#if REX_PLATFORM_MAC
+  if (base_address != nullptr && allocation_type == AllocationType::kCommit) {
+    const size_t host_page = page_size();
+    const uintptr_t address = reinterpret_cast<uintptr_t>(base_address);
+    if ((address % host_page) != 0 || (length % host_page) != 0) {
+      return nullptr;
+    }
+    if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+      return base_address;
+    }
+    return nullptr;
+  }
+#endif
+
   int flags = MAP_PRIVATE | MAP_ANONYMOUS;
-#if defined(MAP_FIXED_NOREPLACE)
+#if REX_PLATFORM_MAC
+  if (access == PageAccess::kExecuteReadWrite || access == PageAccess::kExecuteReadOnly) {
+    flags |= MAP_JIT;
+  }
+  if (base_address) {
+    flags |= MAP_FIXED;
+  }
+#elif defined(MAP_FIXED_NOREPLACE)
   if (base_address) {
     flags |= MAP_FIXED_NOREPLACE;
   }
@@ -283,7 +350,14 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
     *out_old_access = PageAccess::kNoAccess;
   }
 
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_MAC
+  // mprotect doesn't report the previous protection. Query the Mach region
+  // before changing it so this matches VirtualProtect's out parameter.
+  if (out_old_access) {
+    size_t old_region_length = 0;
+    QueryProtect(base_address, old_region_length, *out_old_access);
+  }
+#elif REX_PLATFORM_LINUX
   // NOTE(tomc): we may want to look at doing this differently. it should work for now
   //             but there is a TOCTOU window between reading and changing.
   //             This really shouldn't be an issue since VirtualProtect on Windows isn't truly
@@ -298,11 +372,66 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-  return mprotect(base_address, length, prot) == 0;
+  int ret = mprotect(base_address, length, prot);
+  if (ret != 0) {
+    REXSYS_ERROR("mprotect({}, 0x{:X}, {}) failed: {} ({})", base_address, length, prot,
+                 strerror(errno), errno);
+  }
+  return ret == 0;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
-#if !REX_PLATFORM_LINUX
+#if REX_PLATFORM_MAC
+#if REX_PLATFORM_IOS
+  using rex_vm_address_t = vm_address_t;
+  using rex_vm_size_t = vm_size_t;
+#else
+  using rex_vm_address_t = mach_vm_address_t;
+  using rex_vm_size_t = mach_vm_size_t;
+#endif
+  static_assert(sizeof(rex_vm_address_t) == sizeof(void*),
+                "QueryProtect assumes a 64-bit VM address type");
+
+  rex_vm_address_t address = reinterpret_cast<rex_vm_address_t>(base_address);
+  rex_vm_size_t region_size = 0;
+  vm_region_basic_info_data_64_t info;
+  mach_msg_type_number_t info_count = VM_REGION_BASIC_INFO_COUNT_64;
+  mach_port_t object_name;
+
+#if REX_PLATFORM_IOS
+  kern_return_t kr =
+      vm_region_64(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                   reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+#else
+  kern_return_t kr =
+      mach_vm_region(mach_task_self(), &address, &region_size, VM_REGION_BASIC_INFO_64,
+                     reinterpret_cast<vm_region_info_t>(&info), &info_count, &object_name);
+#endif
+  if (kr != KERN_SUCCESS) {
+    return false;
+  }
+  if (address > reinterpret_cast<rex_vm_address_t>(base_address)) {
+    return false;
+  }
+
+  length = static_cast<size_t>((address + region_size) -
+                               reinterpret_cast<rex_vm_address_t>(base_address));
+
+  if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) ==
+      (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)) {
+    access_out = PageAccess::kExecuteReadWrite;
+  } else if ((info.protection & (VM_PROT_READ | VM_PROT_EXECUTE)) ==
+             (VM_PROT_READ | VM_PROT_EXECUTE)) {
+    access_out = PageAccess::kExecuteReadOnly;
+  } else if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE)) {
+    access_out = PageAccess::kReadWrite;
+  } else if (info.protection & VM_PROT_READ) {
+    access_out = PageAccess::kReadOnly;
+  } else {
+    access_out = PageAccess::kNoAccess;
+  }
+  return true;
+#elif !REX_PLATFORM_LINUX
   access_out = PageAccess::kNoAccess;
   length = 0;
   return false;
@@ -367,30 +496,58 @@ FileMappingHandle CreateFileMappingHandle(const std::filesystem::path& path, siz
       return kFileMappingHandleInvalid;
   }
   oflag |= O_CREAT;
+#if REX_PLATFORM_MAC
+  // Apple sandboxes does not grant POSIX shared memory: shm_open fails, and the
+  // guest arena (~4.5 GB) can never be created, which fails Memory::Initialize
+  // with "Unable to reserve the 4gb guest address space". Back the mapping with
+  // an ordinary file in the app container's temporary directory instead. It is
+  // unlinked immediately so it cannot outlive the process, and APFS keeps it
+  // sparse -- only pages actually touched occupy storage. mmap(MAP_SHARED) over
+  // it supports mapping one object at several addresses, which is what the
+  // virtual/physical membase aliasing needs.
+  (void)oflag;
+  const char* tmp_dir = std::getenv("TMPDIR");
+  std::string file_path = (tmp_dir && tmp_dir[0]) ? tmp_dir : "/tmp";
+  if (file_path.back() != '/') {
+    file_path.push_back('/');
+  }
+  file_path += "rex-arena-XXXXXX";
+  int ret = mkstemp(file_path.data());
+  if (ret < 0) {
+    return kFileMappingHandleInvalid;
+  }
+  // Unlink up front: the fd keeps the inode alive for as long as it is mapped.
+  unlink(file_path.c_str());
+  if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+    close(ret);
+    return kFileMappingHandleInvalid;
+  }
+  return static_cast<FileMappingHandle>(ret);
+#else
   auto full_path = MakeShmName(path);
   int ret = shm_open(full_path.c_str(), oflag, 0777);
   if (ret < 0) {
     return kFileMappingHandleInvalid;
   }
-  if (ftruncate64(ret, static_cast<off_t>(length)) != 0) {
+  if (rex_ftruncate64(ret, static_cast<off_t>(length)) != 0) {
     close(ret);
     shm_unlink(full_path.c_str());
     return kFileMappingHandleInvalid;
   }
-  // The descriptor keeps the object alive and every view maps it, so the name
-  // is no longer needed. Without it, a crashed or killed process cannot leave
-  // the file in /dev/shm, where each copy kept the memory the game had used
-  // until a reboot, and once it was full the next start died of SIGBUS.
-  shm_unlink(full_path.c_str());
   return static_cast<FileMappingHandle>(ret);
+#endif
 #endif
 }
 
 void CloseFileMappingHandle(FileMappingHandle handle, const std::filesystem::path& path) {
   close(static_cast<int>(handle));
-#if !REX_PLATFORM_ANDROID
+  // Android's shared memory and the iOS temp file both go away with the fd --
+  // the iOS backing file was unlinked at creation.
+#if !REX_PLATFORM_ANDROID && !REX_PLATFORM_MAC
   auto full_path = MakeShmName(path);
   shm_unlink(full_path.c_str());
+#else
+  (void)path;
 #endif
 }
 
@@ -412,8 +569,8 @@ void* MapFileView(FileMappingHandle handle, void* base_address, size_t length, P
   }
 
   uint32_t prot = ToPosixProtectFlags(access);
-  void* result = mmap64(base_address, length, prot, flags, static_cast<int>(handle),
-                        static_cast<off_t>(file_offset));
+  void* result = rex_mmap64(base_address, length, prot, flags, static_cast<int>(handle),
+                            static_cast<off_t>(file_offset));
   if (result == MAP_FAILED) {
     return nullptr;
   }

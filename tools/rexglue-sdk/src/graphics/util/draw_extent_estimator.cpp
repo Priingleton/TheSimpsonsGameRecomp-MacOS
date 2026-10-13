@@ -24,10 +24,7 @@
 #include <rex/memory.h>
 #include <rex/ui/graphics_util.h>
 
-// On as in Xenia. Without it, every XDK clear (clipping disabled, 8192
-// scissor) was treated as covering the whole EDRAM, which in this game cost
-// about 2 ms of ownership transfer round trips per frame on the Deck.
-REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, true, "GPU",
+REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu, false, "GPU",
                     "Execute unclipped draw vertex shader on CPU");
 
 REXCVAR_DEFINE_BOOL(execute_unclipped_draw_vs_on_cpu_with_scissor, false, "GPU",
@@ -81,66 +78,6 @@ void DrawExtentEstimator::PositionYExportSink::Export(ucode::ExportRegister expo
   }
 }
 
-void DrawExtentEstimator::PositionExportSink::Export(ucode::ExportRegister export_register,
-                                                     const float* value, uint32_t value_mask) {
-  if (export_register == ucode::ExportRegister::kVSPosition) {
-    for (uint32_t i = 0; i < 4; ++i) {
-      if (value_mask & (uint32_t(1) << i)) {
-        position[i] = value[i];
-      }
-    }
-    position_mask |= value_mask & 0b1111;
-  } else if (export_register == ucode::ExportRegister::kVSPointSizeEdgeFlagKillVertex) {
-    if (value_mask & 0b0100) {
-      vertex_kill = rex::memory::Reinterpret<uint32_t>(value[2]);
-    }
-  }
-}
-
-bool DrawExtentEstimator::GetAutoIndexedVertexPositions(const Shader& vertex_shader,
-                                                        uint32_t vertex_count,
-                                                        float (*positions_out)[4]) {
-  const RegisterFile& regs = register_file_;
-  auto vgt_draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
-  if (vgt_draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
-      vgt_draw_initiator.num_indices < vertex_count) {
-    return false;
-  }
-  if (xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type) &&
-      regs.Get<reg::VGT_OUTPUT_PATH_CNTL>().path_select ==
-          xenos::VGTOutputPath::kTessellationEnable) {
-    return false;
-  }
-  if (vertex_shader.type() != xenos::ShaderType::kVertex || !vertex_shader.is_ucode_analyzed() ||
-      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
-    return false;
-  }
-  uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
-  uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
-  uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
-  shader_interpreter_.SetShader(vertex_shader);
-  PositionExportSink position_export_sink;
-  shader_interpreter_.SetExportSink(&position_export_sink);
-  bool complete = true;
-  for (uint32_t i = 0; i < vertex_count; ++i) {
-    uint32_t vertex_index =
-        std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
-    position_export_sink.Reset();
-    shader_interpreter_.temp_registers()[0] = float(vertex_index);
-    shader_interpreter_.Execute();
-    if ((position_export_sink.vertex_kill & ~(UINT32_C(1) << 31)) ||
-        position_export_sink.position_mask != 0b1111) {
-      complete = false;
-      break;
-    }
-    for (uint32_t j = 0; j < 4; ++j) {
-      positions_out[i][j] = position_export_sink.position[j];
-    }
-  }
-  shader_interpreter_.SetExportSink(nullptr);
-  return complete;
-}
-
 uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   SCOPE_profile_cpu_f("gpu");
 
@@ -179,8 +116,6 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
   if (vgt_draw_initiator.source_select == xenos::SourceSelect::kDMA) {
     xenos::IndexFormat index_format = vgt_draw_initiator.index_size;
     uint32_t index_buffer_base = regs[XE_GPU_REG_VGT_DMA_BASE];
-    uint32_t index_buffer_read_count =
-        std::min(uint32_t(vgt_draw_initiator.num_indices), uint32_t(vgt_dma_size.num_words));
     if (vgt_draw_initiator.index_size == xenos::IndexFormat::kInt16) {
       // Handle the index endianness to same way as the PrimitiveProcessor.
       if (index_endian == xenos::Endian::k8in32) {
@@ -189,17 +124,9 @@ uint32_t DrawExtentEstimator::EstimateVertexMaxY(const Shader& vertex_shader) {
         index_endian = xenos::Endian::kNone;
       }
       index_buffer_base &= ~uint32_t(sizeof(uint16_t) - 1);
-      if (trace_writer_) {
-        trace_writer_->WriteMemoryRead(index_buffer_base,
-                                       sizeof(uint16_t) * index_buffer_read_count);
-      }
     } else {
       assert_true(vgt_draw_initiator.index_size == xenos::IndexFormat::kInt32);
       index_buffer_base &= ~uint32_t(sizeof(uint32_t) - 1);
-      if (trace_writer_) {
-        trace_writer_->WriteMemoryRead(index_buffer_base,
-                                       sizeof(uint32_t) * index_buffer_read_count);
-      }
     }
     index_buffer = memory_.TranslatePhysical(index_buffer_base);
   }

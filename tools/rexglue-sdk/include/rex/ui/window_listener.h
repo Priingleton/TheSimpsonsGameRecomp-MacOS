@@ -27,6 +27,15 @@ class WindowListener {
   virtual void OnOpened(UISetupEvent&) {}
   virtual void OnClosing(UIEvent&) {}
 
+  // Called when the user asks to close the window (close button, Alt+F4).
+  // Return false to veto: the window stays open and the vetoing party is
+  // expected to close it explicitly later (Window::RequestClose) once it is
+  // safe (renderers drained, guest threads stopped). Default accepts.
+  virtual bool OnCloseRequested(UIEvent&) { return true; }
+
+  virtual void OnMinimized(UIEvent&) {}
+  virtual void OnRestored(UIEvent&) {}
+
   virtual void OnDpiChanged(UISetupEvent&) {}
   virtual void OnResize(UISetupEvent&) {}
 
@@ -48,11 +57,6 @@ class WindowInputListener {
   virtual void OnMouseMove(MouseEvent&) {}
   virtual void OnMouseUp(MouseEvent&) {}
   virtual void OnMouseWheel(MouseEvent&) {}
-  // While the mouse is captured, on windows that report relative motion
-  // (Window::ReportsRelativeMouseMotion): x and y are the movement since the
-  // previous event, unaccelerated where the platform allows, independent of
-  // where the (hidden) cursor is.
-  virtual void OnMouseRelativeMove(MouseEvent&) {}
 
   virtual void OnTouchEvent(TouchEvent&) {}
 };

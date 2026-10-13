@@ -14,10 +14,39 @@
 #include <rex/platform.h>
 #include <cstddef>
 
-#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+// Android's bionic declares ucontext_t but implements none of getcontext/
+// makecontext/swapcontext, so it uses a hand-written context switch instead
+// (see core/fiber_aarch64.S).
+#define REX_FIBER_UCONTEXT (!REX_PLATFORM_ANDROID && (REX_PLATFORM_LINUX || REX_PLATFORM_MAC))
+
+#if REX_FIBER_UCONTEXT
+#if REX_PLATFORM_MAC && !defined(_XOPEN_SOURCE)
+// Darwin hides the deprecated ucontext APIs unless _XOPEN_SOURCE is defined
+// before including <ucontext.h>.
+#define _XOPEN_SOURCE 700
+#endif
 #include <ucontext.h>
+#endif
+
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
 #include <cstdint>
 #include <vector>
+#endif
+
+#if REX_PLATFORM_ANDROID
+namespace rex::thread {
+// Callee-saved AArch64 state. Offsets are hard-coded in fiber_aarch64.S --
+// keep the two in step.
+struct alignas(16) RexFiberContext {
+  uint64_t gpr[12];  //   0: x19-x28, x29 (fp), x30 (lr)
+  uint64_t sp;       //  96
+  double fpr[8];     // 104: d8-d15
+};
+static_assert(sizeof(RexFiberContext) == 176, "fiber_aarch64.S assumes this layout");
+}  // namespace rex::thread
+
+extern "C" void rex_fiber_switch(rex::thread::RexFiberContext* from,
+                                 rex::thread::RexFiberContext* to);
 #endif
 
 namespace rex::thread {
@@ -51,7 +80,15 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
-#elif REX_PLATFORM_LINUX
+#elif REX_PLATFORM_ANDROID
+  RexFiberContext context_{};
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+
+  static void Trampoline();
+#elif REX_PLATFORM_LINUX || REX_PLATFORM_MAC
   ucontext_t context_{};
   std::vector<uint8_t> stack_;
   void (*entry_)(void*) = nullptr;

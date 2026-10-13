@@ -18,14 +18,11 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <queue>
 #include <set>
-#include <string>
 #include <thread>
-#include <tuple>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -95,33 +92,11 @@ class VulkanPipelineCache {
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
       VulkanRenderTargetCache::RenderPassKey render_pass_key, VkPipeline& pipeline_out,
-      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr,
-      bool force_rasterizer_discard = false);
+      const PipelineLayoutProvider*& pipeline_layout_out, void** pipeline_handle_out = nullptr);
   bool IsCreatingPipelines() const;
   void GetPipelineAndLayoutByHandle(void* handle, VkPipeline& pipeline_out,
                                     const PipelineLayoutProvider*& pipeline_layout_out,
                                     bool* is_placeholder_out = nullptr) const;
-
-  // Native-path telemetry: how much of this session's shader and pipeline work
-  // the ahead-of-time set and the persistent driver cache actually absorbed.
-  // Everything counted here is work the emulated path would otherwise pay at
-  // runtime, so these are the numbers that say how native the frame is.
-  size_t aot_hits() const { return aot_hits_; }
-  size_t aot_misses() const { return aot_misses_; }
-  size_t pipelines_created() const { return pipelines_created_.load(std::memory_order_relaxed); }
-  size_t pipeline_count() const { return pipelines_.size(); }
-
-  // Smooth tessellation level (1 to 3, 0 = off) for draws whose primitive
-  // processing returned triangle patches.
-  void SetSmoothTessellationLevel(uint32_t level) { smooth_tessellation_level_ = level; }
-  uint32_t smooth_tessellation_level() const { return smooth_tessellation_level_; }
-  // PN triangle control and evaluation shaders for a translated vertex shader
-  // (its interpolators and float constants) - false if it can't be smoothly
-  // tessellated, which the draw should then learn before configuring the
-  // pipeline. Level 0 means the current one.
-  bool GetSmoothTessellationShaders(const VulkanShader::VulkanTranslation& vertex_shader,
-                                    VkShaderModule& control_shader_out,
-                                    VkShaderModule& evaluation_shader_out, uint32_t level = 0);
 
  private:
   REXPACKEDSTRUCT(ShaderStoredHeader, {
@@ -221,15 +196,12 @@ class VulkanPipelineCache {
     xenos::StencilOp stencil_back_depth_fail_op : 3;     // 6
     xenos::CompareFunction stencil_back_compare_op : 3;  // 9
     uint32_t sample_rate_shading : 1;                    // 10
-    // Smooth tessellation level of a guest triangle list drawn as patches (PN
-    // triangles, the guest vertex shader staying the vertex shader), 0 if off.
-    uint32_t smooth_tessellation : 2;  // 12
 
     // Filled only for the attachments present in the render pass object.
     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
 
     // Including all the padding, for a stable hash.
-    static constexpr uint32_t kVersion = 0x20261010;
+    static constexpr uint32_t kVersion = 0x20260228;
     PipelineDescription() {
       Reset();
     }
@@ -298,8 +270,6 @@ class VulkanPipelineCache {
     // Non-guest stages for tessellation.
     VkShaderModule tessellation_vertex_shader = VK_NULL_HANDLE;
     VkShaderModule tessellation_control_shader = VK_NULL_HANDLE;
-    // Only for smooth tessellation, where the guest shader is the vertex shader.
-    VkShaderModule tessellation_evaluation_shader = VK_NULL_HANDLE;
     uint32_t tessellation_patch_control_points = 0;
     VkShaderModule geometry_shader = VK_NULL_HANDLE;
     // VK_NULL_HANDLE when dynamic rendering is used.
@@ -361,28 +331,6 @@ class VulkanPipelineCache {
   // Can be called from multiple threads.
   bool TranslateAnalyzedShader(SpirvShaderTranslator& translator,
                                VulkanShader::VulkanTranslation& translation);
-  // Creates the shader module and registers the texture and sampler binding
-  // layouts of a translation, whether translated now or served precompiled.
-  bool SetUpTranslatedShader(VulkanShader::VulkanTranslation& translation);
-  // The directory of the ahead-of-time shader set (aot_shader_path) made for
-  // the current draw resolution scale and render target path, or empty.
-  std::filesystem::path FindAotShaderSet() const;
-  // The base directory of ahead-of-time shader sets (aot_shader_path, or
-  // native_shaders next to the executable), empty if there is none.
-  std::filesystem::path GetAotShaderRoot() const;
-  // Everything besides the draw resolution scale the translator's output
-  // depends on (device features, render target path, 2x MSAA support), as
-  // translated sets record it (translator_configuration.txt).
-  std::string GetTranslatorConfiguration() const;
-  // The set of modules exported from runtime translations (translated/ in the
-  // ahead-of-time shader root), used only if made with exactly this
-  // translator version and configuration, or empty.
-  std::filesystem::path FindTranslatedShaderSet() const;
-  // Serves a translation from the ahead-of-time shader set if it has it.
-  bool TryLoadAotTranslation(VulkanShader::VulkanTranslation& translation, const char* stage);
-  // With aot_export_path, writes a runtime translation to the ahead-of-time
-  // shader set there, in the format TryLoadAotTranslation serves.
-  void ExportAotTranslation(const VulkanShader::VulkanTranslation& translation);
 
   void WritePipelineRenderTargetDescription(reg::RB_BLENDCONTROL blend_control, uint32_t write_mask,
                                             PipelineRenderTarget& render_target_out) const;
@@ -391,8 +339,8 @@ class VulkanPipelineCache {
       const VulkanShader::VulkanTranslation* pixel_shader,
       const PrimitiveProcessor::ProcessingResult& primitive_processing_result,
       reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
-      VulkanRenderTargetCache::RenderPassKey render_pass_key, PipelineDescription& description_out,
-      bool force_rasterizer_discard = false) const;
+      VulkanRenderTargetCache::RenderPassKey render_pass_key,
+      PipelineDescription& description_out) const;
 
   // Whether the pipeline for the given description is supported by the device.
   bool ArePipelineRequirementsMet(const PipelineDescription& description) const;
@@ -464,18 +412,6 @@ class VulkanPipelineCache {
                      TessellationControlShaderKey::Hasher>
       tessellation_control_shaders_;
 
-  uint32_t smooth_tessellation_level_ = 0;
-  // Smooth tessellation shaders by their GLSL source, VK_NULL_HANDLE if failed,
-  // and the pair for each vertex shader translation and level.
-  std::mutex smooth_tessellation_shaders_mutex_;
-  std::unordered_map<std::string, VkShaderModule> smooth_tessellation_shaders_;
-  struct SmoothTessellationShaderPair {
-    VkShaderModule control = VK_NULL_HANDLE;
-    VkShaderModule evaluation = VK_NULL_HANDLE;
-  };
-  std::map<std::tuple<uint64_t, uint64_t, uint32_t>, SmoothTessellationShaderPair>
-      smooth_tessellation_translations_;
-
   // Empty depth-only pixel shader for writing to depth buffer using fragment
   // shader interlock when no Xenos pixel shader provided.
   VkShaderModule depth_only_fragment_shader_ = VK_NULL_HANDLE;
@@ -484,35 +420,6 @@ class VulkanPipelineCache {
   // provided in host render target mode.
   VkShaderModule depth_float24_truncate_fragment_shader_ = VK_NULL_HANDLE;
   VkShaderModule depth_float24_round_fragment_shader_ = VK_NULL_HANDLE;
-
-  // Diagnostic: dumps every (shader, specialization) pair instantiated this
-  // session, for judging ahead-of-time shader conversion feasibility.
-  void WriteShaderInventory() const;
-  void WritePipelineInventory() const;
-  // Driver-level pipeline cache, persisted to disk across runs so every boot
-  // after the first replays compiles from the cache instead of paying the
-  // full compiler (measured: 72 pipelines 1.5 s cold vs under 2 ms warm on
-  // Van Gogh RADV).
-  VkPipelineCache vk_pipeline_cache_ = VK_NULL_HANDLE;
-  std::filesystem::path vk_pipeline_cache_path_;
-  // Ahead-of-time shader serving statistics for the shutdown log.
-  size_t aot_hits_ = 0;
-  size_t aot_misses_ = 0;
-  // The ahead-of-time shader set usable with this renderer configuration
-  // (see FindAotShaderSet), empty if none; looked up on first use.
-  std::filesystem::path aot_set_dir_;
-  std::filesystem::path translated_set_dir_;
-  bool aot_set_checked_ = false;
-  // aot_export_path: translations may be exported from several threads (the
-  // shader storage is translated by worker threads).
-  std::mutex aot_export_mutex_;
-  bool aot_export_dir_ready_ = false;
-  size_t aot_exported_ = 0;
-  // vkCreateGraphicsPipelines calls actually issued this session. With a warm
-  // persistent driver cache these are cheap replays rather than full compiles;
-  // a count that keeps climbing during play is what stutter looks like.
-  // Atomic: pipelines are created on the creation worker threads.
-  std::atomic<size_t> pipelines_created_{0};
 
   std::unordered_map<PipelineDescription, Pipeline, PipelineDescription::Hasher> pipelines_;
 

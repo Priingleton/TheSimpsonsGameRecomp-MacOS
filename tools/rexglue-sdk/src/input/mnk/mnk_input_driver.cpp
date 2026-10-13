@@ -14,74 +14,138 @@
 #include <rex/input/input.h>
 #include <rex/logging.h>
 #include <rex/ui/keybinds.h>
-#include <rex/ui/overlay_input.h>
 #include <rex/ui/virtual_key.h>
 #include <rex/ui/window.h>
 
 #include <algorithm>
-#include <cstdlib>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
-
-#if REX_PLATFORM_WIN32
-#include <rex/ui/window_win.h>
-#include <windows.h>
-#endif
+#include <string_view>
 
 REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
-REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input",
+                    "Use the mouse for the right stick. Off means the right stick comes "
+                    "from the keybind_rstick_* keys only");
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
-REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert vertical mouse look");
-REXCVAR_DEFINE_DOUBLE(mnk_stick_deadzone, 0.24, "Input",
-                      "Right stick deflection the slowest mouse movement maps to, so it gets past "
-                      "the game's own stick dead zone")
-    .range(0.0, 0.9);
 
-// A binding is a key name or several separated by commas ("Space,Enter"). Mouse:
-// LMB, RMB, MMB, Mouse4, Mouse5, WheelUp, WheelDown.
-REXCVAR_DEFINE_STRING(keybind_a, "Space,Enter", "Input/Keybinds/Controller", "A button (jump)");
-REXCVAR_DEFINE_STRING(keybind_b, "RMB,Backspace", "Input/Keybinds/Controller",
-                      "B button (special attack, back in menus)");
-REXCVAR_DEFINE_STRING(keybind_x, "LMB", "Input/Keybinds/Controller", "X button (attack)");
-REXCVAR_DEFINE_STRING(keybind_y, "E", "Input/Keybinds/Controller", "Y button (action)");
-REXCVAR_DEFINE_STRING(keybind_left_trigger, "Shift", "Input/Keybinds/Controller",
-                      "Left trigger (target)");
-REXCVAR_DEFINE_STRING(keybind_right_trigger, "F", "Input/Keybinds/Controller", "Right trigger");
-REXCVAR_DEFINE_STRING(keybind_left_shoulder, "Q", "Input/Keybinds/Controller", "Left shoulder");
-REXCVAR_DEFINE_STRING(keybind_right_shoulder, "R", "Input/Keybinds/Controller", "Right shoulder");
+REXCVAR_DEFINE_STRING(keybind_a, "Semicolon,Space", "Input/Keybinds/Controller", "A button");
+REXCVAR_DEFINE_STRING(keybind_b, "Quote,Backspace", "Input/Keybinds/Controller", "B button");
+REXCVAR_DEFINE_STRING(keybind_x, "L", "Input/Keybinds/Controller", "X button");
+REXCVAR_DEFINE_STRING(keybind_y, "P", "Input/Keybinds/Controller", "Y button");
+REXCVAR_DEFINE_STRING(keybind_left_trigger, "Q,I", "Input/Keybinds/Controller", "Left trigger");
+REXCVAR_DEFINE_STRING(keybind_right_trigger, "E,O", "Input/Keybinds/Controller", "Right trigger");
+REXCVAR_DEFINE_STRING(keybind_left_shoulder, "1", "Input/Keybinds/Controller", "Left shoulder");
+REXCVAR_DEFINE_STRING(keybind_right_shoulder, "3", "Input/Keybinds/Controller", "Right shoulder");
 REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
 REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Left stick down");
 REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
 REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
-REXCVAR_DEFINE_STRING(keybind_lstick_press, "C", "Input/Keybinds/Controller", "Left stick press");
-REXCVAR_DEFINE_STRING(keybind_walk, "Control", "Input/Keybinds/Controller",
-                      "Walk (half the left stick while held)");
-REXCVAR_DEFINE_STRING(keybind_rstick_press, "MMB", "Input/Keybinds/Controller",
-                      "Right stick press");
-// Camera on keys, besides the mouse (#33). Unbound by default.
-REXCVAR_DEFINE_STRING(keybind_rstick_up, "", "Input/Keybinds/Controller",
-                      "Right stick up (camera)");
-REXCVAR_DEFINE_STRING(keybind_rstick_down, "", "Input/Keybinds/Controller",
-                      "Right stick down (camera)");
-REXCVAR_DEFINE_STRING(keybind_rstick_left, "", "Input/Keybinds/Controller",
-                      "Right stick left (camera)");
-REXCVAR_DEFINE_STRING(keybind_rstick_right, "", "Input/Keybinds/Controller",
-                      "Right stick right (camera)");
-REXCVAR_DEFINE_STRING(keybind_dpad_up, "1,Up", "Input/Keybinds/Controller",
-                      "D-pad up (switch character)");
-REXCVAR_DEFINE_STRING(keybind_dpad_down, "3,Down", "Input/Keybinds/Controller",
-                      "D-pad down (switch character)");
-REXCVAR_DEFINE_STRING(keybind_dpad_left, "4,Left", "Input/Keybinds/Controller",
-                      "D-pad left (switch character)");
-REXCVAR_DEFINE_STRING(keybind_dpad_right, "2,Right", "Input/Keybinds/Controller",
-                      "D-pad right (switch character)");
-REXCVAR_DEFINE_STRING(keybind_back, "Tab", "Input/Keybinds/Controller", "Back button (to-do list)");
-REXCVAR_DEFINE_STRING(keybind_start, "Escape", "Input/Keybinds/Controller",
-                      "Start button (pause)");
+REXCVAR_DEFINE_STRING(keybind_lstick_press, "F", "Input/Keybinds/Controller", "Left stick press");
+REXCVAR_DEFINE_STRING(keybind_rstick_up, "Up", "Input/Keybinds/Controller", "Right stick up");
+REXCVAR_DEFINE_STRING(keybind_rstick_down, "Down", "Input/Keybinds/Controller", "Right stick down");
+REXCVAR_DEFINE_STRING(keybind_rstick_left, "Left", "Input/Keybinds/Controller", "Right stick left");
+REXCVAR_DEFINE_STRING(keybind_rstick_right, "Right", "Input/Keybinds/Controller",
+                      "Right stick right");
+REXCVAR_DEFINE_STRING(keybind_rstick_press, "K", "Input/Keybinds/Controller", "Right stick press");
+REXCVAR_DEFINE_STRING(keybind_dpad_up, "Shift+Up", "Input/Keybinds/Controller", "D-pad up");
+REXCVAR_DEFINE_STRING(keybind_dpad_down, "Shift+Down", "Input/Keybinds/Controller", "D-pad down");
+REXCVAR_DEFINE_STRING(keybind_dpad_left, "Shift+Left", "Input/Keybinds/Controller", "D-pad left");
+REXCVAR_DEFINE_STRING(keybind_dpad_right, "Shift+Right", "Input/Keybinds/Controller",
+                      "D-pad right");
+REXCVAR_DEFINE_STRING(keybind_back, "Z,Tab", "Input/Keybinds/Controller", "Back button");
+REXCVAR_DEFINE_STRING(keybind_start, "X,Return", "Input/Keybinds/Controller", "Start button");
 REXCVAR_DEFINE_STRING(keybind_guide, "", "Input/Keybinds/Controller", "Guide button");
 
 namespace rex::input::mnk {
+
+namespace {
+
+// A single device, so its handle is a constant.
+constexpr rex::input::DeviceId kMnkDevice = static_cast<rex::input::DeviceId>(0x4D4E4B00);
+
+// Bind values are a comma-separated list of alternatives, each optionally
+// carrying modifier prefixes: "Q,I" or "Shift+W". Modifier matching is exact,
+// so "Up" stays silent while Shift is held and "Shift+Up" stays silent without
+// it. That is what lets the D-pad share the arrow keys. A consequence is
+// that binding a bare modifier name ("Shift") can never fire, since holding it
+// makes the live mask non-zero while the bind wants zero.
+constexpr uint8_t kModShift = 1u << 0;
+constexpr uint8_t kModCtrl = 1u << 1;
+constexpr uint8_t kModAlt = 1u << 2;
+
+uint8_t LiveModifiers(const bool (&key_down)[256]) {
+  uint8_t mods = 0;
+  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kShift)])
+    mods |= kModShift;
+  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kControl)])
+    mods |= kModCtrl;
+  if (key_down[static_cast<uint16_t>(rex::ui::VirtualKey::kMenu)])
+    mods |= kModAlt;
+  return mods;
+}
+
+// Strips leading modifier prefixes off 'token', advancing it to the bare key
+// name and returning the mask they require.
+uint8_t TakeModifiers(std::string_view& token) {
+  uint8_t mods = 0;
+  for (;;) {
+    size_t plus = token.find('+');
+    if (plus == std::string_view::npos || plus == 0) {
+      break;
+    }
+    std::string_view head = token.substr(0, plus);
+    uint8_t bit = 0;
+    if (head == "Shift") {
+      bit = kModShift;
+    } else if (head == "Ctrl" || head == "Control") {
+      bit = kModCtrl;
+    } else if (head == "Alt") {
+      bit = kModAlt;
+    } else {
+      break;
+    }
+    mods |= bit;
+    token.remove_prefix(plus + 1);
+  }
+  return mods;
+}
+
+std::string_view TrimSpaces(std::string_view s) {
+  while (!s.empty() && s.front() == ' ') {
+    s.remove_prefix(1);
+  }
+  while (!s.empty() && s.back() == ' ') {
+    s.remove_suffix(1);
+  }
+  return s;
+}
+
+bool TokenPressed(const bool (&key_down)[256], std::string_view token, uint8_t live_mods) {
+  uint8_t want = TakeModifiers(token);
+  if (want != live_mods) {
+    return false;
+  }
+  rex::ui::VirtualKey vk = rex::ui::ParseVirtualKey(token);
+  if (vk == rex::ui::VirtualKey::kNone) {
+    return false;
+  }
+  uint16_t idx = static_cast<uint16_t>(vk);
+  return idx < 256 && key_down[idx];
+}
+
+std::atomic<bool> mouse_look_active{true};
+
+}  // namespace
+
+void SetMouseLookActive(bool active) {
+  mouse_look_active.store(active, std::memory_order_relaxed);
+}
+
+bool IsMouseLookActive() {
+  return mouse_look_active.load(std::memory_order_relaxed);
+}
 
 using rex::ui::VirtualKey;
 
@@ -89,44 +153,47 @@ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
 
 MnkInputDriver::~MnkInputDriver() {
-  alive_->store(false);
   // Detach handled by OnClosing; if window outlives the driver, clean up here.
-  if (attached_window_) {
-    attached_window_->RemoveInputListener(this);
-    attached_window_->RemoveListener(this);
-    attached_window_ = nullptr;
-  }
+  DetachFromWindow();
 }
 
 X_STATUS MnkInputDriver::Setup() {
-  REXLOG_INFO("MnK input driver initialized");
   return X_STATUS_SUCCESS;
 }
 
 void MnkInputDriver::OnWindowAvailable(rex::ui::Window* window) {
   if (window) {
-    attached_window_ = window;
-    has_focus_ = window->HasFocus();
+    {
+      std::lock_guard lock(state_mutex_);
+      attached_window_ = window;
+    }
     window->AddInputListener(this, window_z_order());
     window->AddListener(this);
   }
 }
 
 void MnkInputDriver::OnClosing(rex::ui::UIEvent&) {
-  if (attached_window_) {
-    if (mouse_captured_) {
-      mouse_captured_ = false;
-      attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-      attached_window_->ReleaseMouse();
-    }
-    attached_window_->RemoveInputListener(this);
-    attached_window_->RemoveListener(this);
-    attached_window_ = nullptr;
-  }
+  DetachFromWindow();
 }
 
-uint32_t MnkInputDriver::UserIndex() const {
-  return static_cast<uint32_t>(REXCVAR_GET(mnk_user_index));
+void MnkInputDriver::DetachFromWindow() {
+  rex::ui::Window* window = attached_window_;
+  if (!window) {
+    return;
+  }
+  window->app_context().CallInUIThreadSynchronous([this, window] {
+    // Detach first so nothing new is queued, then run out what already was.
+    {
+      std::lock_guard lock(state_mutex_);
+      attached_window_ = nullptr;
+    }
+    if (mouse_capture_update_queued_.load(std::memory_order_relaxed)) {
+      window->app_context().ExecutePendingFunctionsFromUIThread();
+    }
+    ReleaseMouseCaptureFromUIThread(window);
+    window->RemoveInputListener(this);
+    window->RemoveListener(this);
+  });
 }
 
 bool MnkInputDriver::IsEnabled() const {
@@ -134,46 +201,39 @@ bool MnkInputDriver::IsEnabled() const {
 }
 
 static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_val) {
-  // Any of the comma-separated keys.
-  size_t name_start = 0;
-  while (name_start <= cvar_val.size()) {
-    size_t name_end = cvar_val.find(',', name_start);
-    if (name_end == std::string::npos) {
-      name_end = cvar_val.size();
+  const uint8_t live_mods = LiveModifiers(key_down);
+  std::string_view rest(cvar_val);
+  while (!rest.empty()) {
+    size_t comma = rest.find(',');
+    std::string_view token = rest.substr(0, comma);
+    if (comma == std::string_view::npos) {
+      rest = std::string_view();
+    } else {
+      rest.remove_prefix(comma + 1);
     }
-    size_t first = name_start, last = name_end;
-    while (first < last && cvar_val[first] == ' ') {
-      ++first;
+    token = TrimSpaces(token);
+    if (!token.empty() && TokenPressed(key_down, token, live_mods)) {
+      return true;
     }
-    while (last > first && cvar_val[last - 1] == ' ') {
-      --last;
-    }
-    if (first < last) {
-      VirtualKey vk =
-          rex::ui::ParseVirtualKey(std::string_view(cvar_val).substr(first, last - first));
-      uint16_t idx = static_cast<uint16_t>(vk);
-      if (vk != VirtualKey::kNone && idx < 256 && key_down[idx]) {
-        return true;
-      }
-    }
-    name_start = name_end + 1;
   }
   return false;
 }
 
-// Pseudo virtual keys of the mouse wheel (unassigned in Windows, see
-// keybinds.cpp).
-constexpr uint16_t kVirtualKeyWheelUp = 0x0A;
-constexpr uint16_t kVirtualKeyWheelDown = 0x0B;
-// How long a wheel detent holds its "key", so the game sees it for a few
-// frames.
-constexpr std::chrono::milliseconds kWheelPressDuration(70);
-// The shortest a key or mouse button press is reported for.
-constexpr std::chrono::milliseconds kMinPressDuration(50);
+void MnkInputDriver::EnumerateDevices(std::vector<DeviceInfo>& out) {
+  // Disabled means no device at all, so it never occupies a guest user slot.
+  if (!IsEnabled()) {
+    return;
+  }
+  DeviceInfo info;
+  info.id = kMnkDevice;
+  info.name = "Keyboard and Mouse";
+  info.synthetic = true;
+  out.push_back(info);
+}
 
-X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
-                                         X_INPUT_CAPABILITIES* out_caps) {
-  if (!IsEnabled() || user_index != UserIndex()) {
+X_RESULT MnkInputDriver::GetDeviceCapabilities(DeviceId id, uint32_t flags,
+                                               X_INPUT_CAPABILITIES* out_caps) {
+  if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_caps) {
@@ -194,16 +254,17 @@ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
   return X_ERROR_SUCCESS;
 }
 
-X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
-  if (!IsEnabled() || user_index != UserIndex()) {
+X_RESULT MnkInputDriver::GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) {
+  if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
 
-  UpdateMouseCapture();
+  // Mouse look is opt in. Without this gate, keyboard input alone would hide
+  // and lock the cursor, breaking the ImGui overlays.
+  QueueMouseCaptureUpdate(IsEnabled() && REXCVAR_GET(mnk_mouse) && IsMouseLookActive() &&
+                          has_focus_ && is_active());
 
-  // Nothing reaches the game while an overlay (settings, console) has the
-  // keyboard and mouse.
-  if (!is_active() || !has_focus_ || rex::ui::IsOverlayInputActive()) {
+  if (!is_active() || !has_focus_) {
     if (out_state) {
       std::memset(out_state, 0, sizeof(*out_state));
       out_state->packet_number = packet_number_;
@@ -213,130 +274,80 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
 
   std::lock_guard lock(state_mutex_);
 
-  auto now = std::chrono::steady_clock::now();
-  // Keys held now, or released but pressed too briefly to have been seen yet.
-  bool key_down[256];
-  for (size_t i = 0; i < 256; ++i) {
-    key_down[i] = key_down_[i] || now < key_hold_until_[i];
-  }
-  key_down[kVirtualKeyWheelUp] = now < wheel_up_until_;
-  key_down[kVirtualKeyWheelDown] = now < wheel_down_until_;
-
   uint16_t buttons = 0;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_a)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
     buttons |= X_INPUT_GAMEPAD_A;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_b)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
     buttons |= X_INPUT_GAMEPAD_B;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_x)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
     buttons |= X_INPUT_GAMEPAD_X;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_y)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
     buttons |= X_INPUT_GAMEPAD_Y;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_left_shoulder)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_right_shoulder)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_press)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_press)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_back)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
     buttons |= X_INPUT_GAMEPAD_BACK;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_start)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
     buttons |= X_INPUT_GAMEPAD_START;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_guide)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
     buttons |= X_INPUT_GAMEPAD_GUIDE;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_up)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_down)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_left)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_right)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
 
-  uint8_t lt = IsBindPressed(key_down, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
-  uint8_t rt = IsBindPressed(key_down, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
 
   int32_t lx = 0;
   int32_t ly = 0;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_left)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
     lx -= INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_right)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
     lx += INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_up)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
     ly += INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_down)))
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
     ly -= INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_walk))) {
-    lx /= 2;
-    ly /= 2;
-  }
 
-  // The right stick follows the mouse velocity: camera turn speed rises with
-  // how fast the mouse moves. Recomputed at most every few milliseconds so
-  // several polls in one frame get the same value instead of the first one
-  // taking all the movement, and averaged over two updates against jitter.
-  double interval =
-      std::chrono::duration<double>(now - stick_update_time_).count();
-  if (interval >= 0.004) {
-    interval = std::min(interval, 0.1);
-    double velocity_x = mouse_dx_ / interval;
-    double velocity_y = mouse_dy_ / interval;
-    mouse_dx_ = 0;
-    mouse_dy_ = 0;
-    stick_update_time_ = now;
-    double smoothed_x = 0.5 * (velocity_x + prev_velocity_x_);
-    double smoothed_y = 0.5 * (velocity_y + prev_velocity_y_);
-    prev_velocity_x_ = velocity_x;
-    prev_velocity_y_ = velocity_y;
-    stick_rx_ = MouseVelocityToStick(smoothed_x);
-    stick_ry_ = MouseVelocityToStick(REXCVAR_GET(mnk_invert_y) ? smoothed_y : -smoothed_y);
+  int32_t rx = 0;
+  int32_t ry = 0;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
+    rx -= INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
+    rx += INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
+    ry += INT16_MAX;
+  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
+    ry -= INT16_MAX;
+
+  if (REXCVAR_GET(mnk_mouse) && IsMouseLookActive()) {
+    double sensitivity = REXCVAR_GET(mnk_sensitivity);
+    constexpr double kBaseScale = 200.0;
+    rx += static_cast<int32_t>(double(mouse_dx_) * sensitivity * kBaseScale);
+    ry += static_cast<int32_t>(double(-mouse_dy_) * sensitivity * kBaseScale);
   }
-  int32_t rx = stick_rx_;
-  int32_t ry = stick_ry_;
-  // Camera keys push the stick all the way, over the mouse on that axis.
-  int32_t key_rx = 0;
-  int32_t key_ry = 0;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_left)))
-    key_rx -= INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_right)))
-    key_rx += INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_up)))
-    key_ry += INT16_MAX;
-  if (IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_down)))
-    key_ry -= INT16_MAX;
-  if (key_rx) {
-    rx = key_rx;
-  }
-  if (key_ry) {
-    ry = key_ry;
-  }
+  // Drained unconditionally: deltas keep accumulating in OnMouseMove while the
+  // mouse is off, and toggling it on would otherwise dump the whole backlog
+  // into one frame as a camera snap.
+  mouse_dx_ = 0.0f;
+  mouse_dy_ = 0.0f;
 
   auto clamp16 = [](int32_t v) -> int16_t {
     return static_cast<int16_t>(std::clamp(v, (int32_t)INT16_MIN, (int32_t)INT16_MAX));
   };
 
   packet_number_++;
-
-  // Debugging (REX_MNK_LOG): log changes of the emulated controller state.
-  static const bool state_log = std::getenv("REX_MNK_LOG") != nullptr;
-  if (state_log) {
-    static uint16_t logged_buttons = 0;
-    static uint8_t logged_lt = 0, logged_rt = 0;
-    static int32_t logged_lx = 0, logged_ly = 0, logged_rx_sign = 0;
-    int32_t rx_sign = (rx > 0) - (rx < 0);
-    if (buttons != logged_buttons || lt != logged_lt || rt != logged_rt || lx != logged_lx ||
-        ly != logged_ly || rx_sign != logged_rx_sign) {
-      REXLOG_INFO("[mnk] buttons {:04X} lt {} rt {} left stick {},{} right stick x {}", buttons,
-                  lt, rt, lx, ly, rx);
-      logged_buttons = buttons;
-      logged_lt = lt;
-      logged_rt = rt;
-      logged_lx = lx;
-      logged_ly = ly;
-      logged_rx_sign = rx_sign;
-    }
-  }
 
   if (out_state) {
     out_state->packet_number = packet_number_;
@@ -351,16 +362,16 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   return X_ERROR_SUCCESS;
 }
 
-X_RESULT MnkInputDriver::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
-  if (!IsEnabled() || user_index != UserIndex()) {
+X_RESULT MnkInputDriver::SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) {
+  if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   return X_ERROR_SUCCESS;
 }
 
-X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
-                                      X_INPUT_KEYSTROKE* out_keystroke) {
-  if (!IsEnabled() || user_index != UserIndex()) {
+X_RESULT MnkInputDriver::GetDeviceKeystroke(DeviceId id, uint32_t flags,
+                                            X_INPUT_KEYSTROKE* out_keystroke) {
+  if (!IsEnabled() || id != kMnkDevice) {
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   std::lock_guard lock(state_mutex_);
@@ -379,107 +390,98 @@ void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
   ks.virtual_key = vk_pad;
   ks.unicode = 0;
   ks.flags = down ? X_INPUT_KEYSTROKE_KEYDOWN : X_INPUT_KEYSTROKE_KEYUP;
-  ks.user_index = static_cast<uint8_t>(UserIndex());
+  // InputSystem stamps the guest user this device is assigned to.
+  ks.user_index = 0;
   ks.hid_code = 0;
   keystroke_queue_.push(ks);
 }
 
-void MnkInputDriver::CenterCursor() {
-  if (!attached_window_)
+void MnkInputDriver::QueueMouseCaptureUpdate(bool should_capture) {
+  mouse_capture_requested_.store(should_capture, std::memory_order_relaxed);
+  bool already_queued = false;
+  if (!mouse_capture_update_queued_.compare_exchange_strong(already_queued, true)) {
     return;
-  int32_t cx = static_cast<int32_t>(attached_window_->GetActualLogicalWidth() / 2);
-  int32_t cy = static_cast<int32_t>(attached_window_->GetActualLogicalHeight() / 2);
-  prev_mouse_x_ = cx;
-  prev_mouse_y_ = cy;
-#if REX_PLATFORM_WIN32
-  auto* win32_window = dynamic_cast<rex::ui::Win32Window*>(attached_window_);
-  if (win32_window && win32_window->hwnd()) {
-    POINT pt = {static_cast<LONG>(cx), static_cast<LONG>(cy)};
-    ClientToScreen(win32_window->hwnd(), &pt);
-    SetCursorPos(pt.x, pt.y);
   }
-#endif
+  std::lock_guard lock(state_mutex_);
+  if (!attached_window_) {
+    mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+    return;
+  }
+  // Deferred, not CallInUIThread: running inline would re-enter state_mutex_.
+  attached_window_->app_context().CallInUIThreadDeferred([this] {
+    mouse_capture_update_queued_.store(false, std::memory_order_relaxed);
+    ApplyMouseCaptureFromUIThread();
+  });
 }
 
-int32_t MnkInputDriver::MouseVelocityToStick(double velocity) const {
-  // Mouse counts per second for a full stick deflection at sensitivity 1.
-  constexpr double kFullDeflectionVelocity = 4000.0;
-  // Slower is sensor noise.
-  constexpr double kMinVelocity = 20.0;
-  double magnitude = std::abs(velocity);
-  if (magnitude < kMinVelocity) {
-    return 0;
+void MnkInputDriver::ApplyMouseCaptureFromUIThread() {
+  rex::ui::Window* window = attached_window_;
+  if (!window) {
+    return;
   }
-  double deflection =
-      std::min(1.0, magnitude * REXCVAR_GET(mnk_sensitivity) / kFullDeflectionVelocity);
-  double deadzone = REXCVAR_GET(mnk_stick_deadzone);
-  double value = (deadzone + (1.0 - deadzone) * deflection) * double(INT16_MAX);
-  return int32_t(velocity < 0.0 ? -value : value);
+  bool should_capture = mouse_capture_requested_.load(std::memory_order_relaxed);
+  if (should_capture == mouse_captured_) {
+    return;
+  }
+  if (!should_capture) {
+    ReleaseMouseCaptureFromUIThread(window);
+    return;
+  }
+  mouse_captured_ = true;
+  precapture_cursor_visibility_ = window->GetCursorVisibility();
+  window->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
+  window->CaptureMouse();
+  relative_mouse_mode_ = window->SetRelativeMouseMode(true);
+  if (!relative_mouse_mode_) {
+    REXLOG_WARN("Pointer lock unavailable, mouse look falls back to recentering the cursor");
+  }
+  // Reset deltas to avoid a spike on capture start
+  std::lock_guard lock(state_mutex_);
+  mouse_dx_ = 0.0f;
+  mouse_dy_ = 0.0f;
 }
 
-void MnkInputDriver::UpdateMouseCapture() {
-  if (!attached_window_)
+void MnkInputDriver::ReleaseMouseCaptureFromUIThread(rex::ui::Window* window) {
+  if (!mouse_captured_) {
     return;
-
-  bool should_capture =
-      IsEnabled() && has_focus_ && is_active() && !rex::ui::IsOverlayInputActive();
-  if (should_capture != capture_requested_) {
-    capture_requested_ = should_capture;
-    // Window mouse capture and cursor changes belong to the UI thread (GTK
-    // isn't thread-safe, and Win32 capture is per thread).
-    std::shared_ptr<std::atomic<bool>> alive = alive_;
-    attached_window_->app_context().CallInUIThreadDeferred([this, alive, should_capture] {
-      if (alive->load()) {
-        ApplyMouseCapture(should_capture);
-      }
-    });
   }
-
-  // Without relative motion events, keep the cursor centered so it doesn't
-  // stop at the edges.
-  if (mouse_captured_ && !attached_window_->ReportsRelativeMouseMotion()) {
-    CenterCursor();
-  }
+  mouse_captured_ = false;
+  window->SetCursorVisibility(precapture_cursor_visibility_);
+  window->SetRelativeMouseMode(false);
+  relative_mouse_mode_ = false;
+  window->ReleaseMouse();
 }
 
-void MnkInputDriver::ApplyMouseCapture(bool capture) {
-  if (!attached_window_)
+void MnkInputDriver::RecenterCursorFromUIThread(int32_t x, int32_t y) {
+  rex::ui::Window* window = attached_window_;
+  if (!window) {
     return;
-  if (capture && !mouse_captured_ && has_focus_) {
-    {
-      // No spike from movement before the capture.
-      std::lock_guard lock(state_mutex_);
-      mouse_dx_ = 0;
-      mouse_dy_ = 0;
-    }
-    mouse_captured_ = true;
-    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kHidden);
-    attached_window_->CaptureMouse();
-    if (std::getenv("REX_MNK_LOG")) {
-      REXLOG_INFO("MnK: mouse captured");
-    }
-  } else if (!capture && mouse_captured_) {
-    mouse_captured_ = false;
-    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-    attached_window_->ReleaseMouse();
-    if (std::getenv("REX_MNK_LOG")) {
-      REXLOG_INFO("MnK: mouse released");
-    }
+  }
+  int32_t width = int32_t(window->GetActualPhysicalWidth());
+  int32_t height = int32_t(window->GetActualPhysicalHeight());
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  // Only once the pointer has drifted well off the middle, to keep warps rare.
+  if (std::abs(x - width / 2) < width / 4 && std::abs(y - height / 2) < height / 4) {
+    return;
+  }
+  int32_t center_x = 0;
+  int32_t center_y = 0;
+  if (window->WarpMouseToCenter(center_x, center_y)) {
+    prev_mouse_x_ = center_x;
+    prev_mouse_y_ = center_y;
   }
 }
 
 void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
   if (vk < 256) {
-    if (down && !key_down_[vk]) {
-      key_hold_until_[vk] = std::chrono::steady_clock::now() + kMinPressDuration;
-    }
     key_down_[vk] = down;
   }
 }
 
 void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
-  // Releases still count while an overlay has input, so nothing stays held.
-  if (!IsEnabled() || !has_focus_ || rex::ui::IsOverlayInputActive())
+  if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
@@ -495,7 +497,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
 }
 
 void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_ || rex::ui::IsOverlayInputActive())
+  if (!IsEnabled() || !has_focus_)
     return;
   std::lock_guard lock(state_mutex_);
   switch (e.button()) {
@@ -507,12 +509,6 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
       break;
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
-      break;
-    case rex::ui::MouseEvent::Button::kX1:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
-      break;
-    case rex::ui::MouseEvent::Button::kX2:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
       break;
     default:
       break;
@@ -533,12 +529,6 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
       break;
-    case rex::ui::MouseEvent::Button::kX1:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
-      break;
-    case rex::ui::MouseEvent::Button::kX2:
-      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
-      break;
     default:
       break;
   }
@@ -547,54 +537,44 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
   if (!IsEnabled() || !has_focus_)
     return;
-  std::lock_guard lock(state_mutex_);
   int32_t x = e.x();
   int32_t y = e.y();
-  // Windows reporting relative motion send it separately (positions then only
-  // reflect the window keeping the hidden cursor inside).
-  if (!attached_window_ || !attached_window_->ReportsRelativeMouseMotion()) {
-    mouse_dx_ += x - prev_mouse_x_;
-    mouse_dy_ += y - prev_mouse_y_;
+  {
+    std::lock_guard lock(state_mutex_);
+    if (relative_mouse_mode_) {
+      // The pointer is locked, so the absolute position no longer moves.
+      mouse_dx_ += e.dx();
+      mouse_dy_ += e.dy();
+    } else {
+      mouse_dx_ += float(x - prev_mouse_x_);
+      mouse_dy_ += float(y - prev_mouse_y_);
+    }
   }
   prev_mouse_x_ = x;
   prev_mouse_y_ = y;
-}
-
-void MnkInputDriver::OnMouseRelativeMove(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_ || !mouse_captured_)
-    return;
-  std::lock_guard lock(state_mutex_);
-  mouse_dx_ += e.x();
-  mouse_dy_ += e.y();
-}
-
-void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
-  if (!IsEnabled() || !has_focus_ || rex::ui::IsOverlayInputActive())
-    return;
-  std::lock_guard lock(state_mutex_);
-  auto until = std::chrono::steady_clock::now() + kWheelPressDuration;
-  if (e.scroll_y() > 0) {
-    wheel_up_until_ = until;
-  } else if (e.scroll_y() < 0) {
-    wheel_down_until_ = until;
+  // Without a pointer lock the cursor still has to be kept off the edges.
+  if (mouse_captured_ && !relative_mouse_mode_) {
+    RecenterCursorFromUIThread(x, y);
   }
 }
 
 void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
-  std::lock_guard lock(state_mutex_);
   has_focus_ = false;
-  std::memset(key_down_, 0, sizeof(key_down_));
-  mouse_dx_ = 0;
-  mouse_dy_ = 0;
-  if (mouse_captured_ && attached_window_) {
-    mouse_captured_ = false;
-    attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
-    attached_window_->ReleaseMouse();
+  // Withdraw the request too, or an update queued before the focus loss grabs
+  // the cursor straight back.
+  mouse_capture_requested_.store(false, std::memory_order_relaxed);
+  {
+    std::lock_guard lock(state_mutex_);
+    std::memset(key_down_, 0, sizeof(key_down_));
+    mouse_dx_ = 0.0f;
+    mouse_dy_ = 0.0f;
+  }
+  if (attached_window_) {
+    ReleaseMouseCaptureFromUIThread(attached_window_);
   }
 }
 
 void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
-  std::lock_guard lock(state_mutex_);
   has_focus_ = true;
 }
 

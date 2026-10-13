@@ -26,9 +26,10 @@
 //
 // Controller: L3+R3 free camera on/off, Y photo mode; left stick move, right
 // stick look, triggers down/up, LB/RB zoom out/in, R3 resets the zoom, A
-// faster, X slower. Keyboard: F6 free camera, F8 photo mode; WASD move, arrows
-// look, Q/E down/up, 1/3 zoom out/in, 2 resets the zoom, Shift faster, Ctrl
-// slower.
+// faster (or takes a screenshot in photo mode), X slower. Keyboard: F6 free
+// camera, F8 photo mode, Enter / F9 screenshot in photo mode; WASD move,
+// arrows look, Q/E down/up, 1/3 zoom out/in, 2 resets the zoom, Shift faster,
+// Ctrl slower. Screenshots land in <userdata>/shots as PNG.
 
 #include "guest_memory.h"
 
@@ -37,8 +38,15 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
+#include <filesystem>
+#include <thread>
+#include <vector>
+
+#include <SDL3/SDL.h>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -46,6 +54,7 @@
 #include <rex/ppc.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/overlay_input.h>
+#include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
@@ -56,6 +65,10 @@ REXCVAR_DEFINE_BOOL(freecam_hide_hud, true, "Camera",
 REXCVAR_DEFINE_BOOL(freecam_game_follows, true, "Camera",
                     "Let the game use the free camera as its camera (what it streams, culls and "
                     "hears from), as the developers' fly camera did");
+REXCVAR_DEFINE_STRING(photo_shots_dir, "", "Camera",
+                      "Folder for photo mode screenshots. Empty uses Pictures/The Simpsons Game "
+                      "on Mac.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 // The camera manager's fly camera, which this file takes over.
 REX_EXTERN(__imp__sub_8269D8F8);
@@ -130,6 +143,9 @@ void StoreBE16(uint8_t* p, uint16_t value) {
   p[0] = uint8_t(value >> 8);
   p[1] = uint8_t(value);
 }
+void StoreBES16(uint8_t* p, int16_t value) {
+  StoreBE16(p, uint16_t(value));
+}
 
 int64_t NowNs() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -141,11 +157,16 @@ int64_t NowNs() {
 std::atomic<bool> g_want_freecam{false};
 std::atomic<bool> g_want_photo{false};
 std::atomic<bool> g_reset_fov{false};
+std::atomic<bool> g_want_shot{false};
 // Game-thread state, published for the frame pacing, the HUD draw and the
 // UI-thread toggles.
 std::atomic<bool> g_applied{false};
 std::atomic<bool> g_frozen{false};
 std::atomic<int64_t> g_last_camera_tick_ns{0};
+std::atomic<bool> g_shot_busy{false};
+
+rex::ui::Presenter* g_presenter = nullptr;
+std::filesystem::path g_shots_dir;
 
 // Keyboard (UI thread -> game thread).
 std::array<std::atomic<bool>, 256> g_keys{};
@@ -158,9 +179,15 @@ struct Pad {
   int16_t lx = 0, ly = 0, rx = 0, ry = 0;
 };
 Pad g_pad;
-bool g_chord_down = false;          // L3+R3 held since it toggled
+bool g_chord_down = false;          // L3+R3 both held (chord in progress)
 bool g_r3_tap = false;              // R3 pressed alone, a zoom reset on release
-bool g_hold_until_neutral = false;  // after the free camera: until the pad rests
+bool g_hold_until_neutral = false;  // after freecam: briefly mute sticks so look does not whip
+int64_t g_hold_until_neutral_ns = 0;
+int64_t g_chord_down_ns = 0;
+
+// Accidental stick-clicks were toggling freecam and muting look for seconds.
+constexpr int64_t kChordHoldNs = 400'000'000;       // 0.4s L3+R3 to toggle
+constexpr int64_t kHoldUntilNeutralMaxNs = 250'000'000;  // never mute sticks longer than this
 
 // The free camera (game thread only).
 struct Camera {
@@ -203,6 +230,92 @@ void TogglePhoto() {
     g_want_freecam = true;
   }
   g_want_photo = true;
+}
+
+void RequestPhotoShot() {
+  if (!g_frozen.load(std::memory_order_relaxed)) {
+    REXLOG_INFO("[freecam] screenshots work in photo mode only (F8)");
+    return;
+  }
+  if (!g_presenter || g_shots_dir.empty()) {
+    REXLOG_WARN("[freecam] screenshot: no presenter or shots folder");
+    return;
+  }
+  if (g_shot_busy.load(std::memory_order_relaxed)) {
+    return;
+  }
+  g_want_shot.store(true, std::memory_order_relaxed);
+}
+
+bool WritePng(const std::filesystem::path& path, const rex::ui::RawImage& image) {
+  if (!image.width || !image.height || image.data.empty()) {
+    return false;
+  }
+  // Guest capture is R8 G8 B8 X8; drop X when building a tight RGBX surface.
+  std::vector<uint8_t> rgba(size_t(image.width) * image.height * 4);
+  for (uint32_t y = 0; y < image.height; ++y) {
+    const uint8_t* src = image.data.data() + image.stride * y;
+    uint8_t* dst = rgba.data() + size_t(y) * image.width * 4;
+    for (uint32_t x = 0; x < image.width; ++x) {
+      dst[x * 4 + 0] = src[x * 4 + 0];
+      dst[x * 4 + 1] = src[x * 4 + 1];
+      dst[x * 4 + 2] = src[x * 4 + 2];
+      dst[x * 4 + 3] = 255;
+    }
+  }
+  SDL_Surface* surface =
+      SDL_CreateSurfaceFrom(int(image.width), int(image.height), SDL_PIXELFORMAT_RGBA32,
+                            rgba.data(), int(image.width * 4));
+  if (!surface) {
+    return false;
+  }
+  const bool ok = SDL_SavePNG(surface, path.string().c_str());
+  SDL_DestroySurface(surface);
+  return ok;
+}
+
+void TakePhotoShot() {
+  if (!g_want_shot.exchange(false, std::memory_order_relaxed)) {
+    return;
+  }
+  if (!g_frozen.load(std::memory_order_relaxed) || !g_presenter || g_shots_dir.empty()) {
+    return;
+  }
+  if (g_shot_busy.exchange(true, std::memory_order_acq_rel)) {
+    return;
+  }
+  rex::ui::RawImage image;
+  if (!g_presenter->CaptureGuestOutput(image) || !image.width || !image.height) {
+    g_shot_busy.store(false, std::memory_order_release);
+    REXLOG_WARN("[freecam] screenshot failed to capture the frame");
+    return;
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(g_shots_dir, ec);
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#if defined(_WIN32)
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char stamp[32];
+  std::snprintf(stamp, sizeof(stamp), "photo_%04d%02d%02d_%02d%02d%02d", tm.tm_year + 1900,
+                tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec);
+  std::filesystem::path path = g_shots_dir / (std::string(stamp) + ".png");
+  for (int n = 2; std::filesystem::exists(path, ec); ++n) {
+    path = g_shots_dir / (std::string(stamp) + "_" + std::to_string(n) + ".png");
+  }
+  std::thread([image = std::move(image), path]() mutable {
+    const bool ok = WritePng(path, image);
+    if (ok) {
+      REXLOG_INFO("[freecam] screenshot saved: {}", path.string());
+    } else {
+      REXLOG_WARN("[freecam] screenshot failed to write {}", path.string());
+    }
+    g_shot_busy.store(false, std::memory_order_release);
+  }).detach();
 }
 
 float Axis(int16_t value, int dead_zone) {
@@ -272,7 +385,10 @@ void Disable(PPCContext& ctx, uint8_t* base, uint32_t manager) {
   g_want_freecam = false;
   g_want_photo = false;
   g_applied = false;
+  // Mute sticks briefly so freecam look does not whip the game camera — but
+  // always time out so a resting stick / drift cannot leave look dead.
   g_hold_until_neutral = true;
+  g_hold_until_neutral_ns = NowNs();
   REXLOG_INFO("[freecam] off");
 }
 
@@ -314,7 +430,8 @@ void Fly(float dt) {
   float rise = (pad.rt - pad.lt) / 255.0f;
   float zoom = (pad.buttons & kPadLB ? 1.0f : 0.0f) - (pad.buttons & kPadRB ? 1.0f : 0.0f);
   float speed = float(REXCVAR_GET(freecam_speed));
-  if (pad.buttons & kPadA)
+  // In photo mode A is the shutter; keep it as a speed boost otherwise.
+  if ((pad.buttons & kPadA) && !g_frozen.load(std::memory_order_relaxed))
     speed *= 5.0f;
   if (pad.buttons & kPadX)
     speed *= 0.2f;
@@ -402,7 +519,26 @@ bool FreecamWorldFrozen() {
   return g_frozen.load(std::memory_order_relaxed);
 }
 
-void InitFreecam(rex::ui::Window* window) {
+// Mac frame pacing: a live level camera means "in gameplay", even if physics
+// briefly pauses. Matches the camera tick already tracked for freecam gating.
+bool FreecamLevelCameraRecent() {
+  const int64_t last = g_last_camera_tick_ns.load(std::memory_order_relaxed);
+  return last && NowNs() - last < 2'000'000'000;
+}
+
+void InitFreecam(rex::ui::Window* window, rex::ui::Presenter* presenter,
+                 std::filesystem::path shots_dir) {
+  g_presenter = presenter;
+  // Launcher setting photo_shots_dir wins when set; otherwise use the app default
+  // (Pictures/The Simpsons Game on Mac).
+  {
+    const std::string custom = REXCVAR_GET(photo_shots_dir);
+    if (!custom.empty()) {
+      g_shots_dir = std::filesystem::path(custom);
+    } else {
+      g_shots_dir = std::move(shots_dir);
+    }
+  }
   if (window) {
     window->AddInputListener(&g_key_listener, 32);
     window->AddListener(&g_key_listener);
@@ -418,11 +554,22 @@ void InitFreecam(rex::ui::Window* window) {
                             TogglePhoto();
                           }
                         });
+  // F9 is easier than Enter in freecam (Enter is easy to miss / conflict with UI).
+  rex::ui::RegisterBind("bind_photo_shot", "F9",
+                        "Take a screenshot while photo mode is on", [] {
+                          if (!g_key_repeat.load()) {
+                            RequestPhotoShot();
+                          }
+                        });
+  if (!g_shots_dir.empty()) {
+    REXLOG_INFO("[freecam] photo screenshots go to {}", g_shots_dir.string());
+  }
 }
 
 void ShutdownFreecam(rex::ui::Window* window) {
   rex::ui::UnregisterBind("bind_freecam");
   rex::ui::UnregisterBind("bind_photo_mode");
+  rex::ui::UnregisterBind("bind_photo_shot");
   if (window) {
     window->RemoveInputListener(&g_key_listener);
     window->RemoveListener(&g_key_listener);
@@ -430,6 +577,9 @@ void ShutdownFreecam(rex::ui::Window* window) {
   if (g_applied.exchange(false)) {
     rex::ui::ReleaseOverlayInput();
   }
+  g_presenter = nullptr;
+  g_shots_dir.clear();
+  g_want_shot = false;
 }
 
 REX_FUNC(sub_8269D8F8) {
@@ -461,6 +611,7 @@ REX_FUNC(sub_8269D8F8) {
   Fly(dt);
   ApplyPose(ctx, base, manager, g_cam.position, g_cam.pitch, g_cam.yaw, g_cam.roll, g_cam.fov,
             g_cam.flags1, g_cam.flags2);
+  TakePhotoShot();
 }
 
 REX_FUNC(sub_82B766A8) {
@@ -489,12 +640,20 @@ REX_FUNC(sub_82B766A8) {
     const uint16_t pressed = pad.buttons & ~g_pad.buttons;
     const uint16_t released = g_pad.buttons & ~pad.buttons;
     const bool chord = (pad.buttons & (kPadL3 | kPadR3)) == (kPadL3 | kPadR3);
-    if (chord && !g_chord_down) {
-      g_chord_down = true;
-      g_r3_tap = false;
-      ToggleFreecam();
-    } else if (!(pad.buttons & (kPadL3 | kPadR3))) {
+    const int64_t now = NowNs();
+    if (chord) {
+      if (!g_chord_down) {
+        g_chord_down = true;
+        g_chord_down_ns = now;
+        g_r3_tap = false;
+      } else if (now - g_chord_down_ns >= kChordHoldNs) {
+        // Fire once per hold: mark as consumed by pushing the timer far ahead.
+        g_chord_down_ns = now + 365LL * 24 * 3600 * 1'000'000'000;
+        ToggleFreecam();
+      }
+    } else {
       g_chord_down = false;
+      g_chord_down_ns = 0;
     }
     if ((pressed & kPadR3) && !(pad.buttons & kPadL3)) {
       g_r3_tap = true;
@@ -511,17 +670,33 @@ REX_FUNC(sub_82B766A8) {
     if ((pressed & kPadY) && g_applied) {
       TogglePhoto();
     }
+    if ((pressed & kPadA) && g_frozen.load(std::memory_order_relaxed)) {
+      RequestPhotoShot();
+    }
     g_pad = pad;
-    if (g_hold_until_neutral && !g_applied && pad.buttons == 0 && pad.lt < 30 && pad.rt < 30 &&
-        Axis(pad.lx, 7849) == 0 && Axis(pad.ly, 7849) == 0 && Axis(pad.rx, 8689) == 0 &&
-        Axis(pad.ry, 8689) == 0) {
-      g_hold_until_neutral = false;
+    if (g_hold_until_neutral && !g_applied) {
+      const bool rested = pad.buttons == 0 && pad.lt < 30 && pad.rt < 30 &&
+                          Axis(pad.lx, 7849) == 0 && Axis(pad.ly, 7849) == 0 &&
+                          Axis(pad.rx, 8689) == 0 && Axis(pad.ry, 8689) == 0;
+      if (rested || now - g_hold_until_neutral_ns >= kHoldUntilNeutralMaxNs) {
+        g_hold_until_neutral = false;
+      }
     }
   }
 
-  if (g_applied || g_hold_until_neutral) {
-    // A neutral, connected pad: buttons, triggers and sticks at rest.
+  if (g_applied) {
+    // Freecam owns the pad: game must not see movement or buttons.
     std::memset(gamepad, 0, 12);
+  } else if (g_hold_until_neutral) {
+    // After exit: keep buttons/triggers, only zero sticks briefly so look does
+    // not whip — never blank the whole pad (that made right stick feel dead).
+    StoreBES16(gamepad + 4, 0);
+    StoreBES16(gamepad + 6, 0);
+    StoreBES16(gamepad + 8, 0);
+    StoreBES16(gamepad + 10, 0);
+    if (g_chord_down) {
+      StoreBE16(gamepad, pad.buttons & ~(kPadL3 | kPadR3));
+    }
   } else if (g_chord_down) {
     // The clicks that toggle the free camera are not the game's.
     StoreBE16(gamepad, pad.buttons & ~(kPadL3 | kPadR3));
@@ -558,7 +733,10 @@ REX_FUNC(sub_82691530) {
     // lock here, without accessing the camera manager that is being freed.
     if (g_applied.exchange(false)) {
       rex::ui::ReleaseOverlayInput();
-      g_hold_until_neutral = true;
+      // Do not carry stick-mute into the next level — that made look feel dead
+      // for a few seconds after some loads.
+      g_hold_until_neutral = false;
+      g_hold_until_neutral_ns = 0;
       REXLOG_INFO("[freecam] off: level unloading");
     }
     if (g_frozen.load()) {

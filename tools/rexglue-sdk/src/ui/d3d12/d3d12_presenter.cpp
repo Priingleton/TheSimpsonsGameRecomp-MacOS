@@ -39,6 +39,7 @@ namespace rex::ui::d3d12 {
 namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_bilinear_ps.h"
+#if defined(REX_HAS_FIDELITYFX_SDK)
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_resample_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_cas_sharpen_dither_ps.h"
@@ -46,6 +47,7 @@ namespace shaders {
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_easu_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_ffx_fsr_rcas_ps.h"
+#endif
 #include "ui/shaders/bytecode/d3d12_5_1/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -424,9 +426,8 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
           return SurfacePaintConnectResult::kFailure;
         }
         // Disable automatic Alt+Enter handling - DXGI fullscreen doesn't
-        // support ALLOW_TEARING, and using custom fullscreen in ui::Win32Window
-        // anyway as with Alt+Enter the menu is kept, state changes are tracked
-        // better, and nothing is presented for some reason.
+        // support ALLOW_TEARING, and the window implementation provides
+        // borderless fullscreen anyway with better state tracking.
         dxgi_factory->MakeWindowAssociation(surface_hwnd, DXGI_MWA_NO_ALT_ENTER);
       } break;
 #endif
@@ -795,8 +796,12 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           guest_output_paint_config.GetEffect() == GuestOutputPaintConfig::Effect::kFsr3;
 #endif
       auto is_temporal_easu_effect = [&]([[maybe_unused]] size_t effect_index) {
+#if defined(REX_HAS_FIDELITYFX_SDK)
         return temporal_effect_selected &&
                guest_output_flow.effects[effect_index] == GuestOutputPaintEffect::kFsrEasu;
+#else
+        return false;
+#endif
       };
       for (size_t i = 0; i < guest_output_flow.effect_count; ++i) {
         bool is_final_effect = i + 1 >= guest_output_flow.effect_count;
@@ -943,16 +948,19 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
           UINT effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
+#if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
+#endif
           } effect_constants;
           switch (guest_output_paint_root_signature_index) {
             case kGuestOutputPaintRootSignatureIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintRootSignatureIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);
               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
@@ -971,6 +979,7 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
               effect_constants_size = sizeof(effect_constants.fsr_rcas);
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
+#endif
             default:
               break;
           }
@@ -1260,6 +1269,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexBilinear]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
+#if defined(REX_HAS_FIDELITYFX_SDK)
   // EASU (needs the sampler).
   guest_output_paint_root_parameter_effect_constants.Constants.Num32BitValues =
       sizeof(FsrEasuConstants) / sizeof(uint32_t);
@@ -1322,6 +1332,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
     *(guest_output_paint_root_signatures_[kGuestOutputPaintRootSignatureIndexCasResample]
           .ReleaseAndGetAddressOf()) = guest_output_paint_root_signature;
   }
+#endif  // defined(REX_HAS_FIDELITYFX_SDK)
 
   // Guest output painting pipelines.
   D3D12_GRAPHICS_PIPELINE_STATE_DESC guest_output_paint_pipeline_desc = {};
@@ -1352,6 +1363,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_bilinear_dither_ps);
         break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         guest_output_paint_pipeline_desc.PS.pShaderBytecode =
             shaders::guest_output_ffx_cas_sharpen_ps;
@@ -1392,6 +1404,7 @@ bool D3D12Presenter::InitializeSurfaceIndependent() {
         guest_output_paint_pipeline_desc.PS.BytecodeLength =
             sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         break;
+#endif
       default:
         // Not supported by this implementation.
         continue;

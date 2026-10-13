@@ -10,7 +10,6 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <cmath>
 
 #include <rex/assert.h>
@@ -40,6 +39,8 @@ REXCVAR_DEFINE_BOOL(resolve_resolution_scale_fill_half_pixel_offset, true, "GPU"
 //     "resolve areas to eliminate the gap caused by the half-pixel offset (this "
 //     "is necessary for certain games to display the scene graphics).",
 //     "GPU");
+
+REXCVAR_DECLARE(bool, gpu_disable_msaa);
 
 namespace rex::graphics::draw_util {
 
@@ -684,142 +685,6 @@ void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
   }
 }
 
-InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
-                                                     const Shader& vertex_shader) {
-  // HAND PATCH: single source of truth for how draws with invalid-type vertex
-  // fetch constants are treated; see the header for the shape taxonomy and
-  // flags.cpp for the two gating cvars. Scans EVERY fetch slot the shader can
-  // touch (no residency-cache filtering - the verdict must not change between
-  // draws just because a slot's buffer state was already cached).
-  bool saw_invalid = false;
-  bool saw_stale_address = false;
-  bool saw_read_null_optional = false;
-  const Shader::ConstantRegisterMap& constant_map = vertex_shader.constant_register_map();
-  for (uint32_t i = 0; i < rex::countof(constant_map.vertex_fetch_bitmap); ++i) {
-    uint32_t vfetch_bits_remaining = constant_map.vertex_fetch_bitmap[i];
-    uint32_t j;
-    while (rex::bit_scan_forward(vfetch_bits_remaining, &j)) {
-      vfetch_bits_remaining &= ~(uint32_t(1) << j);
-      uint32_t vfetch_index = i * 32 + j;
-      xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      switch (vfetch_constant.type) {
-        case xenos::FetchConstantType::kVertex:
-          continue;
-        case xenos::FetchConstantType::kInvalidVertex:
-          break;
-        default:
-          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
-                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          return InvalidVertexFetchVerdict::kVeto;
-      }
-      saw_invalid = true;
-      if (vfetch_constant.address == 0 && vfetch_constant.size == 0) {
-        // All-zero constants: harmless on a slot the shader references but
-        // never actually fetches through (no vertex binding exists - the
-        // translator only creates one when a fetch result is used), poison
-        // on a main stream (all-zero vertex data makes (0,0,0,0)-class
-        // positions that wedge the scan converter). A stride-0 binding sits
-        // in between: the shader really reads the absent stream, and
-        // rasterizing whatever its zeros produce has hung Van Gogh, RDNA2
-        // Vulkan and D3D12 alike (#13/#16) - so those draws run their vertex
-        // work (streaming still completes) with rasterization disabled.
-        bool optional_stream = true;
-        bool stream_is_read = false;
-        for (const Shader::VertexBinding& vfetch_binding : vertex_shader.vertex_bindings()) {
-          if (vfetch_binding.fetch_constant == vfetch_index) {
-            stream_is_read = true;
-            optional_stream = vfetch_binding.stride_words == 0;
-            break;
-          }
-        }
-        if (!optional_stream) {
-          static std::atomic<uint32_t> null_main_logs{0};
-          uint32_t null_main_n = null_main_logs.fetch_add(1, std::memory_order_relaxed);
-          if (null_main_n < 16 || (null_main_n & 1023) == 0) {
-            REXGPU_WARN(
-                "[NULL-MAIN-STREAM] draw vetoed: slot={} vs={:016X} "
-                "(entity still streaming; occurrence {})",
-                vfetch_index, vertex_shader.ucode_data_hash(), null_main_n + 1);
-          }
-          return InvalidVertexFetchVerdict::kVeto;
-        }
-        if (!REXCVAR_GET(gpu_allow_null_optional_streams) &&
-            !REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
-          static std::atomic<uint32_t> null_optional_logs{0};
-          uint32_t null_optional_n = null_optional_logs.fetch_add(1, std::memory_order_relaxed);
-          if (null_optional_n < 64 || (null_optional_n & 4095) == 0) {
-            REXGPU_WARN(
-                "[NULL-OPTIONAL-VETO] draw vetoed: slot={} read={} memexport={} vs={:016X} "
-                "(occurrence {})",
-                vfetch_index, stream_is_read, vertex_shader.memexport_eM_written() != 0,
-                vertex_shader.ucode_data_hash(), null_optional_n + 1);
-          }
-          return InvalidVertexFetchVerdict::kVeto;
-        }
-        if (stream_is_read) {
-          saw_read_null_optional = true;
-        }
-        continue;
-      }
-      if (vfetch_constant.address != 0 && vfetch_constant.size != 0 &&
-          (uint64_t(vfetch_constant.size) << 2) <= (64u << 20)) {
-        // Plausible stale address/size - a streaming priming draw, only under
-        // the experimental flag, and never rasterized.
-        if (!REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
-          static std::atomic<uint32_t> invalid_vfetch_logs{0};
-          if (invalid_vfetch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-            REXGPU_WARN(
-                "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type - draw "
-                "skipped (gpu_allow_invalid_fetch_constants would admit it as a "
-                "priming draw)",
-                vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-          }
-          return InvalidVertexFetchVerdict::kVeto;
-        }
-        saw_stale_address = true;
-        continue;
-      }
-      // Nonzero garbage (address without size or vice versa, or an absurd
-      // size): nothing safe can be made of this draw.
-      static std::atomic<uint32_t> garbage_vfetch_logs{0};
-      if (garbage_vfetch_logs.fetch_add(1, std::memory_order_relaxed) < 16) {
-        REXGPU_WARN(
-            "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type and no usable "
-            "buffer - draw skipped",
-            vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
-      }
-      return InvalidVertexFetchVerdict::kVeto;
-    }
-  }
-  if (!saw_invalid) {
-    return InvalidVertexFetchVerdict::kNone;
-  }
-  if (saw_stale_address) {
-    static std::atomic<uint32_t> priming_logs{0};
-    uint32_t log_n = priming_logs.fetch_add(1, std::memory_order_relaxed);
-    if (log_n < 256 || (log_n & 255) == 0) {
-      REXGPU_WARN("[INVALID-VFETCH-PRIMING] vs={:016X} admitted without rasterization "
-                  "(occurrence {})",
-                  vertex_shader.ucode_data_hash(), log_n + 1);
-    }
-    return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
-  }
-  if (saw_read_null_optional) {
-    if (REXCVAR_GET(gpu_rasterize_null_optional_reads)) {
-      return InvalidVertexFetchVerdict::kRasterize;
-    }
-    static std::atomic<uint32_t> read_null_logs{0};
-    uint32_t log_n = read_null_logs.fetch_add(1, std::memory_order_relaxed);
-    if (log_n < 256 || (log_n & 255) == 0) {
-      REXGPU_WARN("[NULL-OPTIONAL-READ] vs={:016X} reads an absent optional stream - "
-                  "vertex work only, rasterization disabled (occurrence {})",
-                  vertex_shader.ucode_data_hash(), log_n + 1);
-    }
-    return InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
-  }
-  return InvalidVertexFetchVerdict::kRasterize;
-}
-
 xenos::CopySampleSelect SanitizeCopySampleSelect(xenos::CopySampleSelect copy_sample_select,
                                                  xenos::MsaaSamples msaa_samples, bool is_depth) {
   // Depth can't be averaged.
@@ -900,16 +765,13 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
 };
 
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
-                    TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
-                    uint32_t draw_resolution_scale_y, bool fixed_rg16_truncated_to_minus_1_to_1,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out) {
   // Don't pass uninitialized values to shaders, not to leak data to frame
   // captures. Also initialize an invalid resolve to empty.
   info_out.coordinate_info.packed = 0;
   info_out.height_div_8 = 0;
-  info_out.rect_x0 = 0;
-  info_out.rect_y0 = 0;
-  info_out.copy_dest_base_raw = 0;
 
   auto rb_copy_control = regs.Get<reg::RB_COPY_CONTROL>();
   info_out.rb_copy_control = rb_copy_control;
@@ -933,7 +795,6 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
     assert_always();
     return false;
   }
-  trace_writer.WriteMemoryRead(fetch.address * sizeof(uint32_t), fetch.size * sizeof(uint32_t));
   const float* vertices_guest =
       reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
   // Most vertices have a negative half-pixel offset applied, which we reverse.
@@ -1042,7 +903,9 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   // Get the sample selection to safely pass to the shader.
   xenos::CopySampleSelect sample_select = SanitizeCopySampleSelect(
       rb_copy_control.copy_sample_select, rb_surface_info.msaa_samples, is_depth);
-  if (rb_copy_control.copy_sample_select != sample_select) {
+  // With gpu_disable_msaa every multisampled resolve hits this - expected.
+  static const bool msaa_disabled = REXCVAR_GET(gpu_disable_msaa);
+  if (rb_copy_control.copy_sample_select != sample_select && !msaa_disabled) {
     REXGPU_WARN(
         "Incorrect resolve sample selected for {}-sample {}: {}, treating like "
         "{}",
@@ -1149,9 +1012,6 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
   info_out.copy_dest_base = copy_dest_base_adjusted;
   info_out.copy_dest_extent_start = copy_dest_extent_start;
   info_out.copy_dest_extent_length = copy_dest_extent_end - copy_dest_extent_start;
-  info_out.rect_x0 = uint32_t(x0);
-  info_out.rect_y0 = uint32_t(y0);
-  info_out.copy_dest_base_raw = rb_copy_dest_base;
 
   // Offset relative to the beginning of the tile to put it in fewer bits.
   uint32_t sample_count_log2_x = uint32_t(rb_surface_info.msaa_samples >= xenos::MsaaSamples::k4X);

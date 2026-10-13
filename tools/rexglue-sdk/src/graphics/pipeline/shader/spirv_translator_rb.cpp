@@ -16,10 +16,55 @@
 #include <SPIRV/GLSL.std.450.h>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/render_target/cache.h>
 #include <rex/graphics/pipeline/shader/spirv_translator.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/math.h>
+
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+
+// Metal has no fragment-input coverage mask; MoltenVK synthesises
+// gl_SampleMaskIn and never reports sample 0 on iOS GPUs, so default this on
+// there. macOS Metal reports it correctly, so leave it off to avoid paying for
+// per-sample invocations.
+#if defined(__APPLE__) && TARGET_OS_IPHONE
+#define REX_FSI_SAMPLE_ID_COVERAGE_DEFAULT true
+#else
+#define REX_FSI_SAMPLE_ID_COVERAGE_DEFAULT false
+#endif
+
+// NoContraction is expanded by SPIRV-Cross into a call to an
+// [[clang::optnone]] fma() helper for every decorated operation. On Metal that
+// both defeats optimization in the hottest shaders and miscompiles: in
+// one title's terrain vertex shader the world-space Y component came out as a
+// constant while X and Z stayed exact, flattening every chunk into a sliver.
+// The reproducibility it buys is only needed for multipass rendering that
+// relies on bit-exact results between shaders, which is not worth a miscompile.
+#if defined(__APPLE__)
+#define REX_SHADER_NO_CONTRACTION_DEFAULT false
+#else
+#define REX_SHADER_NO_CONTRACTION_DEFAULT true
+#endif
+
+REXCVAR_DEFINE_BOOL(shader_no_contraction, REX_SHADER_NO_CONTRACTION_DEFAULT, "GPU/Shader",
+                    "Decorate arithmetic with NoContraction for bit-exact reproducibility across "
+                    "shaders. Must be off on Metal: SPIRV-Cross expands every decorated operation "
+                    "into an [[clang::optnone]] fma() helper, and the Metal compiler miscompiles "
+                    "the resulting shader (a vertex position component comes out constant), as "
+                    "well as losing all optimization in the hottest shaders.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
+REXCVAR_DEFINE_BOOL(
+    fsi_sample_mask_from_sample_id, REX_FSI_SAMPLE_ID_COVERAGE_DEFAULT, "GPU/Shader",
+    "Fragment shader interlock: derive the MSAA coverage mask from gl_SampleID "
+    "with sample-rate shading instead of reading gl_SampleMaskIn. Needed on "
+    "drivers that do not report a fragment-input coverage mask correctly "
+    "(Metal/MoltenVK has no native equivalent, and drops sample 0), at the cost "
+    "of running the pixel shader once per covered sample. Defaults on for iOS.")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
 namespace rex::graphics {
 
@@ -1443,14 +1488,29 @@ void SpirvShaderTranslator::FSI_LoadSampleMask(spv::Id msaa_samples) {
   spv::Id const_uint_1 = builder_->makeUintConstant(1);
   spv::Id const_uint_2 = builder_->makeUintConstant(2);
 
-  assert_true(input_sample_mask_ != spv::NoResult);
-  id_vector_temp_.clear();
-  id_vector_temp_.push_back(const_int_0_);
-  spv::Id input_sample_mask_value = builder_->createUnaryOp(
-      spv::OpBitcast, type_uint_,
-      builder_->createLoad(
-          builder_->createAccessChain(spv::StorageClassInput, input_sample_mask_, id_vector_temp_),
-          spv::NoPrecision));
+  spv::Id input_sample_mask_value;
+  if (REXCVAR_GET(fsi_sample_mask_from_sample_id)) {
+    // Metal has no fragment-input coverage mask, so MoltenVK's gl_SampleMaskIn
+    // is unreliable (it never reports sample 0). With sample-rate shading the
+    // pixel shader is invoked once per covered sample instead, so the coverage
+    // of this invocation is exactly its own sample - the remapping below then
+    // works on it unchanged.
+    assert_true(input_sample_id_ != spv::NoResult);
+    input_sample_mask_value = builder_->createBinOp(
+        spv::OpShiftLeftLogical, type_uint_, builder_->makeUintConstant(1),
+        builder_->createUnaryOp(spv::OpBitcast, type_uint_,
+                                builder_->createLoad(input_sample_id_, spv::NoPrecision)));
+  } else {
+    assert_true(input_sample_mask_ != spv::NoResult);
+    id_vector_temp_.clear();
+    id_vector_temp_.push_back(const_int_0_);
+    input_sample_mask_value = builder_->createUnaryOp(
+        spv::OpBitcast, type_uint_,
+        builder_->createLoad(
+            builder_->createAccessChain(spv::StorageClassInput, input_sample_mask_,
+                                        id_vector_temp_),
+            spv::NoPrecision));
+  }
 
   spv::Block& block_msaa_head = *builder_->getBuildPoint();
   spv::Block& block_msaa_1x = builder_->makeNewBlock();

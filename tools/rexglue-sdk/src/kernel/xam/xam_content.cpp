@@ -15,7 +15,7 @@
 #include <rex/math.h>
 #include <rex/hook.h>
 #include <rex/types.h>
-#include <rex/string/util.h>
+#include <rex/string.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xam/content_device.h>
 #include <rex/system/xenumerator.h>
@@ -160,7 +160,8 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
         // Close any existing mount under this root name first.
         // Games may reuse the same root without explicitly closing.
         content_manager->CloseContent(root_name);
-        if (content_manager->ContentExists(xuid, content_data)) {
+        if (content_manager->ContentExists(xuid, content_data) &&
+            XFAILED(content_manager->BeginRewrite(xuid, content_data))) {
           content_manager->DeleteContent(xuid, content_data);
         }
         // Check filesystem state after deletion attempt to decide
@@ -193,7 +194,9 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
           result = X_ERROR_PATH_NOT_FOUND;
         } else {
           content_manager->CloseContent(root_name);
-          content_manager->DeleteContent(xuid, content_data);
+          if (XFAILED(content_manager->BeginRewrite(xuid, content_data))) {
+            content_manager->DeleteContent(xuid, content_data);
+          }
           if (content_manager->ContentExists(xuid, content_data)) {
             disposition = kDispositionState::Open;
           } else {
@@ -224,6 +227,10 @@ u32 xeXamContentCreate(u32 user_index, mapped_string root_name, mapped_void cont
       *disposition_ptr = static_cast<uint32_t>(disposition);
     }
 
+    REXLOG_INFO("[save] XamContentCreate root='{}' file='{}' type={:08X} flags={:08X} -> {:08X} "
+                "disposition {}",
+                root_name, content_data.file_name(), uint32_t(XContentType(content_data.content_type)),
+                uint32_t(flags), uint32_t(result), uint32_t(disposition));  // DEVSTATS
     extended_error = X_HRESULT_FROM_WIN32(result);
     length = static_cast<uint32_t>(disposition);
     return result;
@@ -270,6 +277,7 @@ u32 XamContentOpenFile_entry(u32 user_index, mapped_string root_name, mapped_str
 
 u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   X_RESULT result = X_ERROR_SUCCESS;
+  REXLOG_INFO("[save] XamContentFlush root='{}'", root_name.value());  // DEVSTATS
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);
     return X_ERROR_IO_PENDING;
@@ -281,6 +289,8 @@ u32 XamContentFlush_entry(mapped_string root_name, mapped_void overlapped_ptr) {
 u32 XamContentClose_entry(mapped_string root_name, mapped_void overlapped_ptr) {
   // Closes a previously opened root from XamContentCreate*.
   auto result = REX_KERNEL_STATE()->content_manager()->CloseContent(root_name.value());
+  REXLOG_INFO("[save] XamContentClose root='{}' -> {:08X}", root_name.value(),
+              uint32_t(result));  // DEVSTATS
 
   if (overlapped_ptr) {
     REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped_ptr.guest_address(), result);

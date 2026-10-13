@@ -9,6 +9,7 @@
  *              See LICENSE file in the project root for full license text.
  */
 
+#include <cstdio>
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -25,6 +26,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/platform/env.h>
 
 #if REX_PLATFORM_WIN32
 #include <spdlog/sinks/msvc_sink.h>
@@ -71,7 +73,10 @@ LogConfig g_config;
 
 std::filesystem::path NextSequentialLogPath(const std::filesystem::path& logs_dir,
                                             std::string_view app_name) {
-  std::filesystem::create_directories(logs_dir);
+  // Non-throwing: this runs before any sink exists, so an exception here escapes
+  // as an unhandled std::filesystem_error rather than a diagnosable failure.
+  std::error_code mkdir_ec;
+  std::filesystem::create_directories(logs_dir, mkdir_ec);
 
   int max_seq = 0;
   std::string prefix = std::string(app_name) + "_";
@@ -225,12 +230,21 @@ void InitLogging(const LogConfig& config) {
     resolved_path = NextSequentialLogPath(log_dir, config.app_name).string();
   }
   if (!resolved_path.empty()) {
+    // Losing the log file is not worth losing the process over: spdlog throws,
+    // and on iOS an unwritable directory threw std::filesystem_error out of
+    // main before anything had a chance to report it.
+    try {
     auto sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
         resolved_path, static_cast<size_t>(REXCVAR_GET(log_max_file_size_mb)) * 1024 * 1024,
         static_cast<size_t>(REXCVAR_GET(log_max_files)), false);
     sink->set_level(spdlog::level::trace);
     sink->set_pattern(config.file_pattern);
     g_file_sink = sink;
+    } catch (const std::exception& e) {
+      g_file_sink.reset();
+      std::fprintf(stderr, "logging: file sink disabled (%s): %s\n", resolved_path.c_str(),
+                   e.what());
+    }
   }
 
   g_extra_sinks = config.extra_sinks;
@@ -285,6 +299,13 @@ void ShutdownLogging() {
   g_extra_sinks.clear();
   g_initialized = false;
   g_early_initialized = false;
+}
+
+void FlushLogging() {
+  std::lock_guard lock(g_mutex);
+  for (auto& entry : g_registry)
+    if (entry.logger)
+      entry.logger->flush();
 }
 
 LogCategoryId RegisterLogCategory(const char* name) {
@@ -503,11 +524,11 @@ LogConfig BuildLogConfig(const char* log_file, const std::string& cli_level,
   config.default_level = kDefaultLogLevel;
 
   // Environment variable
-  if (const char* env_level = std::getenv("REX_LOG_LEVEL")) {
-    if (auto level = ParseLogLevel(env_level))
+  if (auto env_level = rex::platform::env::get("REX_LOG_LEVEL")) {
+    if (auto level = ParseLogLevel(*env_level))
       config.default_level = *level;
-  } else if (const char* env_level2 = std::getenv("SPDLOG_LEVEL")) {
-    if (auto level = ParseLogLevel(env_level2))
+  } else if (auto env_level2 = rex::platform::env::get("SPDLOG_LEVEL")) {
+    if (auto level = ParseLogLevel(*env_level2))
       config.default_level = *level;
   }
 

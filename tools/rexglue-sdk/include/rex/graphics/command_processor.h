@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -22,14 +23,13 @@
 #include <vector>
 
 #include <rex/graphics/register_file.h>
-#include <rex/graphics/native_gpu_diagnostics.h>
 #include <rex/graphics/registers.h>
-#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <rex/thread/background_gate.h>
 #include <rex/ui/presenter.h>
 
 namespace rex::stream {
@@ -77,7 +77,6 @@ enum class GammaRampType {
 
 class CommandProcessor {
  public:
-  NativeGpuDiagnostics& native_gpu_diagnostics() { return native_gpu_diagnostics_; }
   enum class SwapPostEffect {
     kNone,
     kFxaa,
@@ -89,6 +88,10 @@ class CommandProcessor {
 
   uint32_t counter() const { return counter_; }
   void increment_counter() { counter_++; }
+
+  // Wakes a WAIT_REG_MEM in progress to re-check its condition. Called after
+  // each guest vblank interrupt, which is what most of those waits are for.
+  void NotifyGuestProgress();
 
   Shader* active_vertex_shader() const { return active_vertex_shader_; }
   Shader* active_pixel_shader() const { return active_pixel_shader_; }
@@ -112,29 +115,11 @@ class CommandProcessor {
   virtual void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                          uint32_t frontbuffer_height) = 0;
 
-  // Diagnostic (gpu_wait_stats): host ticks the command processor thread spent
-  // blocked on host GPU fences, reported by the backend. full_sync is set for
-  // waits for all submitted work rather than for an older frame.
-  static void RecordHostGpuFenceWait(uint64_t host_ticks, bool full_sync);
-
   // May be called not only from the command processor thread when the command
   // processor is paused, and the termination of this function may be explicitly
   // awaited.
   virtual void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                        bool blocking);
-
-  virtual void RequestFrameTrace(const std::filesystem::path& root_path);
-  virtual void BeginTracing(const std::filesystem::path& root_path);
-  virtual void EndTracing();
-
-  virtual void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) = 0;
-
-  void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
-                        uint32_t register_count, bool execute_callbacks);
-  void RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
-                        const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
-                        uint32_t new_gamma_ramp_rw_component);
-  virtual void RestoreEdramSnapshot(const void* snapshot) = 0;
 
   void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
   void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
@@ -146,6 +131,7 @@ class CommandProcessor {
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
+  void SetBackgrounded(bool backgrounded);
 
   bool Save(::rex::stream::ByteStream* stream);
   bool Restore(::rex::stream::ByteStream* stream);
@@ -160,6 +146,7 @@ class CommandProcessor {
   };
 
   void WorkerThreadMain();
+  void CheckBackgroundPause();
   virtual bool SetupContext() = 0;
   virtual void ShutdownContext() = 0;
 
@@ -188,6 +175,7 @@ class CommandProcessor {
 
   virtual void MakeCoherent();
   virtual void PrepareForWait();
+  virtual void PrepareForSuspend() {}
   virtual void ReturnFromWait();
 
   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
@@ -202,9 +190,8 @@ class CommandProcessor {
   bool ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
   bool ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
-  // Marker of a native record replacing the packets a Direct3D hook skipped.
-  bool ExecutePacketType3_NATIVE_RECORD(memory::RingBuffer* reader, uint32_t packet,
-                                        uint32_t count);
+  // Holds the swap back until the next framerate_limit deadline.
+  void ThrottlePresentation();
   bool ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader, uint32_t packet,
                                           uint32_t count);
   bool ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
@@ -249,8 +236,6 @@ class CommandProcessor {
   // implementations.
   SwapPostEffect GetActualSwapPostEffect() const { return swap_post_effect_actual_; }
 
-  virtual void InitializeTrace();
-
   // Shared readback resolve mode with backend legacy-flag alias support.
   ReadbackResolveMode GetReadbackResolveMode(bool legacy_readback_resolve_enabled) const;
   // Shared memexport readback enable state with backend legacy-flag override support.
@@ -261,17 +246,6 @@ class CommandProcessor {
   GraphicsSystem* graphics_system_ = nullptr;
   RegisterFile* register_file_ = nullptr;
 
-  TraceWriter trace_writer_;
-  NativeGpuDiagnostics native_gpu_diagnostics_;
-  enum class TraceState {
-    kDisabled,
-    kStreaming,
-    kSingleFrame,
-  };
-  TraceState trace_state_ = TraceState::kDisabled;
-  std::filesystem::path trace_stream_path_;
-  std::filesystem::path trace_frame_path_;
-
   std::atomic<bool> worker_running_;
   system::object_ref<system::XHostThread> worker_thread_;
 
@@ -281,6 +255,14 @@ class CommandProcessor {
   std::vector<uint32_t> me_bin_;
 
   uint32_t counter_ = 0;
+
+  // framerate_limit schedule: host tick of the last paced swap, 0 when idle.
+  uint64_t last_swap_host_ticks_ = 0;
+
+  // See NotifyGuestProgress.
+  std::mutex guest_progress_mutex_;
+  std::condition_variable guest_progress_cv_;
+  uint64_t guest_progress_seq_ = 0;  // Guarded by guest_progress_mutex_.
 
   uint32_t primary_buffer_ptr_ = 0;
   uint32_t primary_buffer_size_ = 0;
@@ -303,7 +285,10 @@ class CommandProcessor {
   Shader* active_vertex_shader_ = nullptr;
   Shader* active_pixel_shader_ = nullptr;
 
+  thread::BackgroundGate background_gate_;
   bool paused_ = false;
+  std::unique_ptr<rex::thread::Event> resume_event_ =
+      rex::thread::Event::CreateAutoResetEvent(false);
 
   // By default (such as for tools), post-processing is disabled.
   // "Desired" is for the external thread managing the post-processing effect.
@@ -313,10 +298,6 @@ class CommandProcessor {
   // Set by backend command processors to their legacy memexport readback cvar
   // name (for explicit-override compatibility).
   const char* legacy_readback_memexport_cvar_name_ = nullptr;
-  // Whether the legacy cvar above has a non-default value: -1 until checked.
-  // The check is a string lookup in the cvar registry, too slow for every
-  // draw, so it's cached and redone once per frame (at the swap).
-  mutable int8_t legacy_readback_memexport_overridden_ = -1;
 
  private:
   reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};

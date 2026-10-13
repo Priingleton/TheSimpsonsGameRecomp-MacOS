@@ -276,10 +276,12 @@ bool build_vaddsws(BuilderContext& ctx) {
       "\t\tsimde__m128i sat_val = simde_mm_xor_si128(simde_mm_srai_epi32(a, 31), "
       "simde_mm_set1_epi32(0x7FFFFFFF));");
   // Blend: select sat_val where overflow MSB is set, else sum
-  // Since blendv_epi8 works on bytes, we must replicate the word's MSB to all its bytes.
   ctx.println(
-      "\t\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_blendv_epi8(sum, sat_val, "
-      "simde_mm_srai_epi32(overflow, 31)));",
+      "\t\tsimde_mm_store_si128((simde__m128i*){}.u8, "
+      "simde_mm_castps_si128(simde_mm_blendv_ps("
+      "simde_mm_castsi128_ps(sum), "
+      "simde_mm_castsi128_ps(sat_val), "
+      "simde_mm_castsi128_ps(overflow))));",
       vD);
   ctx.println("\t}}");
   return true;
@@ -1096,18 +1098,17 @@ bool build_vpkuhus(BuilderContext& ctx) {
   // NOTE(tomc): _mm_packus_epi16 treats inputs as signed, so we need custom saturation for
   // unsigned. Unsigned halfwords >= 0x8000 would be interpreted as negative and clamped to 0
   // instead of 0xFF.
-  // HAND PATCH: the scalar expansion must snapshot both sources before writing the
-  // destination -- vD frequently aliases vA or vB (e.g. "vpkuhus v0,v12,v0"), and the
-  // previous in-place form read source elements it had already overwritten. This was
-  // the root cause of the VP6 video green-chroma corruption (2 of every 8 packed
-  // pixels destroyed whenever vD==vB).
+  // vD often aliases vA or vB ("vpkuhus v0,v12,v0" in The Simpsons Game's VP6
+  // decoder), so both sources are copied before any byte of vD is written.
+  // Packing in place read already-overwritten elements and broke 2 of every 8
+  // pixels (green video chroma).
   ctx.println("\t{{");
-  ctx.println("\t\tPPCVRegister _pka = {}, _pkb = {};", ctx.v(ctx.insn.operands[1]),
+  ctx.println("\t\tPPCVRegister pack_a = {}, pack_b = {};", ctx.v(ctx.insn.operands[1]),
               ctx.v(ctx.insn.operands[2]));
   for (size_t i = 0; i < 8; i++) {
-    ctx.println("\t\t{}.u8[{}] = _pka.u16[{}] > 0xFF ? 0xFF : (uint8_t)_pka.u16[{}];",
+    ctx.println("\t\t{}.u8[{}] = pack_a.u16[{}] > 0xFF ? 0xFF : (uint8_t)pack_a.u16[{}];",
                 ctx.v(ctx.insn.operands[0]), 15 - i, 7 - i, 7 - i);
-    ctx.println("\t\t{}.u8[{}] = _pkb.u16[{}] > 0xFF ? 0xFF : (uint8_t)_pkb.u16[{}];",
+    ctx.println("\t\t{}.u8[{}] = pack_b.u16[{}] > 0xFF ? 0xFF : (uint8_t)pack_b.u16[{}];",
                 ctx.v(ctx.insn.operands[0]), 7 - i, 7 - i, 7 - i);
   }
   ctx.println("\t}}");
@@ -1130,18 +1131,15 @@ bool build_vpkuwus(BuilderContext& ctx) {
   // Vector Pack Unsigned Word Unsigned Saturate
 
   // NOTE(tomc): _mm_packus_epi32 treats inputs as signed, so we need custom saturation for unsigned
-  // Saturate each u32 to [0, 0xFFFF], then pack to u16
-  // HAND PATCH: snapshot sources before writing -- vD aliases vA/vB in real code
-  // ("vpkuwus v0,v12,v0" in the VP6 motion-compensation filter), and the previous
-  // in-place expansion read already-clobbered elements, zeroing/saturating 2 of
-  // every 8 pixels. This was the green video artifact root cause.
+  // Saturate each u32 to [0, 0xFFFF], then pack to u16. Sources are copied
+  // first for the same reason as vpkuhus: vD aliases vA/vB in real code.
   ctx.println("\t{{");
-  ctx.println("\t\tPPCVRegister _pka = {}, _pkb = {};", ctx.v(ctx.insn.operands[1]),
+  ctx.println("\t\tPPCVRegister pack_a = {}, pack_b = {};", ctx.v(ctx.insn.operands[1]),
               ctx.v(ctx.insn.operands[2]));
   for (size_t i = 0; i < 4; i++) {
-    ctx.println("\t\t{}.u16[{}] = _pka.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t)_pka.u32[{}];",
+    ctx.println("\t\t{}.u16[{}] = pack_a.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t)pack_a.u32[{}];",
                 ctx.v(ctx.insn.operands[0]), 7 - i, 3 - i, 3 - i);
-    ctx.println("\t\t{}.u16[{}] = _pkb.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t)_pkb.u32[{}];",
+    ctx.println("\t\t{}.u16[{}] = pack_b.u32[{}] > 0xFFFF ? 0xFFFF : (uint16_t)pack_b.u32[{}];",
                 ctx.v(ctx.insn.operands[0]), 3 - i, 3 - i, 3 - i);
   }
   ctx.println("\t}}");
@@ -1335,46 +1333,15 @@ bool build_vpkd3d128(BuilderContext& ctx) {
 
     case 5:  // float16_4
     {
-      // NOTE: These combinations come from game traces (heuristic handling), not the official spec.
-      // The spec only defines the encoding, not the exact semantics of y (mask) and z (shift) here.
-      // Anyone reading this later should know it may need extending if new combos turn up in other
-      // games. Combinations observed so far: mask=2, shift=0 → write u16[3..0], zero u16[4..7]
-      // mask=2, shift=2 → write u16[7..4], zero u16[3..0] (first pass)
-      // mask=3, shift=0 → write u16[3..0] without zeroing (second pass, preserves the upper half)
+      // Pack 4 elements into 64 bits (4 x 16-bit floats)
+      // Guest element 0 goes to highest 16-bit position, element 3 to lowest
+      // Output u16 index = (3-i) + 2*shift for element i
+      if (ctx.insn.operands[3] != 2 || ctx.insn.operands[4] > 2)
+        REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X}", ctx.base);
 
-      uint32_t mask = ctx.insn.operands[3];
-      uint32_t shift = ctx.insn.operands[4];
-
-      // Guard fix: The shift bound was too loose (shift=3 would cause dstIdx to reach 9, an OOB
-      // store). We also explicitly reject shift == 1 since the clear block below only handles 0
-      // and 2. Furthermore, we explicitly warn on unexpected mask values (e.g., 0, 1) to avoid
-      // silent fallthroughs and silently generating miscompiled code.
-      if ((shift != 0 && shift != 2) || (mask != 2 && mask != 3)) {
-        REXCODEGEN_WARN("Unexpected float16_4 pack instruction at {:X} (mask={}, shift={})",
-                        ctx.base, mask, shift);
-        // Emits a debug trap in the generated code to catch this at runtime.
-        ctx.println("\t__builtin_debugtrap();");
-        return true;
-      }
-
-      // mask=2: before writing, clear the half that will NOT be written.
-      // Shift is guaranteed to be 0 or 2 at this point due to the guard above.
-      if (mask == 2) {
-        // Optimization: Emit a single u64 write instead of two u32 writes.
-        // shift=0 → clears upper half u64[1]
-        // shift=2 → clears lower half u64[0]
-        size_t clearU64Start = (shift == 0) ? 1 : 0;
-        ctx.println("\t{}.u64[{}] = 0;", ctx.v(ctx.insn.operands[0]), clearU64Start);
-      }
-
-      // Invariant: dstIdx must stay under 8 (valid u16 lanes are 0..7).
-      // Capping the shift to 0 or 2 in the guard check above ensures this is safe:
-      // it restricts the max dstIdx to (3 - 0) + (2 * 2) = 7.
-      // Do not widen the shift bounds without adjusting this logic.
       for (size_t i = 0; i < 4; i++) {
-        size_t srcIdx = 3 - i;
-        size_t dstIdx = (3 - i) + (2 * shift);
-
+        size_t srcIdx = 3 - i;  // Guest element i is at host array index 3-i
+        size_t dstIdx = (3 - i) + (2 * ctx.insn.operands[4]);  // Output also reversed
         ctx.println("\t{}.u32 = ({}.u32[{}]&0x7FFFFFFF);", ctx.temp(), ctx.v(ctx.insn.operands[1]),
                     srcIdx);
         ctx.println(

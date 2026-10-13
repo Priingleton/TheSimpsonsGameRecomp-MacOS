@@ -80,11 +80,7 @@ class TextureCache {
   virtual void BeginSubmission(uint64_t new_submission_index);
   virtual void BeginFrame();
 
-  // unscaled: with draw resolution scaling, resolved at the guest resolution
-  // anyway (from an original resolution render target) - textures of the range
-  // are loaded unscaled from memory.
-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
-                           bool unscaled = false);
+  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
   // Ensures the memory backing the range in the scaled resolve address space is
   // allocated and returns whether it is.
   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t /*start_unscaled*/,
@@ -114,9 +110,6 @@ class TextureCache {
   }
 
   virtual void RequestTextures(uint32_t used_texture_mask);
-  // Make CPU-backed resources reload into a new trace even when their native
-  // uploads have never been copied into the shared-memory mirror.
-  void InvalidateCpuTextureInputsForTrace();
 
   // "ActiveTexture" means as of the latest RequestTextures call.
 
@@ -243,14 +236,6 @@ class TextureCache {
     // destroyed while still in use.
     void MarkAsUsed();
 
-    // Native resolves whose scaled resolve memory hasn't been written yet: the
-    // texture holds the only copy of that data, so it's kept alive until the
-    // render target cache writes it back (see native_resolve_scaled_lazy_memory).
-    uint32_t scaled_memory_pending() const { return scaled_memory_pending_; }
-    void AddScaledMemoryPending(int32_t delta) {
-      scaled_memory_pending_ = uint32_t(int32_t(scaled_memory_pending_) + delta);
-    }
-
     void LogAction(const char* action) const;
 
    protected:
@@ -273,7 +258,6 @@ class TextureCache {
 
     uint64_t last_usage_submission_index_;
     uint64_t last_usage_time_;
-    uint32_t scaled_memory_pending_ = 0;
     Texture* used_previous_;
     Texture* used_next_;
     bool in_usage_list_;
@@ -409,9 +393,11 @@ class TextureCache {
     kLoadShaderIndex128bpb,
     kLoadShaderIndexR5G5B5A1ToB5G5R5A1,
     kLoadShaderIndexR5G6B5ToB5G6R5,
+    kLoadShaderIndexR5G6B5ToRGBA8,
     kLoadShaderIndexR5G5B6ToB5G6R5WithRBGASwizzle,
     kLoadShaderIndexRGBA4ToBGRA4,
     kLoadShaderIndexRGBA4ToARGB4,
+    kLoadShaderIndexRGBA4ToRGBA8,
     kLoadShaderIndexGBGR8ToGRGB8,
     kLoadShaderIndexGBGR8ToRGB8,
     kLoadShaderIndexBGRG8ToRGBG8,
@@ -530,21 +516,6 @@ class TextureCache {
   // should be made.
   Texture* FindOrCreateTexture(TextureKey key);
 
-  // Calls function(Texture&) for every existing texture whose base level starts
-  // at the 4 KB page.
-  template <typename Function>
-  void ForEachTextureWithBasePage(uint32_t base_page, Function&& function) const {
-    auto range = textures_by_base_page_.equal_range(base_page);
-    for (auto it = range.first; it != range.second; ++it) {
-      function(*it->second);
-    }
-  }
-
-  // For a texture whose base level data has been written directly on the GPU
-  // after the memory range it's sourced from was marked as written by the GPU:
-  // marks the data as matching the memory again and re-arms the memory watches.
-  void MarkTextureBaseWrittenByGpu(Texture& texture);
-
   static const LoadShaderInfo& GetLoadShaderInfo(LoadShaderIndex load_shader_index) {
     assert_true(load_shader_index < kLoadShaderCount);
     return load_shader_info_[load_shader_index];
@@ -556,24 +527,6 @@ class TextureCache {
   // into the texture object.
   virtual bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                      bool load_mips) = 0;
-  // Backends may upload CPU-owned resources directly to a native buffer,
-  // keeping texture decoding independent of a full guest-memory mirror.
-  virtual bool CanLoadTextureDataFromCpu(const Texture& /*texture*/, bool /*load_base*/,
-                                         bool /*load_mips*/) const {
-    return false;
-  }
-  virtual bool LoadTextureDataFromCpuImpl(Texture& /*texture*/, bool /*load_base*/,
-                                          bool /*load_mips*/) {
-    return false;
-  }
-  virtual bool CanLoadTextureDataFromNativeGpu(const Texture& /*texture*/, bool /*load_base*/,
-                                               bool /*load_mips*/) const {
-    return false;
-  }
-  virtual bool LoadTextureDataFromNativeGpuImpl(Texture& /*texture*/, bool /*load_base*/,
-                                                bool /*load_mips*/) {
-    return false;
-  }
 
   // Converts a texture fetch constant to a texture key, normalizing and
   // validating the values, or creating an invalid key, and also gets the
@@ -599,8 +552,6 @@ class TextureCache {
     Texture* texture = nullptr;
     bool load_base = false;
     bool load_mips = false;
-    bool from_cpu = false;
-    bool from_native_gpu = false;
   };
   struct PendingSharedMemoryRange {
     uint32_t start = 0;
@@ -653,8 +604,6 @@ class TextureCache {
   uint64_t current_submission_time_ = 0;
 
   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
-  // Non-owning, maintained by texture creation and destruction.
-  std::unordered_multimap<uint32_t, Texture*> textures_by_base_page_;
 
   uint64_t textures_total_host_memory_usage_ = 0;
 

@@ -12,7 +12,335 @@
 #include "builder_context.h"
 #include "helpers.h"
 
+#include <algorithm>
+#include <set>
+#include <vector>
+
+#include <rex/codegen/binary_view.h>
+#include <rex/codegen/function_node.h>
+#include <rex/memory/utils.h>
+
 namespace rex::codegen {
+
+namespace {
+
+//=============================================================================
+// Interlocked sequences under "interrupts disabled"
+//=============================================================================
+//
+// The Xbox 360 compiler wraps every interlocked operation in
+//   mfmsr rX ; mtmsrd r13 ; lwarx ... stwcx. ; mtmsrd rX
+// Disabling interrupts only kept the reservation from being lost to an
+// interrupt on that hardware thread; it never excluded other cores. Here the
+// lwarx/stwcx. pair is a host compare-and-swap, so taking the process-wide
+// global lock around it adds nothing but contention - and Minecraft refcounts
+// shared pointers this way on every thread, which cost the server thread a
+// fifth of its time. Regions that provably contain nothing but that one
+// atomic operation skip the lock; every other mtmsrd keeps it.
+
+constexpr uint32_t kInterlockedWindowBytes = 32 * 4;
+
+constexpr uint32_t PrimaryOp(uint32_t insn) {
+  return insn >> 26;
+}
+constexpr uint32_t XO10(uint32_t insn) {
+  return (insn >> 1) & 0x3FF;
+}
+
+bool IsLoadReserve(uint32_t insn) {
+  return PrimaryOp(insn) == 31 && (XO10(insn) == 20 || XO10(insn) == 84);  // lwarx, ldarx
+}
+bool IsStoreConditional(uint32_t insn) {
+  return PrimaryOp(insn) == 31 && (XO10(insn) == 150 || XO10(insn) == 214) &&
+         (insn & 1);  // stwcx., stdcx.
+}
+bool IsMtmsrd(uint32_t insn) {
+  return PrimaryOp(insn) == 31 && XO10(insn) == 178;
+}
+uint32_t MtmsrdSource(uint32_t insn) {
+  return (insn >> 21) & 31;
+}
+
+// Integer ops that only read and write registers: no memory, SPRs or calls.
+bool IsRegisterOnlyOp(uint32_t insn) {
+  switch (PrimaryOp(insn)) {
+    case 7:   // mulli
+    case 8:   // subfic
+    case 10:  // cmpli
+    case 11:  // cmpi
+    case 12:  // addic
+    case 13:  // addic.
+    case 14:  // addi
+    case 15:  // addis
+    case 20:  // rlwimi
+    case 21:  // rlwinm
+    case 23:  // rlwnm
+    case 24:  // ori
+    case 25:  // oris
+    case 26:  // xori
+    case 27:  // xoris
+    case 28:  // andi.
+    case 29:  // andis.
+    case 30:  // rldicl, rldicr, rldic, rldimi, rldcl, rldcr
+      return true;
+    case 31:
+      break;
+    default:
+      return false;
+  }
+  switch (XO10(insn)) {
+    case 0:    // cmp
+    case 24:   // slw
+    case 26:   // cntlzw
+    case 27:   // sld
+    case 28:   // and
+    case 32:   // cmpl
+    case 58:   // cntlzd
+    case 60:   // andc
+    case 124:  // nor
+    case 284:  // eqv
+    case 316:  // xor
+    case 412:  // orc
+    case 444:  // or
+    case 476:  // nand
+    case 536:  // srw
+    case 539:  // srd
+    case 598:  // sync, lwsync
+    case 792:  // sraw
+    case 794:  // srad
+    case 824:  // srawi
+    case 922:  // extsh
+    case 954:  // extsb
+    case 986:  // extsw
+      return true;
+    default:
+      break;
+  }
+  if (((insn >> 2) & 0x1FF) == 413) {  // sradi
+    return true;
+  }
+  switch ((insn >> 1) & 0x1FF) {  // XO-form arithmetic, either OE setting
+    case 8:    // subfc
+    case 9:    // mulhdu
+    case 10:   // addc
+    case 11:   // mulhwu
+    case 40:   // subf
+    case 73:   // mulhd
+    case 75:   // mulhw
+    case 104:  // neg
+    case 136:  // subfe
+    case 138:  // adde
+    case 200:  // subfze
+    case 202:  // addze
+    case 232:  // subfme
+    case 233:  // mulld
+    case 234:  // addme
+    case 235:  // mullw
+    case 266:  // add
+    case 457:  // divdu
+    case 459:  // divwu
+    case 489:  // divd
+    case 491:  // divw
+      return true;
+    default:
+      return false;
+  }
+}
+
+struct BranchInfo {
+  bool is_branch = false;  // any b/bc/bclr/bcctr
+  bool can_fall_through = true;
+  bool has_target = false;  // relative, non-linking b/bc with a static target
+  uint32_t target = 0;
+  bool links = false;
+};
+
+BranchInfo DecodeBranch(uint32_t insn, uint32_t addr) {
+  BranchInfo info;
+  uint32_t op = PrimaryOp(insn);
+  if (op == 18) {  // b
+    info.is_branch = true;
+    info.can_fall_through = false;
+    info.links = insn & 1;
+    if (!(insn & 2)) {
+      int32_t li = int32_t(insn & 0x03FFFFFC);
+      if (li & 0x02000000) {
+        li -= 0x04000000;
+      }
+      info.has_target = true;
+      info.target = addr + uint32_t(li);
+    }
+  } else if (op == 16) {  // bc
+    info.is_branch = true;
+    uint32_t bo = (insn >> 21) & 31;
+    info.can_fall_through = (bo & 0x14) != 0x14;
+    info.links = insn & 1;
+    if (!(insn & 2)) {
+      int32_t bd = int32_t(insn & 0xFFFC);
+      if (bd & 0x8000) {
+        bd -= 0x10000;
+      }
+      info.has_target = true;
+      info.target = addr + uint32_t(bd);
+    }
+  } else if (op == 19 && (XO10(insn) == 16 || XO10(insn) == 528)) {  // bclr, bcctr
+    info.is_branch = true;
+    uint32_t bo = (insn >> 21) & 31;
+    info.can_fall_through = (bo & 0x14) != 0x14;
+    info.links = insn & 1;
+  }
+  return info;
+}
+
+struct InterlockedRegion {
+  bool lockless = false;
+  std::vector<uint32_t> exits;
+};
+
+// Proves that the mtmsrd r13 at `enter` guards a single lwarx/stwcx. atomic:
+// every path from it reaches a restoring mtmsrd within a few instructions,
+// running only register ops, the reservation pair and local branches, and
+// nothing outside those paths can jump or fall into them.
+InterlockedRegion AnalyzeInterlockedRegion(const BuilderContext& ctx, uint32_t enter) {
+  const FunctionNode& fn = ctx.fn;
+  const BinaryView& binary = ctx.emitCtx.binary;
+  auto read = [&](uint32_t addr, uint32_t& insn) -> bool {
+    if (addr < fn.base() || addr + 4 > fn.end()) {
+      return false;
+    }
+    const uint8_t* p = binary.translate(addr);
+    if (!p) {
+      return false;
+    }
+    insn = rex::memory::load_and_swap<uint32_t>(p);
+    return true;
+  };
+
+  InterlockedRegion region;
+  uint32_t insn = 0;
+  if (!read(enter, insn) || !IsMtmsrd(insn) || MtmsrdSource(insn) != 13) {
+    return region;
+  }
+  if (!read(enter + 4, insn) || !IsLoadReserve(insn)) {
+    return region;
+  }
+
+  // Walk every path from the first instruction after the enter.
+  std::set<uint32_t> on_path;
+  std::set<uint32_t> exits;
+  std::vector<uint32_t> worklist{enter + 4};
+  while (!worklist.empty()) {
+    uint32_t addr = worklist.back();
+    worklist.pop_back();
+    if (addr <= enter || addr >= enter + kInterlockedWindowBytes) {
+      return InterlockedRegion{};
+    }
+    if (!on_path.insert(addr).second) {
+      continue;
+    }
+    if (!read(addr, insn)) {
+      return InterlockedRegion{};
+    }
+    if (IsMtmsrd(insn)) {
+      if (MtmsrdSource(insn) == 13) {
+        return InterlockedRegion{};  // Nested enter.
+      }
+      exits.insert(addr);  // The path ends here.
+      continue;
+    }
+    if (IsLoadReserve(insn) || IsStoreConditional(insn) || IsRegisterOnlyOp(insn)) {
+      worklist.push_back(addr + 4);
+      continue;
+    }
+    BranchInfo branch = DecodeBranch(insn, addr);
+    if (!branch.is_branch || branch.links || !branch.has_target) {
+      return InterlockedRegion{};  // Memory access, call, return or anything else.
+    }
+    worklist.push_back(branch.target);
+    if (branch.can_fall_through) {
+      worklist.push_back(addr + 4);
+    }
+  }
+  if (exits.empty()) {
+    return InterlockedRegion{};
+  }
+
+  // Nothing else may reach the paths: an instruction on them after the first
+  // may only be entered by a branch on the paths, or by falling through from
+  // a path instruction that isn't an exit.
+  for (uint32_t addr : on_path) {
+    if (addr == enter + 4) {
+      continue;
+    }
+    uint32_t prev = 0;
+    if (read(addr - 4, prev)) {
+      bool prev_on_path = on_path.count(addr - 4) != 0;
+      bool prev_is_exit = exits.count(addr - 4) != 0;
+      BranchInfo prev_branch = DecodeBranch(prev, addr - 4);
+      bool prev_falls_through = !prev_branch.is_branch || prev_branch.can_fall_through;
+      if (prev_falls_through && (!prev_on_path || prev_is_exit)) {
+        return InterlockedRegion{};
+      }
+    }
+  }
+  // Nor jump tables or mid-asm hooks.
+  for (const JumpTable& table : fn.jumpTables()) {
+    for (uint32_t target : table.targets) {
+      if (on_path.count(target)) {
+        return InterlockedRegion{};
+      }
+    }
+  }
+  for (const auto& [table_address, table] : ctx.config().switchTables) {
+    for (uint32_t target : table.targets) {
+      if (on_path.count(target)) {
+        return InterlockedRegion{};
+      }
+    }
+  }
+  for (const auto& [hook_address, hook] : ctx.config().midAsmHooks) {
+    if (hook_address == enter || on_path.count(hook_address) || on_path.count(hook.jumpAddress) ||
+        on_path.count(hook.jumpAddressOnTrue) || on_path.count(hook.jumpAddressOnFalse)) {
+      return InterlockedRegion{};
+    }
+  }
+  // And no branch elsewhere in the function may target them.
+  for (uint32_t addr = fn.base(); addr + 4 <= fn.end(); addr += 4) {
+    if (on_path.count(addr) || !read(addr, insn)) {
+      continue;
+    }
+    BranchInfo branch = DecodeBranch(insn, addr);
+    if (branch.has_target && addr != enter && on_path.count(branch.target) &&
+        branch.target != enter + 4) {
+      return InterlockedRegion{};
+    }
+    if (branch.has_target && branch.target == enter + 4) {
+      return InterlockedRegion{};  // Entering past the enter would skip it.
+    }
+  }
+
+  region.lockless = true;
+  region.exits.assign(exits.begin(), exits.end());
+  return region;
+}
+
+// Whether the restoring mtmsrd at `addr` closes a lockless interlocked region.
+bool IsLocklessInterlockedExit(const BuilderContext& ctx, uint32_t addr) {
+  const FunctionNode& fn = ctx.fn;
+  uint32_t lowest = addr > fn.base() + kInterlockedWindowBytes ? addr - kInterlockedWindowBytes
+                                                               : fn.base();
+  for (uint32_t enter = addr; enter >= lowest + 4;) {
+    enter -= 4;
+    InterlockedRegion region = AnalyzeInterlockedRegion(ctx, enter);
+    if (region.lockless &&
+        std::find(region.exits.begin(), region.exits.end(), addr) != region.exits.end()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+}  // namespace
 
 //=============================================================================
 // No-ops and Sync Operations
@@ -148,13 +476,7 @@ bool build_dcbtst(BuilderContext& ctx) {
 }
 
 bool build_dcbz(BuilderContext& ctx) {
-  // HAND PATCH (reverted to 32): plain dcbz is translated as a 32-byte zero,
-  // matching Xenia's proven semantics across the 360 library; the Xenon
-  // dcbz128/dcbzl form is the 128-byte variant (build_dcbzl below). An
-  // earlier experiment here used 128 for plain dcbz based on a stride
-  // heuristic in one game loop -- but 128-byte clears landing on 64-byte
-  // chroma blocks are precisely the corruption mechanism behind the video
-  // green-stripe bug, so the Xenia behavior is restored.
+  // Compute EA, align to 32-byte cache line, apply physical offset
   ctx.print("\t{} = (", ctx.ea());
   if (ctx.insn.operands[0] != 0)
     ctx.print("{}.u32 + ", ctx.r(ctx.insn.operands[0]));
@@ -331,11 +653,21 @@ bool build_mtmsrd(BuilderContext& ctx) {
     // Global lock mechanism:
     // R13 = enter lock (disable interrupts)
     // Other = leave lock (enable interrupts)
+    // Except around a lone lwarx/stwcx. atomic, which needs no lock (see
+    // AnalyzeInterlockedRegion).
     uint32_t src_reg = ctx.insn.operands[0];
     if (src_reg == 13) {
-      ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+      if (AnalyzeInterlockedRegion(ctx, ctx.base).lockless) {
+        ctx.println("\t// interlocked operation: host atomics, no global lock");
+      } else {
+        ctx.println("\tREX_ENTER_GLOBAL_LOCK();");
+      }
     } else {
-      ctx.println("\tREX_LEAVE_GLOBAL_LOCK();");
+      if (IsLocklessInterlockedExit(ctx, ctx.base)) {
+        ctx.println("\t// end of interlocked operation");
+      } else {
+        ctx.println("\tREX_LEAVE_GLOBAL_LOCK();");
+      }
     }
   }
   return true;

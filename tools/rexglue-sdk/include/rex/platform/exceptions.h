@@ -79,6 +79,52 @@ class SehException : public std::exception {
 };
 
 //=============================================================================
+// Guest Unwind
+//=============================================================================
+
+/**
+ * @brief Thrown by RtlUnwind to unwind recompiled frames to a target frame.
+ *
+ * The guest's C++/SEH runtime calls RtlUnwind(TargetFrame, TargetIp, ...) to
+ * discard frames up to TargetFrame and continue at TargetIp. A static recomp has
+ * no guest frames on the host stack to walk, so the unwind is modelled as a host
+ * C++ exception: it propagates out through the recompiled callers (which have no
+ * destructors, so this is safe), and any function with SEH scopes runs its
+ * __finally handlers via SEH_CATCH_ALL and rethrows on the way past.
+ *
+ * Deliberately not derived from SehException: that type means "a hardware fault
+ * reached SEH-protected code", whereas this is a deliberate control transfer.
+ *
+ * Leaving RtlUnwind as a no-op stub is not a neutral choice -- the throw then
+ * *returns* into a function whose epilogue the compiler omitted (it knew the
+ * throw was noreturn), which silently corrupts the guest stack pointer and the
+ * callee-saved registers.
+ */
+class GuestUnwindException {
+ public:
+  GuestUnwindException(u32 target_frame, u32 target_ip, u32 return_value, u32 exception_record)
+      : target_frame_(target_frame),
+        target_ip_(target_ip),
+        return_value_(return_value),
+        exception_record_(exception_record) {}
+
+  /// Guest stack pointer (r1) to restore before continuing.
+  u32 target_frame() const noexcept { return target_frame_; }
+  /// Guest address to continue execution at; 0 means "unwind and stop".
+  u32 target_ip() const noexcept { return target_ip_; }
+  /// Value the resumed code expects in r3.
+  u32 return_value() const noexcept { return return_value_; }
+  /// Guest EXCEPTION_RECORD pointer, for diagnostics.
+  u32 exception_record() const noexcept { return exception_record_; }
+
+ private:
+  u32 target_frame_;
+  u32 target_ip_;
+  u32 return_value_;
+  u32 exception_record_;
+};
+
+//=============================================================================
 // Initialization
 //=============================================================================
 

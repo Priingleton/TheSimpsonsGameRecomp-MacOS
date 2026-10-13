@@ -1,16 +1,23 @@
 # ============================================================
 # NEVER commit game content. Players supply their own ISO.
 # ============================================================
+game/
 gamedata/
 gamedata_previous/
 gamedata_extracting/
+gamedata_clean_extract/
 extracted/
+**/userdata/
+**/shots/
 *.iso
 *.xiso
 *.img
 *.xex
-# extracted guest shader microcode (dump_shaders debug cvar output) -- this
-# is the game's own copyrighted shader bytecode, not project source
+*.360
+*.bin
+default.xex
+# extracted guest shader microcode (dump_shaders debug cvar output) —
+# the game's own copyrighted shader bytecode, not project source
 shader_dumps/
 
 # Prebuilt toolchains / SDK binaries (downloaded separately, multi-GB)
@@ -18,11 +25,8 @@ tools/clang20/
 tools/rexglue-bin/
 tools/runtime-staging/
 
-# Vendored PySide6+QtWebEngine for the launcher's native window (~500MB
-# trimmed). Local-machine fix for Steam Linux Runtime sandboxing hiding the
-# host's ~/.local packages -- not meant for git history. Rebuild with:
-#   pip install --target=launcher/vendor PySide6
-# then trim per the removal lists in this session's commit message.
+# Vendored PySide6+QtWebEngine for the Linux/Windows launcher (~500MB).
+# Rebuild with: pip install --target=launcher/vendor PySide6
 launcher/vendor/
 
 # Build outputs
@@ -32,10 +36,18 @@ tools/rexglue-sdk/out/
 tools/XenonRecomp/build/
 tools/extract-xiso/build/
 build/
+dist/
 *.o
 *.so.orig
 *.so.bak*
 *.bak-*
+*.dmg
+*.app
+
+# Electron launcher dependencies and local pack output
+macos/electron-launcher/node_modules/
+macos/electron-launcher/out/
+macos/*.log
 
 # Launcher user-local state (generated from the player's own files)
 launcher/art/
@@ -50,7 +62,6 @@ __pycache__/
 *.log
 logs/
 analysis/
-# benchmark harness run artifacts (the scripts themselves are tracked)
 tools/bench/baselines/
 tools/bench/run-*.csv
 tools/bench/shaderstats-raw.txt
@@ -60,8 +71,21 @@ scratch_codegen/
 scratch_project/
 scratch_codegen_manifest.toml
 generated_BACKUP_*/
+# Local screenshots / captures (third-party docs images already in tree stay tracked)
 *.png
+!Icon.png
+photo_*.png
 *.data
+
+# Removed / obsolete local trees
+launcher/
+simpsons/ios/
+tools/rexglue-sdk.macos-cocoa-bak/
+tools/bench/
+tools/XenonRecomp/
+tools/shaderkit/
+tools/native-renderer/
+tools/codegraph/
 perf_hang.data
 missing_*.txt
 capture*.sh
@@ -70,17 +94,14 @@ capture*.sh
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
 
 # Vendored toolchain archives (too large for git; downloaded separately)
 tools/*.tar.xz
 tools/*.zip
 tools/*.tar.gz
 
-# extracted game content (copyrighted) - never ship
-gamedata_clean_extract/
-
-# external repos pulled as read-only reference material (licenses respected;
-# nothing copied without a per-file license check)
+# external repos pulled as read-only reference material
 tools/reference/
 
 # vendored dependencies: ship their sources, not their git object stores
@@ -93,8 +114,12 @@ launcher/launcher_native_error.log
 launcher/launcher.log
 launcher/diagnostics/
 
-# codegraph: rebuildable index (tools/codegraph/recomp_index.py build), not source
+# codegraph: rebuildable index, not source
 tools/codegraph/*.sqlite
 
-# Native renderer offline tool outputs (binaries, SPIR-V sets, frame dumps)
+# Native renderer offline tool outputs
 tools/native-renderer/out/
+
+# Local platform migration backups (not for git)
+simpsons.windows-bak/
+tools/rexglue-sdk.macos-cocoa-bak/

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <string>
 
+#include <rex/platform/exceptions.h>
 #include <rex/chrono/chrono_steady_cast.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/kernel/xboxkrnl/rtl.h>
@@ -559,9 +560,22 @@ void RtlCaptureContext_entry() {
   REXKRNL_WARN("[STUB] RtlCaptureContext called - not implemented");
 }
 
-void RtlUnwind_entry() {
-  // TODO(tomc): do we even need this?
-  REXKRNL_WARN("[STUB] RtlUnwind called - not implemented");
+/**
+ * RtlUnwind(TargetFrame, TargetIp, ExceptionRecord, ReturnValue)
+ *
+ * Discards guest frames up to TargetFrame and resumes at TargetIp. Raised as a
+ * host exception so it propagates out of the recompiled callers; SEH-scoped
+ * functions run their __finally handlers on the way past (SEH_CATCH_ALL), and
+ * XThread::Execute catches it and continues at TargetIp.
+ *
+ * This never returns -- which matches the guest, where the compiler omits the
+ * epilogue of a function ending in a throw. Returning normally (as the previous
+ * stub did) leaves the caller's r1 and callee-saved registers unrestored.
+ */
+void RtlUnwind_entry(u32 target_frame, u32 target_ip, u32 exception_record, u32 return_value) {
+  REXKRNL_DEBUG("RtlUnwind: frame={:08X} ip={:08X} record={:08X} ret={:08X}", target_frame,
+                target_ip, exception_record, return_value);
+  throw rex::GuestUnwindException(target_frame, target_ip, return_value, exception_record);
 }
 
 void __C_specific_handler_entry() {

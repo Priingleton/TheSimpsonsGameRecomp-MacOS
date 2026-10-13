@@ -5,7 +5,7 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
 
 #include "platform_win.h"
 
-#include <winsock2.h>
+#include <WinSock2.h>
 
 namespace rex::net {
 

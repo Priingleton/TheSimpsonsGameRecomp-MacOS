@@ -14,6 +14,8 @@
 
 #include <cstring>
 
+#include <atomic>
+#include <chrono>
 #include <rex/assert.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/xma/decoder.h>
@@ -192,22 +194,28 @@ u32 XMAInitializeContext_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_IN
 }
 
 u32 XMASetLoopData_entry(mapped_void context_ptr, ppc_ptr_t<XMA_CONTEXT_DATA> loop_data) {
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 3, 0x03FFFFFFu, loop_data->loop_start);
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 4, 0x03FFFFFFu, loop_data->loop_end);
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 255u << 12, uint32_t(loop_data->loop_count) << 12);
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 63u << 14,
-                               (uint32_t(loop_data->loop_subframe_end) << 14) |
-                                   (uint32_t(loop_data->loop_subframe_skip) << 17));
+  XMA_CONTEXT_DATA context(context_ptr);
+
+  context.loop_start = loop_data->loop_start;
+  context.loop_end = loop_data->loop_end;
+  context.loop_count = loop_data->loop_count;
+  context.loop_subframe_end = loop_data->loop_subframe_end;
+  context.loop_subframe_skip = loop_data->loop_subframe_skip;
+
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAGetInputBufferReadOffset_entry(mapped_void context_ptr) {
-  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 2) & 0x03FFFFFFu;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.input_buffer_read_offset;
 }
 
 u32 XMASetInputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 2, 0x03FFFFFFu, value);
+  XMA_CONTEXT_DATA context(context_ptr);
+  context.input_buffer_read_offset = value;
+  context.Store(context_ptr);
 
   return 0;
 }
@@ -223,18 +231,25 @@ u32 XMASetInputBuffer0_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 5, 0xFFFFFFFFu, buffer_physical_address);
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 4095u, packet_count);
+  XMA_CONTEXT_DATA context(context_ptr);
+
+  context.input_buffer_0_ptr = buffer_physical_address;
+  context.input_buffer_0_packet_count = packet_count;
+
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAIsInputBuffer0Valid_entry(mapped_void context_ptr) {
-  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 20) & 1u;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.input_buffer_0_valid;
 }
 
 u32 XMASetInputBuffer0Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 1u << 20, 1u << 20);
+  XMA_CONTEXT_DATA context(context_ptr);
+  context.input_buffer_0_valid = 1;
+  context.Store(context_ptr);
 
   return 0;
 }
@@ -250,49 +265,119 @@ u32 XMASetInputBuffer1_entry(mapped_void context_ptr, mapped_void buffer, u32 pa
     return X_E_FALSE;
   }
 
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 6, 0xFFFFFFFFu, buffer_physical_address);
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 4095u, packet_count);
+  XMA_CONTEXT_DATA context(context_ptr);
+
+  context.input_buffer_1_ptr = buffer_physical_address;
+  context.input_buffer_1_packet_count = packet_count;
+
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAIsInputBuffer1Valid_entry(mapped_void context_ptr) {
-  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 21) & 1u;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.input_buffer_1_valid;
 }
 
 u32 XMASetInputBuffer1Valid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, 1u << 21, 1u << 21);
+  XMA_CONTEXT_DATA context(context_ptr);
+  context.input_buffer_1_valid = 1;
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAIsOutputBufferValid_entry(mapped_void context_ptr) {
-  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 1) >> 31;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.output_buffer_valid;
 }
 
 u32 XMASetOutputBufferValid_entry(mapped_void context_ptr) {
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 1u << 31, 1u << 31);
+  XMA_CONTEXT_DATA context(context_ptr);
+  context.output_buffer_valid = 1;
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAGetOutputBufferReadOffset_entry(mapped_void context_ptr) {
-  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 9) & 31u;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.output_buffer_read_offset;
 }
 
 u32 XMASetOutputBufferReadOffset_entry(mapped_void context_ptr, u32 value) {
-  // Advancing the mixer must not overwrite samples published by the decoder.
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 9, 31u, value);
+  XMA_CONTEXT_DATA context(context_ptr);
+  context.output_buffer_read_offset = value;
+  context.Store(context_ptr);
 
   return 0;
 }
 
 u32 XMAGetOutputBufferWriteOffset_entry(mapped_void context_ptr) {
-  return XMA_CONTEXT_DATA::LoadWord(context_ptr, 0) >> 27;
+  XMA_CONTEXT_DATA context(context_ptr);
+
+  // PARCHE LOCAL - desatasco de la voz XMA
+  //
+  // Aqui es donde el juego se queda girando cuando se cuelga: pide este
+  // offset, pide el de lectura, y vuelta a empezar, para siempre.
+  //
+  // Se vigila un solo contexto a la vez, el ultimo que haya preguntado. No
+  // hace falta mas: cuando se atasca pregunta por uno y solo por uno, asi que
+  // dos enteros atomicos bastan y esto no cuesta nada en el camino normal,
+  // que es lo que importa estando en un bucle tan caliente.
+  {
+    const uint32_t direccion = context_ptr.guest_address();
+    static std::atomic<uint32_t> vigilado{0};
+    static std::atomic<int64_t> desde{0};
+
+    const int64_t ahora = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+
+    if (vigilado.load(std::memory_order_relaxed) != direccion) {
+      vigilado.store(direccion, std::memory_order_relaxed);
+      desde.store(ahora, std::memory_order_relaxed);
+    } else {
+      const int64_t llevo = ahora - desde.load(std::memory_order_relaxed);
+
+      // La foto exacta del atasco, y nada mas que esa:
+      //   salida valida  +  las dos entradas vacias  +  offsets distintos.
+      // Con las entradas vacias el descodificador no puede producir ni una
+      // muestra por mucho que se le insista, asi que esperar no arregla nada.
+      // Y con los offsets distintos el juego nunca llega a preguntar si el
+      // buffer sigue valido, que es su unica salida.
+      const bool atascado = llevo > 250 && context.output_buffer_valid &&
+                            !context.input_buffer_0_valid && !context.input_buffer_1_valid &&
+                            context.output_buffer_write_offset != context.output_buffer_read_offset;
+
+      if (atascado) {
+        REXAPU_WARN(
+            "[desatasco] ctx={:08X} lleva {} ms girando sin entrada "
+            "(escritura={} lectura={}). Le digo que el buffer esta terminado.",
+            direccion, llevo, uint32_t(context.output_buffer_write_offset),
+            uint32_t(context.output_buffer_read_offset));
+
+        // Igualar los dos offsets hace que la resta del juego de cero o
+        // negativo, que es lo que le empuja a preguntar; y apagar la validez
+        // es la respuesta que su codigo entiende como "buffer completo".
+        context.output_buffer_write_offset = context.output_buffer_read_offset;
+        context.output_buffer_valid = 0;
+        context.Store(context_ptr);
+
+        // El reloj se reinicia para no repetirlo en la vuelta siguiente si el
+        // juego tardara un poco en reaccionar.
+        desde.store(ahora, std::memory_order_relaxed);
+        return context.output_buffer_write_offset;
+      }
+    }
+  }
+  return context.output_buffer_write_offset;
 }
 
 u32 XMAGetPacketMetadata_entry(mapped_void context_ptr) {
-  return (XMA_CONTEXT_DATA::LoadWord(context_ptr, 4) >> 26) & 31u;
+  XMA_CONTEXT_DATA context(context_ptr);
+  return context.packet_metadata;
 }
 
 u32 XMAEnableContext_entry(mapped_void context_ptr) {

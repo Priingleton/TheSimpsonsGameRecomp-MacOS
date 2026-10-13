@@ -26,7 +26,7 @@ namespace ui {
 
 class ImGuiDialog {
  public:
-  ~ImGuiDialog();
+  virtual ~ImGuiDialog();
 
   // Shows a simple message box containing a text message.
   // Callers can want for the dialog to close with Wait().
@@ -38,6 +38,12 @@ class ImGuiDialog {
   void Then(rex::thread::Fence* fence);
 
   void Draw();
+
+  // Whether the drawer should keep repainting the screen while this dialog is
+  // attached. A dialog that is idle most of the time (a notification with
+  // nothing to show) returns false while idle, or it would force a repaint at
+  // the display refresh rate for as long as it exists.
+  virtual bool WantsContinuousPaint() const { return true; }
 
  protected:
   ImGuiDialog(ImGuiDrawer* imgui_drawer);

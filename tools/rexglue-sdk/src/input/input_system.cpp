@@ -10,20 +10,18 @@
  */
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <string>
 
 #include <rex/dbg.h>
+#include <rex/input/device_assignment.h>
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
+#include <rex/input/state_merge.h>
+#include <rex/input/touch/touch_input_driver.h>
 #include <rex/input/xinput/xinput_input_driver.h>
 #include <rex/logging.h>
 
@@ -31,203 +29,14 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
     .allowed({"sdl", "xinput"});
 
 REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
-REXCVAR_DEFINE_STRING(input_inject_file, "", "Input",
-                      "Test automation: file polled for injected player 1 controller input, "
-                      "one command per write: '<control> <hold_seconds>'");
 namespace rex::input {
 
 namespace {
 
-// Injected controller input for unattended test runs. The harness writes a
-// command such as "A 0.15" to the file; it is consumed on the next poll and
-// the control is held for that long.
-class InputInjector {
- public:
-  bool enabled() const { return !REXCVAR_GET(input_inject_file).empty(); }
-
-  // Adds the active injected control to the state; returns true if enabled.
-  bool Apply(X_INPUT_STATE& state) {
-    if (!enabled()) {
-      return false;
-    }
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto now = std::chrono::steady_clock::now();
-    if (now >= next_poll_) {
-      next_poll_ = now + std::chrono::milliseconds(20);
-      Poll(now);
-    }
-    uint16_t buttons = 0;
-    int16_t lx = 0, ly = 0, rx = 0, ry = 0;
-    uint8_t lt = 0, rt = 0;
-    if (now < release_at_) {
-      buttons = buttons_;
-      lx = lx_;
-      ly = ly_;
-      rx = rx_;
-      ry = ry_;
-      lt = lt_;
-      rt = rt_;
-    }
-    if (buttons != last_buttons_ || lx != last_lx_ || ly != last_ly_ || rx != last_rx_ ||
-        ry != last_ry_ || lt != last_lt_ || rt != last_rt_) {
-      ++packet_;
-      last_buttons_ = buttons;
-      last_lx_ = lx;
-      last_ly_ = ly;
-      last_rx_ = rx;
-      last_ry_ = ry;
-      last_lt_ = lt;
-      last_rt_ = rt;
-    }
-    state.packet_number = uint32_t(state.packet_number) + packet_;
-    state.gamepad.buttons = uint16_t(state.gamepad.buttons) | buttons;
-    state.gamepad.left_trigger = std::max(state.gamepad.left_trigger, lt);
-    state.gamepad.right_trigger = std::max(state.gamepad.right_trigger, rt);
-    if (lx || ly) {
-      state.gamepad.thumb_lx = lx;
-      state.gamepad.thumb_ly = ly;
-    }
-    if (rx || ry) {
-      state.gamepad.thumb_rx = rx;
-      state.gamepad.thumb_ry = ry;
-    }
-    return true;
-  }
-
- private:
-  void Poll(std::chrono::steady_clock::time_point now) {
-    const std::string& path = REXCVAR_GET(input_inject_file);
-    FILE* file = std::fopen(path.c_str(), "r");
-    if (!file) {
-      return;
-    }
-    char control[32] = {};
-    double hold = 0.15;
-    int fields = std::fscanf(file, "%31s %lf", control, &hold);
-    std::fclose(file);
-    std::remove(path.c_str());
-    if (fields < 1 || !std::isfinite(hold) || hold < 0.0 || hold > 60.0) {
-      return;
-    }
-    buttons_ = 0;
-    lx_ = ly_ = rx_ = ry_ = 0;
-    lt_ = rt_ = 0;
-    // One control, or several joined by '+' and held together (e.g. LS+RS).
-    std::string controls(control);
-    static const std::pair<const char*, uint16_t> kButtons[] = {
-        {"A", X_INPUT_GAMEPAD_A},
-        {"B", X_INPUT_GAMEPAD_B},
-        {"X", X_INPUT_GAMEPAD_X},
-        {"Y", X_INPUT_GAMEPAD_Y},
-        {"START", X_INPUT_GAMEPAD_START},
-        {"BACK", X_INPUT_GAMEPAD_BACK},
-        {"LB", X_INPUT_GAMEPAD_LEFT_SHOULDER},
-        {"RB", X_INPUT_GAMEPAD_RIGHT_SHOULDER},
-        {"LS", X_INPUT_GAMEPAD_LEFT_THUMB},
-        {"RS", X_INPUT_GAMEPAD_RIGHT_THUMB},
-        {"UP", X_INPUT_GAMEPAD_DPAD_UP},
-        {"DOWN", X_INPUT_GAMEPAD_DPAD_DOWN},
-        {"LEFT", X_INPUT_GAMEPAD_DPAD_LEFT},
-        {"RIGHT", X_INPUT_GAMEPAD_DPAD_RIGHT},
-    };
-    constexpr int16_t kFull = 32767;
-    size_t start = 0;
-    while (start <= controls.size()) {
-      size_t end = controls.find('+', start);
-      if (end == std::string::npos) {
-        end = controls.size();
-      }
-      const std::string name = controls.substr(start, end - start);
-      start = end + 1;
-      bool known = false;
-      for (const auto& [button_name, mask] : kButtons) {
-        if (name == button_name) {
-          buttons_ |= mask;
-          known = true;
-        }
-      }
-      if (name == "LT") {
-        lt_ = 0xFF;
-        known = true;
-      }
-      if (name == "RT") {
-        rt_ = 0xFF;
-        known = true;
-      }
-      if (name == "L_UP") {
-        ly_ = kFull;
-        known = true;
-      }
-      if (name == "L_DOWN") {
-        ly_ = -kFull;
-        known = true;
-      }
-      if (name == "L_LEFT") {
-        lx_ = -kFull;
-        known = true;
-      }
-      if (name == "L_RIGHT") {
-        lx_ = kFull;
-        known = true;
-      }
-      if (name == "R_UP") {
-        ry_ = kFull;
-        known = true;
-      }
-      if (name == "R_DOWN") {
-        ry_ = -kFull;
-        known = true;
-      }
-      if (name == "R_LEFT") {
-        rx_ = -kFull;
-        known = true;
-      }
-      if (name == "R_RIGHT") {
-        rx_ = kFull;
-        known = true;
-      }
-      if (!known) {
-        REXLOG_WARN("input_inject_file: unknown control '{}'", name);
-        buttons_ = 0;
-        lx_ = ly_ = rx_ = ry_ = 0;
-        lt_ = rt_ = 0;
-        return;
-      }
-    }
-    const std::string& name = controls;
-    release_at_ = now + std::chrono::microseconds(int64_t(hold * 1e6));
-    REXLOG_INFO("input_inject_file: {} for {:.2f}s", name, hold);
-  }
-
-  std::mutex mutex_;
-  std::chrono::steady_clock::time_point next_poll_{};
-  std::chrono::steady_clock::time_point release_at_{};
-  uint16_t buttons_ = 0;
-  int16_t lx_ = 0, ly_ = 0, rx_ = 0, ry_ = 0;
-  uint8_t lt_ = 0, rt_ = 0;
-  uint16_t last_buttons_ = 0;
-  int16_t last_lx_ = 0, last_ly_ = 0, last_rx_ = 0, last_ry_ = 0;
-  uint8_t last_lt_ = 0, last_rt_ = 0;
-  uint32_t packet_ = 0;
-};
-
-InputInjector g_input_injector;
-
-void FillInjectedCapabilities(X_INPUT_CAPABILITIES* out_caps) {
-  if (!out_caps) {
-    return;
-  }
-  std::memset(out_caps, 0, sizeof(*out_caps));
-  out_caps->type = 0x01;
-  out_caps->sub_type = 0x01;
-  out_caps->gamepad.buttons = 0xFFFF;
-  out_caps->gamepad.left_trigger = 0xFF;
-  out_caps->gamepad.right_trigger = 0xFF;
-  out_caps->gamepad.thumb_lx = static_cast<int16_t>(0x7FFF);
-  out_caps->gamepad.thumb_ly = static_cast<int16_t>(0x7FFF);
-  out_caps->gamepad.thumb_rx = static_cast<int16_t>(0x7FFF);
-  out_caps->gamepad.thumb_ry = static_cast<int16_t>(0x7FFF);
-}
+// Synthetic devices are parked past every physical ordinal so they cannot push
+// a real pad off guest user 0. SlotAssignment routes them by their synthetic
+// flag and never reads this value.
+constexpr uint32_t kSyntheticOrdinal = UINT32_MAX;
 
 }  // namespace
 
@@ -240,14 +49,20 @@ X_STATUS InputSystem::Setup() {
 }
 
 void InputSystem::Shutdown() {
+  std::lock_guard<std::mutex> lock(mutex_);
+  // device_owners_ holds raw driver pointers.
+  devices_.clear();
+  device_owners_.clear();
   drivers_.clear();
 }
 
 void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
+  std::lock_guard<std::mutex> lock(mutex_);
   drivers_.push_back(std::move(driver));
 }
 
 void InputSystem::AttachWindow(rex::ui::Window* window) {
+  std::lock_guard<std::mutex> lock(mutex_);
   window_ = window;
   for (auto& driver : drivers_) {
     driver->OnWindowAvailable(window);
@@ -255,82 +70,190 @@ void InputSystem::AttachWindow(rex::ui::Window* window) {
 }
 
 void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+  std::lock_guard<std::mutex> lock(mutex_);
   for (auto& driver : drivers_) {
     driver->set_is_active_callback(callback);
   }
 }
 
+void InputSystem::SetDeviceAssignment(std::unique_ptr<DeviceAssignment> assignment) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  assignment_ = std::move(assignment);
+  if (assignment_) {
+    assignment_->OnDevicesChanged(devices_);
+  }
+}
+
+void InputSystem::RefreshDevices() {
+  // Called with mutex_ held.
+  std::vector<DeviceInfo> seen;
+  std::vector<InputDriver*> owners;
+  std::vector<DeviceInfo> enumerated;
+  for (auto& driver : drivers_) {
+    enumerated.clear();
+    driver->EnumerateDevices(enumerated);
+    for (auto& info : enumerated) {
+      seen.push_back(info);
+      owners.push_back(driver.get());
+    }
+  }
+
+  // Carry forward ordinals already handed out, so a device keeps its guest user
+  // when another pad is unplugged.
+  bool changed = seen.size() != devices_.size();
+  std::vector<bool> fresh(seen.size(), false);
+  for (size_t i = 0; i < seen.size(); i++) {
+    auto existing = std::find_if(devices_.begin(), devices_.end(),
+                                 [&](const DeviceInfo& d) { return d.id == seen[i].id; });
+    if (existing != devices_.end()) {
+      seen[i].ordinal = existing->ordinal;
+      continue;
+    }
+    fresh[i] = true;
+    changed = true;
+  }
+
+  // Runs after the carry-forward pass so a new device cannot take an ordinal a
+  // live one is still holding. Lowest free rather than a growing counter,
+  // because a reconnected pad arrives as a new device and would otherwise walk
+  // off the end of the guest users.
+  for (size_t i = 0; i < seen.size(); i++) {
+    if (!fresh[i]) {
+      continue;
+    }
+    // Only physical devices consume an ordinal, so the first pad to connect is
+    // guest user 0 however many synthetic devices enumerated ahead of it.
+    if (seen[i].synthetic) {
+      seen[i].ordinal = kSyntheticOrdinal;
+      fresh[i] = false;
+      continue;
+    }
+    auto taken = [&](uint32_t candidate) {
+      for (size_t j = 0; j < seen.size(); j++) {
+        if (!fresh[j] && !seen[j].synthetic && seen[j].ordinal == candidate) {
+          return true;
+        }
+      }
+      return false;
+    };
+    uint32_t ordinal = 0;
+    while (taken(ordinal)) {
+      ordinal++;
+    }
+    seen[i].ordinal = ordinal;
+    fresh[i] = false;
+  }
+
+  for (const auto& old : devices_) {
+    if (std::none_of(seen.begin(), seen.end(),
+                     [&](const DeviceInfo& d) { return d.id == old.id; })) {
+      active_devices_.Forget(old.id);
+      changed = true;
+    }
+  }
+
+  std::vector<size_t> order(seen.size());
+  for (size_t i = 0; i < order.size(); i++) {
+    order[i] = i;
+  }
+  // Stable: synthetic devices share one ordinal, and their relative order
+  // decides which answers GetCapabilities when no pad is attached.
+  std::stable_sort(order.begin(), order.end(),
+                   [&](size_t a, size_t b) { return seen[a].ordinal < seen[b].ordinal; });
+
+  devices_.clear();
+  device_owners_.clear();
+  for (size_t i : order) {
+    devices_.push_back(seen[i]);
+    device_owners_.push_back(owners[i]);
+  }
+
+  if (changed && assignment_) {
+    assignment_->OnDevicesChanged(devices_);
+  }
+}
+
+InputDriver* InputSystem::DriverForDevice(DeviceId id) {
+  for (size_t i = 0; i < devices_.size(); i++) {
+    if (devices_[i].id == id) {
+      return device_owners_[i];
+    }
+  }
+  return nullptr;
+}
+
+const DeviceInfo* InputSystem::DeviceInfoFor(DeviceId id) const {
+  for (const auto& device : devices_) {
+    if (device.id == id) {
+      return &device;
+    }
+  }
+  return nullptr;
+}
+
 X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
                                       X_INPUT_CAPABILITIES* out_caps) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!out_caps || !assignment_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 
-  bool any_connected = false;
-  for (auto& driver : drivers_) {
-    X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
-    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
-      any_connected = true;
-    }
-    if (result == X_ERROR_SUCCESS) {
-      return result;
-    }
+  RefreshDevices();
+  std::vector<DeviceId> ids;
+  assignment_->DevicesForUser(user_index, ids);
+  if (ids.empty()) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-  if (user_index == 0 && g_input_injector.enabled()) {
-    FillInjectedCapabilities(out_caps);
-    return X_ERROR_SUCCESS;
+
+  // Prefer the pad in hand, so button glyphs follow it rather than whichever
+  // device enumerated first.
+  DeviceId chosen = active_devices_.Active(user_index);
+  if (std::find(ids.begin(), ids.end(), chosen) == ids.end()) {
+    chosen = ids.front();
   }
-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+
+  auto* driver = DriverForDevice(chosen);
+  if (!driver) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+  return driver->GetDeviceCapabilities(chosen, flags, out_caps);
 }
 
 X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!assignment_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 
-  bool any_connected = false;
-  bool first_result = true;
+  RefreshDevices();
+  std::vector<DeviceId> ids;
+  assignment_->DevicesForUser(user_index, ids);
+
   X_INPUT_STATE merged = {};
-
-  for (auto& driver : drivers_) {
+  bool any = false;
+  for (DeviceId id : ids) {
+    auto* driver = DriverForDevice(id);
+    if (!driver) {
+      continue;
+    }
     X_INPUT_STATE state = {};
-    X_RESULT result = driver->GetState(user_index, &state);
-    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
-      any_connected = true;
+    if (driver->GetDeviceState(id, &state) != X_ERROR_SUCCESS) {
+      continue;
     }
-    if (result == X_ERROR_SUCCESS) {
-      if (first_result) {
-        merged = state;
-        first_result = false;
-      } else {
-        // Merge: OR buttons, max triggers, max-magnitude sticks
-        merged.gamepad.buttons = static_cast<uint16_t>(merged.gamepad.buttons) |
-                                 static_cast<uint16_t>(state.gamepad.buttons);
-        merged.gamepad.left_trigger =
-            std::max(merged.gamepad.left_trigger, state.gamepad.left_trigger);
-        merged.gamepad.right_trigger =
-            std::max(merged.gamepad.right_trigger, state.gamepad.right_trigger);
-
-        auto merge_axis = [](int16_t a, int16_t b) -> int16_t {
-          return (std::abs(static_cast<int>(a)) >= std::abs(static_cast<int>(b))) ? a : b;
-        };
-        merged.gamepad.thumb_lx = merge_axis(merged.gamepad.thumb_lx, state.gamepad.thumb_lx);
-        merged.gamepad.thumb_ly = merge_axis(merged.gamepad.thumb_ly, state.gamepad.thumb_ly);
-        merged.gamepad.thumb_rx = merge_axis(merged.gamepad.thumb_rx, state.gamepad.thumb_rx);
-        merged.gamepad.thumb_ry = merge_axis(merged.gamepad.thumb_ry, state.gamepad.thumb_ry);
-
-        if (static_cast<uint32_t>(state.packet_number) >
-            static_cast<uint32_t>(merged.packet_number)) {
-          merged.packet_number = state.packet_number;
-        }
-      }
+    active_devices_.Observe(user_index, id, state.gamepad);
+    if (!any) {
+      merged = state;
+      any = true;
+    } else {
+      MergeInto(merged, state);
     }
   }
 
-  if (user_index == 0 && g_input_injector.Apply(merged)) {
-    first_result = false;
+  if (!any) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
   }
-
-  if (first_result) {
-    return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
-  }
-
   if (out_state) {
     *out_state = merged;
   }
@@ -339,32 +262,71 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
 
 X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!assignment_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
 
-  bool any_connected = false;
-  for (auto& driver : drivers_) {
-    X_RESULT result = driver->SetState(user_index, vibration);
-    if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
-      any_connected = true;
+  RefreshDevices();
+  std::vector<DeviceId> ids;
+  assignment_->DevicesForUser(user_index, ids);
+
+  // Every pad on this user belongs to the same player, so all of them buzz.
+  // Only pads decide the result: synthetic devices accept any vibration and
+  // would otherwise report success for a pad that never rumbled.
+  bool any_pad = false;
+  bool any_synthetic = false;
+  bool pad_rumbled = false;
+  X_RESULT pad_error = X_ERROR_DEVICE_NOT_CONNECTED;
+  for (DeviceId id : ids) {
+    auto* driver = DriverForDevice(id);
+    const DeviceInfo* info = DeviceInfoFor(id);
+    if (!driver || !info) {
+      continue;
     }
+    X_RESULT result = driver->SetDeviceVibration(id, vibration);
+    if (info->synthetic) {
+      any_synthetic = true;
+      continue;
+    }
+    any_pad = true;
     if (result == X_ERROR_SUCCESS) {
-      return result;
+      pad_rumbled = true;
+    } else {
+      pad_error = result;
     }
   }
-  return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
+  if (any_pad) {
+    return pad_rumbled ? X_ERROR_SUCCESS : pad_error;
+  }
+  return any_synthetic ? X_ERROR_SUCCESS : X_ERROR_DEVICE_NOT_CONNECTED;
 }
 
 X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
                                    X_INPUT_KEYSTROKE* out_keystroke) {
   SCOPE_profile_cpu_f("hid");
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!assignment_) {
+    return X_ERROR_DEVICE_NOT_CONNECTED;
+  }
+
+  RefreshDevices();
+  std::vector<DeviceId> ids;
+  assignment_->DevicesForUser(user_index, ids);
 
   bool any_connected = false;
-  for (auto& driver : drivers_) {
-    X_RESULT result = driver->GetKeystroke(user_index, flags, out_keystroke);
+  for (DeviceId id : ids) {
+    auto* driver = DriverForDevice(id);
+    if (!driver) {
+      continue;
+    }
+    X_RESULT result = driver->GetDeviceKeystroke(id, flags, out_keystroke);
+    if (result == X_ERROR_SUCCESS) {
+      out_keystroke->user_index = static_cast<uint8_t>(user_index);
+      return result;
+    }
     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
       any_connected = true;
-    }
-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
-      return result;
     }
   }
   return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
@@ -395,11 +357,18 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     if (mnk_driver->Setup() == X_STATUS_SUCCESS) {
       input->AddDriver(std::move(mnk_driver));
     }
+
+#if REX_PLATFORM_IOS
+    // On-screen gamepad. Ahead of the NOP driver so that, with no pad attached,
+    // the guest reads its capabilities rather than the NOP stand-in's.
+    input->AddDriver(std::make_unique<touch::TouchInputDriver>(nullptr, 0));
+#endif
   }
 
   // NOP driver (primary in tool mode, fallback otherwise)
   uint8_t nop_index = tool_mode ? 0 : 1;
   input->AddDriver(std::make_unique<nop::NopInputDriver>(nullptr, nop_index));
+  input->SetDeviceAssignment(std::make_unique<SlotAssignment>());
   return input;
 }
 

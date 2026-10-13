@@ -12,13 +12,15 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
-
+#include <rex/math.h>
 #include <rex/memory.h>
 #include <rex/string/key.h>
-#include <rex/string/util.h>
+#include <rex/string.h>
 #include <rex/system/xcontent.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
@@ -78,14 +80,13 @@ struct XCONTENT_DATA {
     // read the string properly, blanking the array should take care of that
 
     std::fill_n(display_name_raw.chars, countof(display_name_raw.chars), 0);
-    rex::string::util_copy_and_swap_truncating(display_name_raw.chars, value,
-                                               countof(display_name_raw.chars));
+    rex::string::copy_and_swap_truncating(display_name_raw.chars, value,
+                                          countof(display_name_raw.chars));
   }
 
   void set_file_name(const std::string_view value) {
     std::fill_n(file_name_raw, countof(file_name_raw), 0);
-    rex::string::util_copy_maybe_truncating<rex::string::CopySafety::IKnowWhatIAmDoing>(
-        file_name_raw, value, rex::countof(file_name_raw));
+    rex::string::copy_unterminated(file_name_raw, value, rex::countof(file_name_raw));
 
     // Some games rely on padding field acting as a null-terminator...
     padding[0] = padding[1] = 0;
@@ -163,6 +164,12 @@ class ContentManager {
   X_RESULT SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data,
                                std::vector<uint8_t> buffer);
   X_RESULT DeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
+  // Rewriting a save (CREATE_ALWAYS / TRUNCATE_EXISTING) moves the existing
+  // package aside instead of deleting it, and closing the package commits the
+  // new one. If the process dies in between - an app swiped away on a phone
+  // while the title is saving - the next run restores the previous save rather
+  // than leaving none at all.
+  X_RESULT BeginRewrite(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
   X_RESULT UnmountAndDeleteContent(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data);
 
@@ -197,8 +204,14 @@ class ContentManager {
   ContentPackage* DetachPackage(std::unordered_map<string::string_key_case, ContentPackage*,
                                                    string::string_key_case::Hash>::iterator it);
 
+  std::filesystem::path RewriteBackupPath(const std::filesystem::path& path) const;
+  void RecoverInterruptedRewrites();
+  void CommitRewrite(const std::filesystem::path& package_path);
+
   KernelState* kernel_state_;
   std::filesystem::path root_path_;
+  std::set<std::filesystem::path> rewrites_pending_;  // guarded by global_critical_region_
+  std::once_flag rewrites_recovered_;
 
   // TODO(benvanik): remove use of global lock, it's bad here!
   rex::thread::global_critical_region global_critical_region_;

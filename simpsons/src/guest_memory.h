@@ -8,10 +8,11 @@
 
 namespace simpsons {
 
-// Match REX_PHYS_HOST_OFFSET in the generated code. Windows reserves an
-// extra page before the physical heaps; ordinary virtual addresses do not.
+// Match REX_PHYS_HOST_OFFSET in the generated code. Windows and macOS arm64
+// reserve an extra page before the physical heaps; ordinary virtual addresses
+// do not.
 inline const uint8_t* GuestToHost(const uint8_t* base, uint32_t address) {
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
   return base + address + (address >= 0xE0000000u ? 0x1000u : 0u);
 #else
   return base + address;

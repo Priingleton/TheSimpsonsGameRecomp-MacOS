@@ -9,11 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <algorithm>
 #include <cfloat>
 #include <cstring>
 #include <filesystem>
 #include <map>
-#include <unordered_map>
 
 #include <rex/assert.h>
 #include <rex/chrono/clock.h>
@@ -37,135 +37,7 @@ static_assert(sizeof(ImmediateVertex) == sizeof(ImDrawVert), "Vertex types must 
 
 namespace {
 
-// Physical mouse buttons held, per drawer. Mouse input goes to ImGui as queued
-// events (so a press and release between two frames still make a click), and
-// ImGui's own button state lags those. Kept outside the class so its layout
-// stays the same.
-std::unordered_map<const ImGuiDrawer*, uint32_t> mouse_buttons_down;
-
-// Releases the physical mouse buttons held in ImGui; returns whether any were.
-bool ReleaseMouseButtons(const ImGuiDrawer* drawer, ImGuiIO& io) {
-  auto it = mouse_buttons_down.find(drawer);
-  if (it == mouse_buttons_down.end() || !it->second) {
-    return false;
-  }
-  for (int button = 0; button < ImGuiMouseButton_COUNT; ++button) {
-    if (it->second & (uint32_t(1) << button)) {
-      io.AddMouseButtonEvent(button, false);
-    }
-  }
-  it->second = 0;
-  return true;
-}
-
-}  // namespace
-
-ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup)
-    : window_(window), z_order_(z_order), font_setup_(std::move(font_setup)) {
-  Initialize();
-}
-
-ImGuiDrawer::~ImGuiDrawer() {
-  SetPresenter(nullptr);
-  if (!dialogs_.empty()) {
-    window_->RemoveInputListener(this);
-    if (internal_state_) {
-      ImGui::SetCurrentContext(internal_state_);
-      if (ReleaseMouseButtons(this, ImGui::GetIO())) {
-        window_->ReleaseMouse();
-      }
-    }
-  }
-  if (internal_state_) {
-    ImGui::DestroyContext(internal_state_);
-    internal_state_ = nullptr;
-  }
-  mouse_buttons_down.erase(this);
-}
-
-void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
-  assert_not_null(dialog);
-  // Check if already added.
-  if (std::find(dialogs_.cbegin(), dialogs_.cend(), dialog) != dialogs_.cend()) {
-    return;
-  }
-  if (dialogs_.empty() && !IsDrawingDialogs()) {
-    // First dialog added. !IsDrawingDialogs() is also checked because in a
-    // situation of removing the only dialog, then adding a dialog, from within
-    // a dialog's Draw function, re-registering the ImGuiDrawer may result in
-    // ImGui being drawn multiple times in the current frame.
-    window_->AddInputListener(this, z_order_);
-    if (presenter_) {
-      presenter_->AddUIDrawerFromUIThread(this, z_order_);
-    }
-  }
-  dialogs_.push_back(dialog);
-}
-
-void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
-  assert_not_null(dialog);
-  auto it = std::find(dialogs_.cbegin(), dialogs_.cend(), dialog);
-  if (it == dialogs_.cend()) {
-    return;
-  }
-  if (IsDrawingDialogs()) {
-    // Actualize the next dialog index after the erasure from the vector.
-    size_t existing_index = size_t(std::distance(dialogs_.cbegin(), it));
-    if (dialog_loop_next_index_ > existing_index) {
-      --dialog_loop_next_index_;
-    }
-  }
-  dialogs_.erase(it);
-  DetachIfLastDialogRemoved();
-}
-
-void ImGuiDrawer::Initialize() {
-  // Setup ImGui internal state.
-  // This will give us state we can swap to the ImGui globals when in use.
-  internal_state_ = ImGui::CreateContext();
-  ImGui::SetCurrentContext(internal_state_);
-
-  auto& io = ImGui::GetIO();
-
-  // TODO(gibbed): disable imgui.ini saving for now,
-  // imgui assumes paths are char* so we can't throw a good path at it on
-  // Windows.
-  io.IniFilename = nullptr;
-
-  // Setup the font glyphs.
-  ImFontConfig font_config;
-  font_config.OversampleH = font_config.OversampleV = 1;
-  font_config.PixelSnapH = true;
-  static const ImWchar font_glyph_ranges[] = {
-      0x0020,
-      0x00FF,  // Basic Latin + Latin Supplement
-      0,
-  };
-  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
-                                                 &font_config, font_glyph_ranges);
-
-#if REX_PLATFORM_WIN32
-  // TODO(benvanik): jp font on other platforms?
-  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
-  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
-  if (std::filesystem::exists(jp_font_path)) {
-    ImFontConfig jp_font_config;
-    jp_font_config.MergeMode = true;
-    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
-    jp_font_config.PixelSnapH = true;
-    jp_font_config.FontNo = 0;
-    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
-                                 io.Fonts->GetGlyphRangesJapanese());
-  } else {
-    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
-  }
-#endif
-
-  if (font_setup_) {
-    font_setup_(io.Fonts);
-  }
-
-  auto& style = ImGui::GetStyle();
+void ApplyDefaultStyle(ImGuiStyle& style) {
   style.ScrollbarRounding = 0;
   style.WindowRounding = 0;
   style.TabRounding = 0;
@@ -213,6 +85,133 @@ void ImGuiDrawer::Initialize() {
   style.Colors[ImGuiCol_PlotHistogramHovered] = ImVec4(1.00f, 0.60f, 0.00f, 1.00f);
   style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.00f, 1.00f, 0.00f, 0.21f);
   style.Colors[ImGuiCol_ModalWindowDimBg] = ImVec4(0.20f, 0.20f, 0.20f, 0.35f);
+}
+
+}  // namespace
+
+ImGuiDrawer::ImGuiDrawer(rex::ui::Window* window, size_t z_order, FontSetupCallback font_setup,
+                         StyleSetupCallback style_setup)
+    : window_(window),
+      z_order_(z_order),
+      font_setup_(std::move(font_setup)),
+      style_setup_(std::move(style_setup)) {
+  Initialize();
+}
+
+ImGuiDrawer::~ImGuiDrawer() {
+  SetPresenter(nullptr);
+  SetWindowTextInputActive(false);
+  if (!dialogs_.empty()) {
+    window_->RemoveInputListener(this);
+    if (internal_state_) {
+      ImGui::SetCurrentContext(internal_state_);
+      if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
+        window_->ReleaseMouse();
+      }
+    }
+  }
+  if (internal_state_) {
+    ImGui::DestroyContext(internal_state_);
+    internal_state_ = nullptr;
+  }
+}
+
+void ImGuiDrawer::AddDialog(ImGuiDialog* dialog) {
+  assert_not_null(dialog);
+  // Check if already added.
+  if (std::find(dialogs_.cbegin(), dialogs_.cend(), dialog) != dialogs_.cend()) {
+    return;
+  }
+  if (dialogs_.empty() && !IsDrawingDialogs()) {
+    // First dialog added. !IsDrawingDialogs() is also checked because in a
+    // situation of removing the only dialog, then adding a dialog, from within
+    // a dialog's Draw function, re-registering the ImGuiDrawer may result in
+    // ImGui being drawn multiple times in the current frame.
+    window_->AddInputListener(this, z_order_);
+    if (presenter_) {
+      presenter_->AddUIDrawerFromUIThread(this, z_order_);
+    }
+  }
+  dialogs_.push_back(dialog);
+}
+
+void ImGuiDrawer::RemoveDialog(ImGuiDialog* dialog) {
+  assert_not_null(dialog);
+  auto it = std::find(dialogs_.cbegin(), dialogs_.cend(), dialog);
+  if (it == dialogs_.cend()) {
+    return;
+  }
+  if (IsDrawingDialogs()) {
+    // Actualize the next dialog index after the erasure from the vector.
+    size_t existing_index = size_t(std::distance(dialogs_.cbegin(), it));
+    if (dialog_loop_next_index_ > existing_index) {
+      --dialog_loop_next_index_;
+    }
+  }
+  dialogs_.erase(it);
+  DetachIfLastDialogRemoved();
+}
+
+void ImGuiDrawer::Initialize() {
+  // Setup ImGui internal state.
+  // This will give us state we can swap to the ImGui globals when in use.
+  internal_state_ = ImGui::CreateContext();
+  ImGui::SetCurrentContext(internal_state_);
+
+  auto& io = ImGui::GetIO();
+
+  auto& platform_io = ImGui::GetPlatformIO();
+  platform_io.Platform_SetImeDataFn = PlatformSetImeData;
+  platform_io.Platform_ImeUserData = this;
+
+  // TODO(gibbed): disable imgui.ini saving for now,
+  // imgui assumes paths are char* so we can't throw a good path at it on
+  // Windows.
+  io.IniFilename = nullptr;
+
+  // Dialogs are shown over a running title, where a controller is often the
+  // only input device attached - let ImGui drive focus and buttons from it.
+  io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+
+  // Setup the font glyphs.
+  ImFontConfig font_config;
+  font_config.OversampleH = font_config.OversampleV = 1;
+  font_config.PixelSnapH = true;
+  static const ImWchar font_glyph_ranges[] = {
+      0x0020,
+      0x00FF,  // Basic Latin + Latin Supplement
+      0,
+  };
+  io.Fonts->AddFontFromMemoryCompressedBase85TTF(kProggyTinyCompressedDataBase85, 10.0f,
+                                                 &font_config, font_glyph_ranges);
+
+#if REX_PLATFORM_WIN32
+  // TODO(benvanik): jp font on other platforms?
+  // https://github.com/Koruri/kibitaki looks really good, but is 1.5MiB.
+  const char* jp_font_path = "C:\\Windows\\Fonts\\msgothic.ttc";
+  if (std::filesystem::exists(jp_font_path)) {
+    ImFontConfig jp_font_config;
+    jp_font_config.MergeMode = true;
+    jp_font_config.OversampleH = jp_font_config.OversampleV = 1;
+    jp_font_config.PixelSnapH = true;
+    jp_font_config.FontNo = 0;
+    io.Fonts->AddFontFromFileTTF(jp_font_path, 12.0f, &jp_font_config,
+                                 io.Fonts->GetGlyphRangesJapanese());
+  } else {
+    REXLOG_WARN("Unable to load Japanese font; JP characters will be boxes");
+  }
+#endif
+
+  if (font_setup_) {
+    font_setup_(io.Fonts);
+  }
+
+  auto& style = ImGui::GetStyle();
+  ApplyDefaultStyle(style);
+  if (style_setup_) {
+    style_setup_(style, style_);
+  }
 
   frame_time_tick_frequency_ = double(rex::chrono::Clock::QueryHostTickFrequency());
   last_frame_time_ticks_ = rex::chrono::Clock::QueryHostTickCount();
@@ -356,7 +355,6 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
     if (!dialogs_.empty()) {
       presenter_->RemoveUIDrawerFromUIThread(this);
     }
-    ImGuiIO& io = GetIO();
   }
   presenter_ = new_presenter;
   if (presenter_) {
@@ -375,19 +373,28 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
     font_texture_.reset();
   }
   immediate_drawer_ = new_immediate_drawer;
-  if (immediate_drawer_) {
+  // Eagerly upload the font atlas only when a presenter is attached (SDK mode).
+  // In detached mode (presenter_ == nullptr) the app's renderer device may not
+  // exist yet at SetupPresentation, so defer to the idempotent Draw-time
+  // SetupFontTexture().
+  if (immediate_drawer_ && presenter_) {
     SetupFontTexture();
   }
 }
 
 void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
-  // Drawing of anything is initiated by the presenter.
-  assert_not_null(presenter_);
+  // Drawing is initiated by the presenter (SDK mode), or by the app in detached
+  // mode (config.graphics == nullptr), where there is no presenter.
   if (!immediate_drawer_) {
-    // A presenter has been attached, but an immediate drawer hasn't been
-    // attached yet.
+    // A drawer target has been attached, but an immediate drawer hasn't yet.
     return;
   }
+
+  // In detached mode the app's immediate drawer (and the renderer device
+  // backing it) may only become usable on the first frame, after the guest
+  // creates its D3D device. Upload the font atlas lazily and idempotently;
+  // SetupFontTexture early-returns once font_texture_ is set.
+  SetupFontTexture();
 
   if (dialogs_.empty()) {
     return;
@@ -411,6 +418,10 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
   io.DisplaySize.x = window_->GetActualPhysicalWidth() * physical_to_logical;
   io.DisplaySize.y = window_->GetActualPhysicalHeight() * physical_to_logical;
 
+  if (gamepad_poll_) {
+    gamepad_poll_(io);
+  }
+
   ImGui::NewFrame();
 
   assert_true(!IsDrawingDialogs());
@@ -428,15 +439,22 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
 
   if (reset_mouse_position_after_next_frame_) {
     reset_mouse_position_after_next_frame_ = false;
-    io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
+    io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
   }
 
   // Detaching is deferred if the last dialog is removed during drawing, perform
   // it now if needed.
   DetachIfLastDialogRemoved();
 
-  if (!dialogs_.empty()) {
-    // Repaint (and handle input) continuously if still active.
+  // Repaint (and handle input) continuously while a dialog is active. An idle
+  // one does not count: the achievement toast stays attached for the whole
+  // session, and repainting for it kept the presenter painting at the display
+  // rate on top of every guest frame. A toast pushed while idle still appears
+  // on the next guest frame. In detached mode there is no presenter; the app
+  // drives repaint via its own present loop.
+  if (presenter_ &&
+      std::any_of(dialogs_.begin(), dialogs_.end(),
+                  [](const ImGuiDialog* dialog) { return dialog->WantsContinuousPaint(); })) {
     presenter_->RequestUIPaintFromUIThread();
   }
 }
@@ -519,14 +537,12 @@ void ImGuiDrawer::OnMouseDown(MouseEvent& e) {
       break;
     }
   }
-  if (button >= 0) {
-    uint32_t& buttons_down = mouse_buttons_down[this];
-    if (!(buttons_down & (uint32_t(1) << button))) {
-      if (!buttons_down) {
+  if (button >= 0 && button < std::size(io.MouseDown)) {
+    if (!io.MouseDown[button]) {
+      if (!ImGui::IsAnyMouseDown()) {
         window_->CaptureMouse();
       }
-      buttons_down |= uint32_t(1) << button;
-      io.AddMouseButtonEvent(button, true);
+      io.MouseDown[button] = true;
     }
   }
 }
@@ -553,12 +569,10 @@ void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
       break;
     }
   }
-  if (button >= 0) {
-    uint32_t& buttons_down = mouse_buttons_down[this];
-    if (buttons_down & (uint32_t(1) << button)) {
-      buttons_down &= ~(uint32_t(1) << button);
-      io.AddMouseButtonEvent(button, false);
-      if (!buttons_down) {
+  if (button >= 0 && button < std::size(io.MouseDown)) {
+    if (io.MouseDown[button]) {
+      io.MouseDown[button] = false;
+      if (!ImGui::IsAnyMouseDown()) {
         window_->ReleaseMouse();
       }
     }
@@ -568,7 +582,7 @@ void ImGuiDrawer::OnMouseUp(MouseEvent& e) {
 void ImGuiDrawer::OnMouseWheel(MouseEvent& e) {
   SwitchToPhysicalMouseAndUpdateMousePosition(e);
   auto& io = GetIO();
-  io.AddMouseWheelEvent(0.0f, float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent));
+  io.MouseWheel += float(e.scroll_y()) / float(MouseEvent::kScrollPerDetent);
 }
 
 void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
@@ -579,7 +593,8 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
     // The latest pointer needs to be controlling the ImGui mouse.
     if (touch_pointer_id_ == TouchEvent::kPointerIDNone) {
       // Switching from the mouse to touch input.
-      if (ReleaseMouseButtons(this, io)) {
+      if (ImGui::IsAnyMouseDown()) {
+        std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
         window_->ReleaseMouse();
       }
     }
@@ -591,25 +606,24 @@ void ImGuiDrawer::OnTouchEvent(TouchEvent& e) {
   }
   UpdateMousePosition(e.x(), e.y());
   if (action == TouchEvent::Action::kUp || action == TouchEvent::Action::kCancel) {
-    io.AddMouseButtonEvent(0, false);
+    io.MouseDown[0] = false;
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     // Make sure that after a touch, the ImGui mouse isn't hovering over
     // anything.
     reset_mouse_position_after_next_frame_ = true;
   } else {
-    io.AddMouseButtonEvent(0, true);
+    io.MouseDown[0] = true;
     reset_mouse_position_after_next_frame_ = false;
   }
 }
 
 void ImGuiDrawer::ClearInput() {
   auto& io = GetIO();
-  if (ReleaseMouseButtons(this, io)) {
+  if (touch_pointer_id_ == TouchEvent::kPointerIDNone && ImGui::IsAnyMouseDown()) {
     window_->ReleaseMouse();
   }
-  io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
-  // A touch holds button 0 without being counted as a physical button.
-  io.AddMouseButtonEvent(0, false);
+  io.MousePos = ImVec2(-FLT_MAX, -FLT_MAX);
+  std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
   io.ClearInputKeys();
   touch_pointer_id_ = TouchEvent::kPointerIDNone;
   reset_mouse_position_after_next_frame_ = false;
@@ -643,14 +657,15 @@ void ImGuiDrawer::OnKey(KeyEvent& e, bool is_down) {
 void ImGuiDrawer::UpdateMousePosition(float x, float y) {
   auto& io = GetIO();
   float physical_to_logical = float(window_->GetMediumDpi()) / float(window_->GetDpi());
-  io.AddMousePosEvent(x * physical_to_logical, y * physical_to_logical);
+  io.MousePos.x = x * physical_to_logical;
+  io.MousePos.y = y * physical_to_logical;
 }
 
 void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e) {
   if (touch_pointer_id_ != TouchEvent::kPointerIDNone) {
     touch_pointer_id_ = TouchEvent::kPointerIDNone;
     auto& io = GetIO();
-    io.AddMouseButtonEvent(0, false);
+    std::memset(io.MouseDown, 0, sizeof(io.MouseDown));
     // Nothing needs to be done regarding CaptureMouse and ReleaseMouse - all
     // buttons as well as mouse capture have been released when switching to
     // touch input, the mouse is never captured during touch input, and now
@@ -658,6 +673,26 @@ void ImGuiDrawer::SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& 
   }
   reset_mouse_position_after_next_frame_ = false;
   UpdateMousePosition(float(e.x()), float(e.y()));
+}
+
+void ImGuiDrawer::PlatformSetImeData(ImGuiContext* context, ImGuiViewport* viewport,
+                                     ImGuiPlatformImeData* data) {
+  (void)context;
+  (void)viewport;
+  auto* drawer = static_cast<ImGuiDrawer*>(ImGui::GetPlatformIO().Platform_ImeUserData);
+  if (drawer) {
+    drawer->SetWindowTextInputActive(data->WantTextInput);
+  }
+}
+
+void ImGuiDrawer::SetWindowTextInputActive(bool active) {
+  if (text_input_active_ == active) {
+    return;
+  }
+  text_input_active_ = active;
+  // SDL text input is main thread only, and in detached mode Draw is not.
+  Window* window = window_;
+  window->app_context().CallInUIThread([window, active] { window->SetTextInputActive(active); });
 }
 
 void ImGuiDrawer::DetachIfLastDialogRemoved() {
@@ -668,6 +703,9 @@ void ImGuiDrawer::DetachIfLastDialogRemoved() {
   if (!dialogs_.empty() || IsDrawingDialogs()) {
     return;
   }
+  // Detaching stops Draw, so there is no later frame to notice that the
+  // removed dialog took a focused InputText with it.
+  SetWindowTextInputActive(false);
   if (presenter_) {
     presenter_->RemoveUIDrawerFromUIThread(this);
   }

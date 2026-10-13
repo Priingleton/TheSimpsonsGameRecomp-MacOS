@@ -29,7 +29,14 @@
 #endif
 
 #if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+// TARGET_OS_MAC is 1 for every Darwin variant, iOS included. REX_PLATFORM_MAC
+// therefore means "Darwin" and keeps every shared BSD/Mach path active on iOS;
+// REX_PLATFORM_IOS narrows it where the device really differs (no SDL desktop
+// window, no fork/exec, sandboxed filesystem, 16 KiB pages).
 #define REX_PLATFORM_MAC 1
+#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
+#define REX_PLATFORM_IOS 1
+#endif
 #elif defined(WIN32) || defined(_WIN32)
 #define REX_PLATFORM_WIN32 1
 #elif defined(__ANDROID__)
@@ -46,6 +53,9 @@
 // so they can be used in static_assert and regular expressions.
 #ifndef REX_PLATFORM_MAC
 #define REX_PLATFORM_MAC 0
+#endif
+#ifndef REX_PLATFORM_IOS
+#define REX_PLATFORM_IOS 0
 #endif
 #ifndef REX_PLATFORM_WIN32
 #define REX_PLATFORM_WIN32 0
@@ -83,11 +93,6 @@
 #elif defined(_M_PPC) || defined(__powerpc__)
 #define REX_ARCH_PPC 1
 #endif
-
-#if REX_PLATFORM_WIN32
-#define WIN32_LEAN_AND_MEAN
-#define NOMINMAX  // Don't want windows.h including min/max macros.
-#endif            // REX_PLATFORM_WIN32
 
 #if REX_PLATFORM_WIN32
 #include <intrin.h>
@@ -139,20 +144,16 @@
 // Compiler capability macros
 #if REX_COMPILER_CLANG || REX_COMPILER_GNUC
 #define REX_HAS_BUILTIN_STRLEN 1
-#define REX_LACKS_FLOAT_FROM_CHARS 1
 #else
 #define REX_HAS_BUILTIN_STRLEN 0
-#define REX_LACKS_FLOAT_FROM_CHARS 0
 #endif
 
-namespace rex {
+namespace rex::platform {
 
 #if REX_PLATFORM_WIN32
-const char kPathSeparator = '\\';
+inline constexpr char kPathSeparator = '\\';
 #else
-const char kPathSeparator = '/';
+inline constexpr char kPathSeparator = '/';
 #endif  // REX_PLATFORM_WIN32
 
-const char kGuestPathSeparator = '\\';
-
-}  // namespace rex
+}  // namespace rex::platform

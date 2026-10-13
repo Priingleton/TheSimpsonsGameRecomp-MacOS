@@ -28,7 +28,6 @@
 #include <rex/graphics/registers.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
-#include <rex/graphics/vulkan/gpu_profiler.h>
 #include <rex/graphics/vulkan/graphics_system.h>
 #include <rex/graphics/vulkan/pipeline_cache.h>
 #include <rex/graphics/vulkan/primitive_processor.h>
@@ -52,14 +51,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   enum class SingleTransientDescriptorLayout {
     kStorageBufferCompute,
     kStorageBufferPairCompute,
-    // One storage buffer visible to the guest shader stages: defined like the
-    // shared memory set layout with a single shared memory binding and no
-    // EDRAM binding, so it can stand in for it (native resolves writing the
-    // scaled resolve buffer).
-    kStorageBufferGuestShaders,
-    // Compatible with the host-render-target shared-memory layout, including
-    // devices where the guest buffer uses multiple descriptors.
-    kStorageBufferNativeVertexStreams,
     kCount,
   };
 
@@ -144,20 +135,13 @@ class VulkanCommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
-
-  void RestoreEdramSnapshot(const void* snapshot) override;
-
-  VulkanGpuProfiler& gpu_profiler() { return gpu_profiler_; }
-
   ui::vulkan::VulkanDevice* GetVulkanDevice() const {
     return static_cast<const ui::vulkan::VulkanProvider*>(graphics_system_->provider())
         ->vulkan_device();
   }
 
   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
-                          std::vector<uint32_t>& spirv_out, std::string& error_out,
-                          bool spirv_1_3 = false) const;
+                          std::vector<uint32_t>& spirv_out, std::string& error_out) const;
 
   // Returns the deferred drawing command list for the currently open
   // submission.
@@ -184,22 +168,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   uint64_t GetCurrentFrame() const { return frame_current_; }
   uint64_t GetCompletedFrame() const { return frame_completed_; }
 
-  // Immutable texture upload snapshot, retained until its frame completes.
-  bool UploadNativeTextureData(uint32_t address, uint32_t length,
-                               VkDescriptorBufferInfo& buffer_info);
-  bool UseNativeResolveBufferRange(uint32_t address, uint32_t length,
-                                   VkDescriptorBufferInfo& buffer_info, bool scaled = false);
-  bool CanUseNativeResolveBufferRange(uint32_t address, uint32_t length, bool scaled) const;
-  // A texture source assembled from native resolve buffers and guest memory.
-  bool CanComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled) const;
-  bool ComposeNativeResolveRange(uint32_t address, uint32_t length, bool scaled,
-                                 VkDescriptorBufferInfo& buffer_info);
-  // Diagnostics: the native resolve buffers overlapping the range.
-  std::string DescribeNativeResolveBuffers(uint32_t address, uint32_t length, bool scaled) const;
-  // Writes the guest memory part of the shared memory and EDRAM descriptor set
-  // (creating the GPU copy of guest memory) before the set is first bound.
-  bool EnsureSharedMemoryDescriptor();
-
   // Submission must be open to insert barriers. If no pipeline stages access
   // the resource in a synchronization scope, the stage masks should be 0 (top /
   // bottom of pipe should be specified only if explicitly needed). Returning
@@ -223,8 +191,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   // render pass will also be closed.
   bool SubmitBarriers(bool force_end_render_pass);
 
-  bool IsHostOcclusionQueryActive() const { return active_occlusion_query_.valid; }
-
   // If not started yet, begins a render pass from the render target cache.
   // Submission must be open.
   void SubmitBarriersAndEnterRenderTargetCacheRenderPass(
@@ -241,14 +207,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkDescriptorSetLayout GetSingleTransientDescriptorLayout(
       SingleTransientDescriptorLayout transient_descriptor_layout) const {
     return descriptor_set_layouts_single_transient_[size_t(transient_descriptor_layout)];
-  }
-  // All of the shared memory (and the EDRAM with fragment shader interlock),
-  // accessible from guest shader stages. Valid after the context is set up.
-  VkDescriptorSetLayout descriptor_set_layout_shared_memory_and_edram() const {
-    return descriptor_set_layout_shared_memory_and_edram_;
-  }
-  VkDescriptorSet shared_memory_and_edram_descriptor_set() const {
-    return shared_memory_and_edram_descriptor_set_;
   }
   // A frame must be open.
   VkDescriptorSet AllocateSingleTransientDescriptor(
@@ -289,6 +247,7 @@ class VulkanCommandProcessor : public CommandProcessor {
  protected:
   bool SetupContext() override;
   void ShutdownContext() override;
+  void PrepareForSuspend() override;
 
   void WriteRegister(uint32_t index, uint32_t value) override;
   void WriteRegistersFromMem(uint32_t start_index, uint32_t* base, uint32_t num_registers) override;
@@ -308,8 +267,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType prim_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
-
-  void InitializeTrace() override;
 
  private:
   struct CommandBuffer {
@@ -471,25 +428,7 @@ class VulkanCommandProcessor : public CommandProcessor {
   void ClearTransientDescriptorPools();
   bool IssueCopy_ReadbackResolvePath();
   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
-  // HAND PATCH: accurate memexport readback, deferred to end-of-frame. The
-  // per-draw synchronous path drains the whole GPU queue mid-frame inside an
-  // open render pass - once per skinned-character draw - which wedges
-  // RADV/VanGogh (CP stuck at PS_PARTIAL_FLUSH). Ranges are accumulated per
-  // draw and read back once per frame in IssueSwap, where the submission is
-  // ending anyway; the guest consumes the data on the following frame.
-  void PerformDeferredMemexportReadback();
   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
-  struct NativeVertexRange {
-    uint32_t address;
-    uint32_t size;
-    uint32_t offset;
-  };
-  struct NativeVertexCache;
-  VkDescriptorSet TryCachedNativeVertexStreams(const NativeVertexRange* ranges, size_t range_count,
-                                               uint32_t snapshot_size);
-
-  bool PrepareNativeVertexStreams(const VulkanShader& shader, const VulkanShader* pixel_shader,
-                                  const PrimitiveProcessor::ProcessingResult& primitives);
 
   void SplitPendingBarrier();
 
@@ -502,6 +441,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
+  void InvalidateAllVertexBufferResidency();
+  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
+  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
   struct ReadbackBuffer {
     VkBuffer buffers[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
     VkDeviceMemory memories[2] = {VK_NULL_HANDLE, VK_NULL_HANDLE};
@@ -543,12 +485,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   bool EnsureSwapFxaaSourceImage(uint32_t width, uint32_t height);
   void DestroySwapFxaaSourceImage();
 
-  // Resolution scale for rasterizing the current draw, including samples of
-  // multisampled surfaces kept as pixels of single-sampled render targets.
+  // The draw resolution scale, doubled along the axes of multisampled surfaces
+  // kept single-sampled (see RenderTargetCache::msaa_as_single_sample).
   void GetDrawRasterizationScale(uint32_t& scale_x_out, uint32_t& scale_y_out) const;
-  // gpu_null_optional_draw_limit bookkeeping.
-  uint64_t null_optional_draw_frame_ = UINT64_MAX;
-  uint32_t null_optional_draws_this_frame_ = 0;
   void UpdateDynamicState(const draw_util::ViewportInfo& viewport_info, bool primitive_polygonal,
                           reg::RB_DEPTHCONTROL normalized_depth_control);
   void UpdateSystemConstantValues(
@@ -597,8 +536,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   static constexpr uint32_t kMaxFramesInFlight = 3;
   bool frame_open_ = false;
-  VulkanGpuProfiler gpu_profiler_;
-  uint64_t gpu_profiler_reported_frame_ = 0;
   // Tracks whether any draw in the current frame used an async placeholder
   // graphics pipeline and may have produced incomplete output.
   bool frame_used_async_placeholder_pipeline_ = false;
@@ -635,21 +572,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   std::vector<VkDescriptorImageInfo> descriptor_write_image_info_;
 
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> uniform_buffer_pool_;
-  std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> native_vertex_buffer_pool_;
-  std::unique_ptr<NativeVertexCache> native_vertex_cache_;
-  std::deque<std::pair<uint64_t, std::unique_ptr<NativeVertexCache>>> native_vertex_caches_retired_;
-
-  std::unordered_map<size_t, std::unique_ptr<ui::vulkan::VulkanUploadBufferPool>>
-      native_texture_buffer_pools_;
-
-  std::array<uint32_t, 6 * 32> native_vertex_fetch_constants_{};
-  VkDescriptorSet native_vertex_descriptor_set_ = VK_NULL_HANDLE;
-  uint32_t shared_memory_binding_count_ = 0;
-  bool native_vertex_streams_active_ = false;
-  bool native_vertex_fetch_constants_bound_ = false;
-  uint64_t native_vertex_draws_ = 0;
-  uint64_t native_vertex_total_draws_ = 0;
-  uint64_t native_vertex_bytes_ = 0;
 
   // Descriptor set layouts used by different shaders.
   VkDescriptorSetLayout descriptor_set_layout_empty_ = VK_NULL_HANDLE;
@@ -699,8 +621,6 @@ class VulkanCommandProcessor : public CommandProcessor {
 
   VkDescriptorPool shared_memory_and_edram_descriptor_pool_ = VK_NULL_HANDLE;
   VkDescriptorSet shared_memory_and_edram_descriptor_set_;
-  // Whether its guest memory binding is written (EnsureSharedMemoryDescriptor).
-  bool shared_memory_descriptor_written_ = false;
 
   // Bytes 0x0...0x3FF - 256-entry gamma ramp table with B10G10R10X2 data (read
   // as R10G10B10X2 with swizzle).
@@ -770,8 +690,6 @@ class VulkanCommandProcessor : public CommandProcessor {
   VkPipeline swap_apply_gamma_compute_pwl_fxaa_luma_rb_swap_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_pipeline_ = VK_NULL_HANDLE;
   VkPipeline swap_fxaa_extreme_pipeline_ = VK_NULL_HANDLE;
-  // Colour grading without FXAA (only created with grading settings).
-  VkPipeline swap_color_grade_pipeline_ = VK_NULL_HANDLE;
   VkPipelineLayout resolve_downscale_pipeline_layout_ = VK_NULL_HANDLE;
   VkPipeline resolve_downscale_pipeline_ = VK_NULL_HANDLE;
   VkBuffer resolve_downscale_buffer_ = VK_NULL_HANDLE;
@@ -827,9 +745,14 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  struct VertexBufferState {
+    uint32_t address = UINT32_MAX;
+    uint32_t size = UINT32_MAX;
+  };
+  std::array<VertexBufferState, 96> vertex_buffer_states_{};
+  uint64_t vertex_buffers_in_sync_[2] = {};
   std::unordered_map<uint64_t, ReadbackBuffer> readback_buffers_;
   std::unordered_map<uint64_t, ReadbackBuffer> memexport_readback_buffers_;
-  std::vector<draw_util::MemExportRange> deferred_memexport_readback_ranges_;
 
   // The current dynamic state of the graphics pipeline bind point. Note that
   // binding any pipeline to the bind point with static state (even if it's

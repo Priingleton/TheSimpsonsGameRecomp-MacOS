@@ -25,10 +25,6 @@ using namespace rex::arch;
 
 namespace rex::runtime {
 
-// The host instruction of the access violation being handled, for statistics
-// of what writes watched memory.
-thread_local uintptr_t g_access_violation_pc = 0;
-
 MMIOHandler* MMIOHandler::global_handler_ = nullptr;
 
 MMIOHandler* MMIOHandler::global_handler() {
@@ -410,19 +406,6 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     // clears the watch we just hit).
     // Do this under the lock so we don't introduce another race condition.
     auto lock = global_critical_region_.Acquire();
-#if !REX_PLATFORM_LINUX
-    // HAND PATCH (Linux): this recheck is nearly free on Windows
-    // (VirtualQuery), but on Linux memory::QueryProtect parses the whole
-    // /proc/self/maps with an ifstream ON EVERY WRITE-WATCH FAULT while
-    // holding the global lock. During level streaming (tens of thousands of
-    // faults) this alone consumed ~99% of the faulting thread's time
-    // (confirmed via perf: FindEntryForAddress + basic_ifstream dominating),
-    // starving audio and delaying texture/vertex uploads by tens of seconds.
-    // The race it guards against (another thread already serviced this
-    // watch) is handled correctly anyway by access_violation_callback_:
-    // TriggerCallbacks under the same lock, plus the stale-protection
-    // recovery path in Memory::AccessViolationCallback which restores page
-    // access and resumes. So on Linux, skip straight to the callback.
     memory::PageAccess cur_access;
     size_t page_length = memory::page_size();
     memory::QueryProtect(fault_host_address, page_length, cur_access);
@@ -431,10 +414,8 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
       // Another thread has cleared this watch. Abort.
       return true;
     }
-#endif
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
-    g_access_violation_pc = uintptr_t(ex->pc());
     if (access_violation_callback_) {
       return access_violation_callback_(std::move(lock), access_violation_callback_context_,
                                         fault_host_address, is_write);

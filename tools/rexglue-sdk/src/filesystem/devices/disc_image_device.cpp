@@ -56,7 +56,10 @@ bool DiscImageDevice::Initialize() {
 
 void DiscImageDevice::Dump(string::StringBuffer* string_buffer) {
   auto global_lock = global_critical_region_.Acquire();
-  root_entry_->Dump(string_buffer, 0);
+  string_buffer->AppendFormat(
+      "{}: {} files, {} bytes (game_offset={:#x}, root_sector={}, root_size={}, host_size={})\n",
+      mount_path(), file_count_, total_file_size_, disc_info_.game_offset, disc_info_.root_sector,
+      disc_info_.root_size, disc_info_.host_size);
 }
 
 Entry* DiscImageDevice::ResolvePath(const std::string_view path) {
@@ -86,14 +89,16 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
   }
 
   // Read sector 32 to get FS state.
-  if (state->size < state->game_offset + (32 * kXESectorSize)) {
+  if (state->game_offset + (32 * kXESectorSize) > state->size ||
+      state->size - (state->game_offset + (32 * kXESectorSize)) < 28) {
     return Error::kErrorReadError;
   }
   uint8_t* fs_ptr = state->ptr + state->game_offset + (32 * kXESectorSize);
   state->root_sector = memory::load<uint32_t>(fs_ptr + 20);
   state->root_size = memory::load<uint32_t>(fs_ptr + 24);
   state->root_offset = state->game_offset + (state->root_sector * kXESectorSize);
-  if (state->root_size < 13 || state->root_size > 32_MiB) {
+  if (state->root_size < 14 || state->root_size > 32_MiB ||
+      state->root_offset > state->size || state->root_size > state->size - state->root_offset) {
     return Error::kErrorDamagedFile;
   }
 
@@ -106,7 +111,7 @@ DiscImageDevice::Error DiscImageDevice::Verify(ParseState* state) {
 }
 
 bool DiscImageDevice::VerifyMagic(ParseState* state, size_t offset) {
-  if (offset >= state->size) {
+  if (offset > state->size || state->size - offset < 20) {
     return false;
   }
 
@@ -120,74 +125,50 @@ DiscImageDevice::Error DiscImageDevice::ReadAllEntries(ParseState* state,
   root_entry->attributes_ = kFileAttributeDirectory;
   root_entry_ = std::unique_ptr<Entry>(root_entry);
 
-  if (!ReadEntry(state, root_buffer, 0, root_entry)) {
+  if (!ReadEntry(state, root_buffer, 0, root_entry, state->root_size)) {
     return Error::kErrorOutOfMemory;
   }
 
   return Error::kSuccess;
 }
 
-bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16_t entry_ordinal,
-                                DiscImageEntry* parent) {
-  const uint8_t* p = buffer + (entry_ordinal * 4);
-
-  uint16_t node_l = memory::load<uint16_t>(p + 0);
-  uint16_t node_r = memory::load<uint16_t>(p + 2);
-  size_t sector = memory::load<uint32_t>(p + 4);
-  size_t length = memory::load<uint32_t>(p + 8);
-  uint8_t attributes = memory::load<uint8_t>(p + 12);
-  uint8_t name_length = memory::load<uint8_t>(p + 13);
-  auto name_buffer = reinterpret_cast<const char*>(p + 14);
-
-  if (node_l && !ReadEntry(state, buffer, node_l, parent)) {
-    return false;
-  }
-
-  auto name = std::string(name_buffer, name_length);
-
+bool DiscImageDevice::ReadEntry(ParseState* state, const uint8_t* buffer, uint16_t ordinal,
+                                DiscImageEntry* parent, size_t table_size, size_t depth) {
+  const size_t offset = size_t(ordinal) * 4;
+  const size_t absolute = size_t(buffer - state->ptr) + offset;
+  if (depth > 512 || offset > table_size || table_size - offset < 14 ||
+      !state->visited.insert(absolute).second) return false;
+  const uint8_t* p = buffer + offset;
+  const uint16_t left = memory::load<uint16_t>(p);
+  const uint16_t right = memory::load<uint16_t>(p + 2);
+  const size_t sector = memory::load<uint32_t>(p + 4);
+  const size_t length = memory::load<uint32_t>(p + 8);
+  const uint8_t attributes = p[12], name_length = p[13];
+  if (!name_length || name_length > table_size - offset - 14) return false;
+  const std::string name(reinterpret_cast<const char*>(p + 14), name_length);
+  if (name == "." || name == ".." || name.find_first_of("/\\") != std::string::npos ||
+      name.find('\0') != std::string::npos) return false;
+  const size_t data_offset = state->game_offset + sector * kXESectorSize;
+  if (data_offset > state->size || length > state->size - data_offset) return false;
+  if (left && !ReadEntry(state, buffer, left, parent, table_size, depth + 1)) return false;
   auto entry = DiscImageEntry::Create(this, parent, name, mmap_.get());
   entry->attributes_ = attributes | kFileAttributeReadOnly;
   entry->size_ = length;
   entry->allocation_size_ = rex::round_up(length, bytes_per_sector());
-
-  // Set to January 1, 1970 (UTC) in 100-nanosecond intervals
-  entry->create_timestamp_ = 10000 * 11644473600000LL;
-  entry->access_timestamp_ = 10000 * 11644473600000LL;
-  entry->write_timestamp_ = 10000 * 11644473600000LL;
-
+  entry->create_timestamp_ = entry->access_timestamp_ = entry->write_timestamp_ =
+      10000 * 11644473600000LL;
   if (attributes & kFileAttributeDirectory) {
-    // Folder.
-    entry->data_offset_ = 0;
-    entry->data_size_ = 0;
-    if (length) {
-      // Not a leaf - read in children.
-      if (state->size < state->game_offset + (sector * kXESectorSize)) {
-        // Out of bounds read.
-        return false;
-      }
-      // Read child list.
-      uint8_t* folder_ptr = state->ptr + state->game_offset + (sector * kXESectorSize);
-      if (!ReadEntry(state, folder_ptr, 0, entry.get())) {
-        return false;
-      }
-    }
+    entry->data_offset_ = entry->data_size_ = 0;
+    if (length && !ReadEntry(state, state->ptr + data_offset, 0, entry.get(), length, depth + 1))
+      return false;
   } else {
-    // File.
-    entry->data_offset_ = state->game_offset + (sector * kXESectorSize);
+    entry->data_offset_ = data_offset;
     entry->data_size_ = length;
     ++file_count_;
     total_file_size_ += length;
   }
-
-  // Add to parent.
   parent->children_.emplace_back(std::move(entry));
-
-  // Read next file in the list.
-  if (node_r && !ReadEntry(state, buffer, node_r, parent)) {
-    return false;
-  }
-
-  return true;
+  return !right || ReadEntry(state, buffer, right, parent, table_size, depth + 1);
 }
 
 }  // namespace rex::filesystem

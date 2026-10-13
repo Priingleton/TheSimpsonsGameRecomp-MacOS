@@ -14,7 +14,7 @@ else()
     if(REXSDK_VERSION)
         find_package(rexglue ${REXSDK_VERSION} EXACT QUIET CONFIG)
     else()
-        find_package(rexglue 0.8.0 QUIET CONFIG)
+        find_package(rexglue 0.10.0 QUIET CONFIG)
     endif()
     if(NOT rexglue_FOUND)
         message(FATAL_ERROR
@@ -32,37 +32,127 @@ if(NOT DEFINED REXGLUE_HOST_TARGET)
     set(REXGLUE_HOST_TARGET ${PROJECT_NAME})
 endif()
 
+set(REXGLUE_RECOMP_DEBUG_INFO "line-tables-only" CACHE STRING
+    "Debug info level for generated code: line-tables-only, full, or none")
+
+# Guest SEH scopes emit __try/__except, which traps hardware faults only under
+# asynchronous EH. clang++ spells that flag the GNU way.
+set(REXGLUE_RECOMP_OPTIONS "")
+if(WIN32)
+    if(MSVC)
+        list(APPEND REXGLUE_RECOMP_OPTIONS /EHa)
+    elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        list(APPEND REXGLUE_RECOMP_OPTIONS -fasync-exceptions)
+    endif()
+endif()
+if(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "none")
+    list(APPEND REXGLUE_RECOMP_OPTIONS
+        $<$<CXX_COMPILER_ID:Clang,AppleClang,GNU>:-g0>)
+elseif(REXGLUE_RECOMP_DEBUG_INFO STREQUAL "line-tables-only")
+    list(APPEND REXGLUE_RECOMP_OPTIONS
+        $<$<CXX_COMPILER_ID:Clang,AppleClang>:-gline-tables-only>)
+endif()
+
 # Include entrypoint generated code if codegen has been run.
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/sources.cmake")
     include(generated/default/sources.cmake)
     set(REXGLUE_ENTRYPOINT_GENERATED_SOURCES ${GENERATED_SOURCES})
     set(REXGLUE_ENTRYPOINT_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/generated/default")
+
+    # Carried on the sources so they hold for whichever target compiles them.
+    set_source_files_properties(${REXGLUE_ENTRYPOINT_GENERATED_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "${REXGLUE_RECOMP_OPTIONS}")
 endif()
+
+# The options go on the target as well: CMake compiles the header from its own
+# cmake_pch.hxx.cxx, which carries none of the source properties above, and
+# clang rejects a PCH whose EH mode disagrees with the TU including it.
+function(rexglue_apply_recomp_settings target_name pch_header)
+    target_precompile_headers(${target_name} PRIVATE "${pch_header}")
+    target_compile_options(${target_name} PRIVATE ${REXGLUE_RECOMP_OPTIONS})
+endfunction()
 
 # Configure a rexglue target with SDK libraries and platform settings.
 # Call after add_executable() in your CMakeLists.txt.
-# Usage: rexglue_setup_target(<target>)
+# Usage: rexglue_setup_target(<target> [GPU_PLUGINS xenos])
 macro(rexglue_setup_target target_name)
-    target_sources(${target_name} PRIVATE ${REXGLUE_ENTRYPOINT_GENERATED_SOURCES})
+    if(REXGLUE_ENTRYPOINT_GENERATED_SOURCES)
+        add_library(${target_name}_recomp OBJECT
+            ${REXGLUE_ENTRYPOINT_GENERATED_SOURCES})
+        target_include_directories(${target_name}_recomp PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${REXGLUE_ENTRYPOINT_INCLUDE_DIR}
+        )
+        target_link_libraries(${target_name}_recomp PRIVATE rex::runtime)
+        rexglue_apply_target_settings(${target_name}_recomp)
+        rexglue_apply_recomp_settings(${target_name}_recomp
+            "${REXGLUE_ENTRYPOINT_INCLUDE_DIR}/simpsons_pch.h")
+        add_dependencies(${target_name}_recomp simpsons_codegen)
+        target_link_libraries(${target_name} PRIVATE
+            ${target_name}_recomp)
+    endif()
+    # Also on the host, so a tree that has never run codegen still generates it.
+    add_dependencies(${target_name} simpsons_codegen)
     target_include_directories(${target_name} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/src
         ${REXGLUE_ENTRYPOINT_INCLUDE_DIR}
     )
     target_link_libraries(${target_name} PRIVATE rex::runtime)
-    rexglue_configure_target(${target_name})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons")
+        rexglue_embed_metadata(${target_name}
+            DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/metadata/icons"
+            PREFIX "icons")
+    endif()
+    rexglue_configure_target(${target_name} ${ARGN})
 endmacro()
+
+# Shipped generated sources build without the private disc or a host CLI.
+# Opt in to regenerate after changing the manifest or function hooks.
+option(SIMPSONS_REGENERATE_CODE "Regenerate C++ from your own default.xex" OFF)
+if(SIMPSONS_REGENERATE_CODE)
+# Codegen is a host-side step: it runs the rexglue CLI, which a cross-compiled
+# SDK install (iOS, Android) does not ship -- those build the runtime only, so
+# rex::rexglue is undefined there. Fall back to a host tool named by
+# REXGLUE_HOST_TOOL, or found on PATH.
+if(TARGET rex::rexglue)
+    set(REXGLUE_CODEGEN_COMMAND "$<TARGET_FILE:rex::rexglue>")
+else()
+    find_program(REXGLUE_HOST_TOOL rexglue
+        DOC "Host rexglue CLI used for codegen when cross-compiling")
+    if(NOT REXGLUE_HOST_TOOL)
+        message(FATAL_ERROR
+            "This SDK install provides no rexglue CLI (expected when cross-compiling).\n"
+            "  Set REXGLUE_HOST_TOOL to the host build's rexglue binary.")
+    endif()
+    set(REXGLUE_CODEGEN_COMMAND "${REXGLUE_HOST_TOOL}")
+endif()
+
+# Codegen runs as part of the build, re-running only when an input in codegen.d
+# changes. Build it alone with 'cmake --build . --target simpsons_codegen'.
+# Listing the sources as outputs orders any target that compiles them after
+# codegen, including one a project assembles itself rather than taking the
+# library rexglue_setup_target() builds. The stamp comes first: the DEPFILE
+# names it.
+add_custom_command(
+    OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.build.stamp"
+           ${REXGLUE_ENTRYPOINT_GENERATED_SOURCES}
+    COMMAND ${REXGLUE_CODEGEN_COMMAND} codegen ${CMAKE_CURRENT_SOURCE_DIR}/simpsons_manifest.toml
+    DEPFILE "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.d"
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    COMMENT "Generating recompiled code for simpsons"
+    VERBATIM
+)
+add_custom_target(simpsons_codegen
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/codegen.build.stamp")
+
+else()
+    add_custom_target(simpsons_codegen
+        COMMAND ${CMAKE_COMMAND} -E echo "Configure with -DSIMPSONS_REGENERATE_CODE=ON to regenerate")
+endif()
 
 # Include DLL module shared library targets if codegen has generated them
 if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/generated/default/dll_targets.cmake")
     include(generated/default/dll_targets.cmake)
 endif()
-
-# Codegen target - run 'cmake --build . --target simpsons_codegen'
-# Uses the manifest to drive codegen for all modules (entrypoint + DLLs).
-add_custom_target(simpsons_codegen
-    COMMAND $<TARGET_FILE:rex::rexglue> codegen ${CMAKE_CURRENT_SOURCE_DIR}/simpsons_manifest.toml
-    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
-    COMMENT "Generating recompiled code for simpsons"
-    VERBATIM
-)

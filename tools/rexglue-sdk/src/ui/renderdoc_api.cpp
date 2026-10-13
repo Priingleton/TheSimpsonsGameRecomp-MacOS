@@ -9,8 +9,6 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <cstdlib>
-
 #include <rex/logging.h>
 #include <rex/ui/renderdoc_api.h>
 
@@ -18,18 +16,11 @@ namespace rex {
 namespace ui {
 
 std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
-  // HAND PATCH: the "is RenderDoc attached" heuristic below dlopens
-  // librenderdoc.so and treats a successful load as "attached". On systems
-  // with RenderDoc installed globally (SteamOS with renderdoc-minimal:
-  // /usr/lib/librenderdoc.so), the load ALWAYS succeeds, silently embedding
-  // the full capture layer + auto-enabling GPU debug markers in every run --
-  // significant overhead and an instability source. Make the integration
-  // opt-in: only probe when explicitly requested.
-  const char* renderdoc_env = std::getenv("REX_ENABLE_RENDERDOC");
-  if (!renderdoc_env || renderdoc_env[0] != '1') {
-    return nullptr;
-  }
-
+#if REX_PLATFORM_MAC
+  // The vendored RenderDoc app API header doesn't expose a macOS path.
+  // Keep RenderDoc optional and simply report "not connected" on this platform.
+  return nullptr;
+#else
   std::unique_ptr<RenderDocAPI> renderdoc_api(new RenderDocAPI());
 
   pRENDERDOC_GetAPI get_api = nullptr;
@@ -52,6 +43,7 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
   REXLOG_INFO("RenderDoc API initialized");
 
   return renderdoc_api;
+#endif
 }
 
 RenderDocAPI::~RenderDocAPI() {

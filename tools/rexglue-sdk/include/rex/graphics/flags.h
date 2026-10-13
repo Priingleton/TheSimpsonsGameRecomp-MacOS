@@ -15,13 +15,10 @@
 
 // GPU Core
 REXCVAR_DECLARE(bool, vsync);
+REXCVAR_DECLARE(int32_t, framerate_limit);
 REXCVAR_DECLARE(bool, clear_memory_page_state);
 REXCVAR_DECLARE(bool, half_pixel_offset);
 REXCVAR_DECLARE(bool, async_shader_compilation);
-REXCVAR_DECLARE(int32_t, video_mode_width);
-REXCVAR_DECLARE(int32_t, video_mode_height);
-REXCVAR_DECLARE(double, video_mode_refresh_rate);
-REXCVAR_DECLARE(std::string, resolution);
 
 // GPU Resolution / Readback / Queries
 REXCVAR_DECLARE(int32_t, resolution_scale);
@@ -30,6 +27,7 @@ REXCVAR_DECLARE(int32_t, draw_resolution_scale_y);
 REXCVAR_DECLARE(bool, resolve_resolution_scale_fill_half_pixel_offset);
 REXCVAR_DECLARE(bool, draw_resolution_scaled_texture_offsets);
 REXCVAR_DECLARE(std::string, readback_resolve);
+REXCVAR_DECLARE(int32_t, readback_resolve_small_kb);
 REXCVAR_DECLARE(bool, readback_resolve_half_pixel_offset);
 REXCVAR_DECLARE(bool, readback_memexport);
 REXCVAR_DECLARE(bool, readback_memexport_fast);
@@ -51,8 +49,6 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
 // GPU Textures
 REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
 REXCVAR_DECLARE(bool, gpu_allow_null_optional_streams);
-REXCVAR_DECLARE(bool, gpu_rasterize_null_optional_reads);
-REXCVAR_DECLARE(int32_t, gpu_null_optional_draw_limit);
 REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
 REXCVAR_DECLARE(int32_t, anisotropic_override);
 REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
@@ -77,25 +73,11 @@ bool IsGpuDebugMarkersEnabled();
 // GPU Alpha Test
 REXCVAR_DECLARE(bool, use_fuzzy_alpha_epsilon);
 
-// GPU Shader Translation / Tracing
+// GPU Shader Translation
 REXCVAR_DECLARE(std::string, dump_shaders);
-REXCVAR_DECLARE(std::string, gpu);
-REXCVAR_DECLARE(std::string, shader_inventory_csv);
-REXCVAR_DECLARE(bool, dxbc_switch);
-REXCVAR_DECLARE(bool, dxbc_source_map);
-REXCVAR_DECLARE(std::string, trace_gpu_prefix);
-REXCVAR_DECLARE(bool, trace_gpu_stream);
 REXCVAR_DECLARE(std::string, swap_post_effect);
-// HAND PATCH: belt-and-braces cap on passes through a translated shader's main
-// control-flow dispatch loop (Xenos LOOP continuations, JMP/CALL targets) per
-// invocation. See spirv_translator.cpp (var_main_cf_iteration_guard_) for how
-// this is enforced. 0 disables the guard.
-REXCVAR_DECLARE(int32_t, gpu_shader_max_cf_iterations);
-REXCVAR_DECLARE(bool, gpu_sanitize_vertex_position);
-REXCVAR_DECLARE(double, gpu_vertex_position_magnitude_limit);
-REXCVAR_DECLARE(double, gpu_vertex_position_min_abs_w);
 
-// Vulkan
+#if REX_HAS_VULKAN
 REXCVAR_DECLARE(bool, vulkan_sparse_shared_memory);
 REXCVAR_DECLARE(bool, vulkan_submit_on_primary_buffer_end);
 REXCVAR_DECLARE(bool, vulkan_dynamic_rendering);
@@ -109,8 +91,11 @@ REXCVAR_DECLARE(std::string, render_target_path_vulkan);
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DECLARE(bool, vulkan_readback_resolve);
 REXCVAR_DECLARE(bool, vulkan_readback_memexport);
+#endif  // REX_HAS_VULKAN
 
-// D3D12
+#if REX_HAS_D3D12
+REXCVAR_DECLARE(bool, dxbc_switch);
+REXCVAR_DECLARE(bool, dxbc_source_map);
 REXCVAR_DECLARE(bool, d3d12_bindless);
 REXCVAR_DECLARE(bool, d3d12_submit_on_primary_buffer_end);
 REXCVAR_DECLARE(bool, d3d12_dxbc_disasm);
@@ -122,5 +107,6 @@ REXCVAR_DECLARE(std::string, render_target_path_d3d12);
 // Legacy backend compatibility aliases for shared readback controls.
 REXCVAR_DECLARE(bool, d3d12_readback_memexport);
 REXCVAR_DECLARE(bool, d3d12_readback_resolve);
+#endif  // REX_HAS_D3D12
 
 #define XE_GPU_FINE_GRAINED_DRAW_SCOPES 1

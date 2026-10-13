@@ -11,8 +11,6 @@
  */
 
 #include <array>
-#include <deque>
-#include <functional>
 #include <memory>
 #include <unordered_map>
 #include <utility>
@@ -131,76 +129,9 @@ class VulkanTextureCache final : public TextureCache {
                                               length_scaled_alignment_log2);
   }
   VkBuffer scaled_resolve_buffer() const { return scaled_resolve_buffer_; }
-  void UseScaledResolveBufferForRead(std::pair<uint32_t, uint32_t> read_range = {
-                                         0, SharedMemory::kBufferSize});
+  void UseScaledResolveBufferForRead();
   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                       uint64_t written_length_scaled);
-  void SetNativeResolveMemoryFlusher(std::function<bool(uint32_t, uint32_t)> flusher) {
-    native_resolve_memory_flusher_ = std::move(flusher);
-  }
-
-  // Native resolves: resolved render target data written directly into the
-  // textures that sample it instead of being reloaded from guest memory. Must be
-  // set before textures are created, as it affects image creation.
-  void SetNativeResolveTexturesEnabled(bool enabled) { native_resolve_textures_enabled_ = enabled; }
-  // Called before scaled resolve memory is read by a texture load, with the
-  // unscaled range, to write back resolved data only held in textures so far.
-  void SetScaledResolveMemoryFlusher(std::function<void(uint32_t start, uint32_t length)> flusher) {
-    scaled_resolve_memory_flusher_ = std::move(flusher);
-  }
-  struct NativeResolveTarget {
-    // Opaque texture reference, valid within the resolve it was found for.
-    void* texture = nullptr;
-    VkImageView view = VK_NULL_HANDLE;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    uint32_t width = 0;
-    uint32_t height = 0;
-  };
-  static constexpr uint32_t kMaxNativeResolveTargets = 4;
-  // Finds existing textures that sample exactly the memory a resolve writes:
-  // the base level starting at dest_base, stored as a single 2D tiled level with
-  // the resolve's row pitch, the same format and endianness, with data that
-  // currently matches guest memory. Returns the number of targets written.
-  // scaled: the textures are resolution-scaled (resolved from a render target
-  // at the scaled resolution).
-  uint32_t FindNativeResolveTargets(uint32_t dest_base, uint32_t dest_pitch_texels,
-                                    xenos::TextureFormat format, xenos::Endian endian, bool scaled,
-                                    NativeResolveTarget* targets_out);
-  // Pushes the barrier for writing the target as a color attachment or copy.
-  void BeginNativeResolveWrite(const NativeResolveTarget& target, bool image_copy = false);
-  // To be called once the target's memory range has been marked as resolved and
-  // the texture data has been written, so it matches guest memory again.
-  void EndNativeResolveWrite(const NativeResolveTarget& target);
-  // Write-back of native resolve targets to the scaled resolve memory
-  // (native_resolve_scaled_lazy_memory). The texture is the opaque reference of
-  // a NativeResolveTarget, kept alive while pending.
-  void AddScaledMemoryPending(void* texture, int32_t delta);
-  // Transitions the texture for reading in the write-back compute shader, and
-  // returns its raw bits (integer) view.
-  VkImageView BeginScaledMemoryWriteback(void* texture);
-
-  // native_resolve_copy_free: native resolve target textures created with
-  // their own memory and the properties of render target images, so a render
-  // target can hand its image over instead of copying it in a resolve. Gives
-  // the host extent of the texture's image if it's such a texture.
-  bool GetCopyFreeResolveTargetExtent(void* texture, uint32_t& width_out,
-                                      uint32_t& height_out) const;
-  // Exchanges the texture's image and memory with the given ones. In: the
-  // state of the given image; out: the state of the texture's old image. With
-  // content_red_blue_swapped, the given image holds red and blue swapped
-  // relative to the texture's format (the render target's own order), and the
-  // texture's views swap them back.
-  void ExchangeCopyFreeResolveTargetImage(void* texture, VkImage& image, VkDeviceMemory& memory,
-                                          VkPipelineStageFlags& stage_mask,
-                                          VkAccessFlags& access_mask, VkImageLayout& layout,
-                                          bool content_red_blue_swapped);
-  VkImage GetTextureImage(void* texture) const {
-    return static_cast<const VulkanTexture*>(texture)->image();
-  }
-  // For data written in the texture's own order (a resolve copy, a load).
-  void ClearTextureContentRedBlueSwapped(void* texture);
-  void SetTextureContentRedBlueSwapped(void* texture, bool swapped);
-  bool IsTextureContentRedBlueSwapped(void* texture) const;
 
  protected:
   bool IsSignedVersionSeparateForFormat(TextureKey key) const override;
@@ -217,20 +148,10 @@ class VulkanTextureCache final : public TextureCache {
 
   bool LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                              bool load_mips) override;
-  bool CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
-                                 bool load_mips) const override;
-  bool CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
-                                       bool load_mips) const override;
-  bool LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base, bool load_mips) override;
-  bool LoadTextureDataFromCpuImpl(Texture& texture, bool load_base, bool load_mips) override;
 
   void UpdateTextureBindingsImpl(uint32_t fetch_constant_mask) override;
 
  private:
-  bool LoadTextureDataImpl(Texture& texture, bool load_base, bool load_mips, bool from_cpu,
-                           bool from_native_gpu = false);
-  std::function<bool(uint32_t, uint32_t)> native_resolve_memory_flusher_;
-
   enum LoadDescriptorSetIndex {
     kLoadDescriptorSetIndexDestination,
     kLoadDescriptorSetIndexSource,
@@ -272,30 +193,14 @@ class VulkanTextureCache final : public TextureCache {
       kTransferDestination,
       kGuestShaderSampled,
       kSwapSampled,
-      kNativeResolveWrite,
-      // Read by a compute shader writing its resolved data back to the scaled
-      // resolve memory.
-      kScaledMemoryWriteback,
     };
 
     // Takes ownership of the image and its memory.
     explicit VulkanTexture(VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
                            VmaAllocation allocation, bool track_usage = true);
-    // An image with its own dedicated memory (native_resolve_copy_free).
-    explicit VulkanTexture(VulkanTextureCache& texture_cache, const TextureKey& key, VkImage image,
-                           VkDeviceMemory memory, VkDeviceSize memory_size);
     ~VulkanTexture();
 
     VkImage image() const { return image_; }
-    // Images with their own memory can be exchanged with render targets'.
-    VkDeviceMemory memory() const { return memory_; }
-    bool content_red_blue_swapped() const { return content_red_blue_swapped_; }
-    void SetContentRedBlueSwapped(bool swapped) { content_red_blue_swapped_ = swapped; }
-    // Replaces the image and its memory (only for one with its own memory),
-    // returning the old ones; the views of the old image are appended to
-    // retired_views_out.
-    void ExchangeImage(VkImage& image, VkDeviceMemory& memory,
-                       std::vector<VkImageView>& retired_views_out);
 
     // Doesn't transition (the caller must insert the barrier).
     Usage SetUsage(Usage new_usage) {
@@ -306,13 +211,6 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
-
-    // Integer view format for writing raw texel bits. VK_FORMAT_UNDEFINED
-    // unless the image was created as a native resolve destination.
-    VkFormat native_resolve_format() const { return native_resolve_format_; }
-    void SetNativeResolveFormat(VkFormat format) { native_resolve_format_ = format; }
-    // Level 0, layer 0 color attachment view.
-    VkImageView GetNativeResolveView();
 
    private:
     union ViewKey {
@@ -364,9 +262,6 @@ class VulkanTextureCache final : public TextureCache {
 
     VkImage image_;
     VmaAllocation allocation_;
-    // Instead of allocation_.
-    VkDeviceMemory memory_ = VK_NULL_HANDLE;
-    bool content_red_blue_swapped_ = false;
 
     Usage usage_ = Usage::kUndefined;
 
@@ -374,9 +269,6 @@ class VulkanTextureCache final : public TextureCache {
     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
-
-    VkFormat native_resolve_format_ = VK_FORMAT_UNDEFINED;
-    VkImageView native_resolve_view_ = VK_NULL_HANDLE;
   };
 
   struct VulkanTextureBinding {
@@ -422,7 +314,7 @@ class VulkanTextureCache final : public TextureCache {
                               VkPipelineStageFlags guest_shader_pipeline_stages);
 
   bool Initialize();
-  bool InitializeScaledResolveBuffer(bool defer = true);
+  bool InitializeScaledResolveBuffer();
   void ShutdownScaledResolveBuffer();
 
   const HostFormatPair& GetHostFormatPair(TextureKey key) const;
@@ -435,19 +327,6 @@ class VulkanTextureCache final : public TextureCache {
 
   xenos::ClampMode NormalizeClampMode(xenos::ClampMode clamp_mode) const;
 
-  static bool IsNativeResolveTextureFormat(xenos::TextureFormat format);
-  // Integer format of the same size for writing raw texel bits.
-  static VkFormat GetNativeResolveViewFormat(VkFormat host_format);
- public:
-  // Formats native resolves can write through a view of the format itself with
-  // native_resolve_unorm_views (the float round trip is exact for them).
-  static bool IsNativeResolveUnormFormat(VkFormat host_format);
-  // Whether a native resolve view format is the texture's own (unorm, or float
-  // depth) rather than a raw integer one.
-  static bool IsNativeResolveOwnFormatView(VkFormat view_format);
- private:
-  bool IsColorAttachmentFormatSupported(VkFormat format);
-
   VulkanCommandProcessor& command_processor_;
   VkPipelineStageFlags guest_shader_pipeline_stages_;
 
@@ -456,10 +335,6 @@ class VulkanTextureCache final : public TextureCache {
   // on Windows versions before 10, may have an allocation count limit as low as
   // 4096.
   VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
-  // Views of images textures gave away, destroyed once the submission that
-  // may still use them completes.
-  std::deque<std::pair<uint64_t, VkImageView>> retired_image_views_;
-  void RefreshBindingsOfTexture(const Texture* texture);
 
   static const HostFormatPair kBestHostFormats[64];
   static const HostFormatPair kHostFormatGBGRUnaligned;
@@ -496,10 +371,6 @@ class VulkanTextureCache final : public TextureCache {
   };
   uint8_t unsupported_format_features_used_[64] = {};
 
-  bool native_resolve_textures_enabled_ = false;
-  std::function<void(uint32_t start, uint32_t length)> scaled_resolve_memory_flusher_;
-  std::unordered_map<VkFormat, bool> color_attachment_format_support_;
-
   uint32_t sampler_max_count_;
 
   xenos::AnisoFilter max_anisotropy_;
@@ -512,8 +383,6 @@ class VulkanTextureCache final : public TextureCache {
   VkBuffer scaled_resolve_buffer_ = VK_NULL_HANDLE;
   uint64_t scaled_resolve_buffer_size_ = 0;
   bool scaled_resolve_buffer_sparse_ = false;
-  // Not created yet: without sparse binding it's created on first use.
-  bool scaled_resolve_buffer_deferred_ = false;
   uint32_t scaled_resolve_buffer_memory_type_ = UINT32_MAX;
   std::vector<VkDeviceMemory> scaled_resolve_buffer_memory_;
   uint32_t scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;

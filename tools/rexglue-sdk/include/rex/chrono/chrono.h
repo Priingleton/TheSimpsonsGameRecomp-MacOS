@@ -116,6 +116,19 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 
 namespace std::chrono {
 
+// C++20 clock_cast/clock_time_conversion (P0355) is absent from libc++ on both
+// Apple and the Android NDK, so key off the feature-test macro rather than the
+// platform: the specializations below need the primary template to exist.
+#if !defined(__cpp_lib_chrono) || __cpp_lib_chrono < 201907L
+template <class, class>
+struct clock_time_conversion {};
+
+template <class DestClock, class SourceClock, class Duration>
+auto clock_cast(const std::chrono::time_point<SourceClock, Duration>& t) {
+  return clock_time_conversion<DestClock, SourceClock>{}(t);
+}
+#endif
+
 template <>
 struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
   using WClock_ = ::rex::chrono::WinSystemClock;

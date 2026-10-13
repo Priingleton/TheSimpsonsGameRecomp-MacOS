@@ -4,3 +4,8 @@
 /bsf_list.c
 /codec_list.c
 /parser_list.c
+
+# Preconfigured decoder, bitstream-filter and parser tables.
+!/bsf_list.c
+!/codec_list.c
+!/parser_list.c

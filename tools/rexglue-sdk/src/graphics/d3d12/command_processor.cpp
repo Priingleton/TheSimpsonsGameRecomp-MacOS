@@ -104,6 +104,7 @@ void D3D12CommandProcessor::InsertDebugMarker(const char* format, ...) {
 
 void D3D12CommandProcessor::ClearCaches() {
   CommandProcessor::ClearCaches();
+  InvalidateAllVertexBufferResidency();
   cache_clear_requested_ = true;
 }
 
@@ -113,33 +114,40 @@ void D3D12CommandProcessor::InvalidateGpuMemory() {
   }
 }
 
+void D3D12CommandProcessor::InvalidateAllVertexBufferResidency() {
+  vertex_buffers_in_sync_[0] = 0;
+  vertex_buffers_in_sync_[1] = 0;
+  for (VertexBufferState& state : vertex_buffer_states_) {
+    state.address = UINT32_MAX;
+    state.size = UINT32_MAX;
+  }
+}
+
+void D3D12CommandProcessor::InvalidateVertexBufferResidency(uint32_t vfetch_index) {
+  if (vfetch_index >= vertex_buffer_states_.size()) {
+    return;
+  }
+  vertex_buffers_in_sync_[vfetch_index >> 6] &= ~(uint64_t(1) << (vfetch_index & 63));
+}
+
+void D3D12CommandProcessor::InvalidateVertexBufferResidencyRange(uint32_t first_vfetch,
+                                                                 uint32_t last_vfetch) {
+  if (first_vfetch > last_vfetch) {
+    std::swap(first_vfetch, last_vfetch);
+  }
+  if (first_vfetch >= vertex_buffer_states_.size()) {
+    return;
+  }
+  last_vfetch = std::min(last_vfetch, uint32_t(vertex_buffer_states_.size() - 1));
+  for (uint32_t vfetch_index = first_vfetch; vfetch_index <= last_vfetch; ++vfetch_index) {
+    InvalidateVertexBufferResidency(vfetch_index);
+  }
+}
 
 void D3D12CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                     uint32_t title_id, bool blocking) {
   CommandProcessor::InitializeShaderStorage(cache_root, title_id, blocking);
   pipeline_cache_->InitializeShaderStorage(cache_root, title_id, blocking);
-}
-
-void D3D12CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
-  // Capture with PIX if attached.
-  if (GetD3D12Provider().GetGraphicsAnalysis() != nullptr) {
-    pix_capture_requested_.store(true, std::memory_order_relaxed);
-    return;
-  }
-  CommandProcessor::RequestFrameTrace(root_path);
-}
-
-void D3D12CommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) {
-  shared_memory_->MemoryInvalidationCallback(base_ptr, length, true);
-  primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
-}
-
-void D3D12CommandProcessor::RestoreEdramSnapshot(const void* snapshot) {
-  // Starting a new frame because descriptors may be needed.
-  if (!BeginSubmission(true)) {
-    return;
-  }
-  render_target_cache_->RestoreEdramSnapshot(snapshot);
 }
 
 bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader,
@@ -167,9 +175,9 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
       return true;
     }
     bool is_end_via_z_pass =
-        sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+        sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
     bool is_end_via_z_fail =
-        sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+        sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
     std::memset(sample_counts, 0, sizeof(xenos::xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       sample_counts->ZPass_A = fake_sample_count;
@@ -179,9 +187,9 @@ bool D3D12CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffe
   };
 
   bool is_end_via_z_pass =
-      sample_counts->ZPass_A == kQueryFinished && sample_counts->ZPass_B == kQueryFinished;
+      sample_counts->ZPass_A == kQueryFinished || sample_counts->ZPass_B == kQueryFinished;
   bool is_end_via_z_fail =
-      sample_counts->ZFail_A == kQueryFinished && sample_counts->ZFail_B == kQueryFinished;
+      sample_counts->ZFail_A == kQueryFinished || sample_counts->ZFail_B == kQueryFinished;
   bool is_end = is_end_via_z_pass || is_end_via_z_fail;
 
   if (!is_end) {
@@ -851,6 +859,7 @@ bool D3D12CommandProcessor::SetupContext() {
     REXGPU_ERROR("Failed to initialize base command processor context");
     return false;
   }
+  InvalidateAllVertexBufferResidency();
   UpdateDebugMarkersEnabled();
 
   const ui::d3d12::D3D12Provider& provider = GetD3D12Provider();
@@ -916,7 +925,7 @@ bool D3D12CommandProcessor::SetupContext() {
         draw_resolution_scale_x, draw_resolution_scale_y);
   }
 
-  shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_, trace_writer_);
+  shared_memory_ = std::make_unique<D3D12SharedMemory>(*this, *memory_);
   if (!shared_memory_->Initialize()) {
     REXGPU_ERROR("Failed to initialize shared memory");
     return false;
@@ -925,8 +934,8 @@ bool D3D12CommandProcessor::SetupContext() {
   // Initialize the render target cache before configuring binding - need to
   // know if using rasterizer-ordered views for the bindless root signature.
   render_target_cache_ = std::make_unique<D3D12RenderTargetCache>(
-      *register_file_, *memory_, trace_writer_, draw_resolution_scale_x, draw_resolution_scale_y,
-      *this, bindless_resources_used_);
+      *register_file_, *memory_, draw_resolution_scale_x, draw_resolution_scale_y, *this,
+      bindless_resources_used_);
   if (!render_target_cache_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the render target cache");
     return false;
@@ -1170,8 +1179,8 @@ bool D3D12CommandProcessor::SetupContext() {
     }
   }
 
-  primitive_processor_ = std::make_unique<D3D12PrimitiveProcessor>(
-      *register_file_, *memory_, trace_writer_, *shared_memory_, *this);
+  primitive_processor_ =
+      std::make_unique<D3D12PrimitiveProcessor>(*register_file_, *memory_, *shared_memory_, *this);
   if (!primitive_processor_->Initialize()) {
     REXGPU_ERROR("Failed to initialize the geometric primitive processor");
     return false;
@@ -1409,7 +1418,7 @@ bool D3D12CommandProcessor::SetupContext() {
   *(fxaa_extreme_pipeline_.ReleaseAndGetAddressOf()) = ui::d3d12::util::CreateComputePipeline(
       device, shaders::fxaa_extreme_cs, sizeof(shaders::fxaa_extreme_cs),
       fxaa_root_signature_.Get());
-  if (!fxaa_extreme_pipeline_) {
+  if (!fxaa_pipeline_) {
     REXGPU_ERROR("Failed to create the extreme-quality FXAA compute pipeline");
     return false;
   }
@@ -1609,8 +1618,6 @@ bool D3D12CommandProcessor::SetupContext() {
                                             uint32_t(SystemBindlessView::kGammaRampPWLSRV)));
   }
 
-  pix_capture_requested_.store(false, std::memory_order_relaxed);
-  pix_capturing_ = false;
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
 
   // Just not to expose uninitialized memory.
@@ -1621,6 +1628,7 @@ bool D3D12CommandProcessor::SetupContext() {
 
 void D3D12CommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
+  InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
 
   ui::d3d12::util::ReleaseAndNull(readback_buffer_);
@@ -1789,6 +1797,7 @@ void D3D12CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
       texture_cache_->TextureFetchConstantWritten((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) /
                                                   6);
     }
+    InvalidateVertexBufferResidency((index - XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0) / 2);
   }
 }
 
@@ -1867,6 +1876,7 @@ void D3D12CommandProcessor::WriteRegistersFromMem(uint32_t start_index, uint32_t
     if (texture_cache_) {
       texture_cache_->TextureFetchConstantsWritten(first_fetch_dword / 6, last_fetch_dword / 6);
     }
+    InvalidateVertexBufferResidencyRange(first_fetch_dword / 2, last_fetch_dword / 2);
     return;
   }
 
@@ -1884,6 +1894,8 @@ void D3D12CommandProcessor::OnGammaRampPWLValueWritten() {
 void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
                                       uint32_t frontbuffer_height) {
   SCOPE_profile_cpu_f("gpu");
+  vertex_buffers_in_sync_[0] = 0;
+  vertex_buffers_in_sync_[1] = 0;
 
   if (!graphics_system_)
     return;
@@ -2281,16 +2293,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
     return false;
   }
   pipeline_cache_->AnalyzeShaderUcode(*vertex_shader);
-  // HAND PATCH: settle the invalid-fetch-constant verdict once, up front
-  // (shared with the Vulkan backend - see draw_util::ClassifyInvalidVertexFetch
-  // for the taxonomy). kVeto draws are dropped here; kRasterize draws (absent
-  // optional streams only) render like any valid draw; priming draws (stale
-  // streaming addresses) run muted below.
-  draw_util::InvalidVertexFetchVerdict invalid_vfetch_verdict =
-      draw_util::ClassifyInvalidVertexFetch(regs, *vertex_shader);
-  if (invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kVeto) {
-    return false;
-  }
   bool memexport_used_vertex = vertex_shader->memexport_eM_written() != 0;
 
   // Pixel shader analysis.
@@ -2474,17 +2476,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   // Must not call anything that can change the descriptor heap from now on!
 
   // Ensure vertex buffers are resident.
-  // HAND PATCH (shared with Vulkan, see draw_util::ClassifyInvalidVertexFetch):
-  // priming draws (plausible stale streaming addresses) finalize streamed
-  // characters via the vertex shader's memexport; they must run, but their
-  // rasterized output is degenerate, so they are muted below. Draws whose
-  // only invalid slots are absent optional streams rasterize normally --
-  // muting those made finished characters invisible.
-  bool priming_draw =
-      invalid_vfetch_verdict == draw_util::InvalidVertexFetchVerdict::kPrimeWithoutRasterization;
-  // Deduplicated WITHIN this draw only -- see the Vulkan backend for why
-  // caching residency across draws pinned the GPU to stale vertex data.
-  uint64_t vertex_buffers_resident[2] = {};
   const Shader::ConstantRegisterMap& constant_map_vertex = vertex_shader->constant_register_map();
   for (uint32_t i = 0; i < rex::countof(constant_map_vertex.vertex_fetch_bitmap); ++i) {
     uint32_t vfetch_bits_remaining = constant_map_vertex.vertex_fetch_bitmap[i];
@@ -2493,30 +2484,43 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       vfetch_bits_remaining &= ~(uint32_t(1) << j);
       uint32_t vfetch_index = i * 32 + j;
       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
-      if (vertex_buffers_resident[vfetch_index >> 6] & vfetch_bit) {
+      if (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) {
         continue;
       }
       xenos::xe_gpu_vertex_fetch_t vfetch_constant = regs.GetVertexFetch(vfetch_index);
-      // Invalid-type slots already passed classification above (a kVeto draw
-      // never reaches this loop), so both valid and admitted-invalid slots
-      // just need their buffer ranges resident.
-      uint32_t vfetch_request_size = vfetch_constant.size << 2;
-      if (!vfetch_request_size &&
-          invalid_vfetch_verdict != draw_util::InvalidVertexFetchVerdict::kNone) {
-        // An absent optional stream (all-zero fetch constant) the shader may
-        // read, at guest address 0. With tiled shared memory nothing backs that
-        // address, and reading it hung AMD GPUs right after the first cutscene
-        // (#25), like it did on the Steam Deck with Vulkan. Back it with memory.
-        vfetch_request_size = 4096;
+      switch (vfetch_constant.type) {
+        case xenos::FetchConstantType::kVertex:
+          break;
+        case xenos::FetchConstantType::kInvalidVertex:
+          if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+            break;
+          }
+          REXGPU_WARN(
+              "Vertex fetch constant {} ({:08X} {:08X}) has \"invalid\" type! "
+              "This is incorrect behavior, but you can try bypassing this by "
+              "launching Xenia with --gpu_allow_invalid_fetch_constants=true.",
+              vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          return false;
+        default:
+          REXGPU_WARN("Vertex fetch constant {} ({:08X} {:08X}) is completely invalid!",
+                      vfetch_index, vfetch_constant.dword_0, vfetch_constant.dword_1);
+          return false;
       }
-      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_request_size)) {
+      VertexBufferState& state = vertex_buffer_states_[vfetch_index];
+      if (state.address == vfetch_constant.address && state.size == vfetch_constant.size) {
+        vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
+        continue;
+      }
+      if (!shared_memory_->RequestRange(vfetch_constant.address << 2, vfetch_constant.size << 2)) {
         REXGPU_ERROR(
             "Failed to request vertex buffer at 0x{:08X} (size {}) in the "
             "shared memory",
-            vfetch_constant.address << 2, vfetch_request_size);
+            vfetch_constant.address << 2, vfetch_constant.size << 2);
         return false;
       }
-      vertex_buffers_resident[vfetch_index >> 6] |= vfetch_bit;
+      state.address = vfetch_constant.address;
+      state.size = vfetch_constant.size;
+      vertex_buffers_in_sync_[vfetch_index >> 6] |= vfetch_bit;
     }
   }
 
@@ -2612,18 +2616,6 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
   }
   SetPrimitiveTopology(primitive_topology);
   // Must not call anything that may change the primitive topology from now on!
-
-  // HAND PATCH: mute rasterization for priming draws. Their vertex shader +
-  // memexport MUST run (that is what finalizes streamed characters), but the
-  // rasterized output is degenerate. Use an EMPTY (0-area) scissor so ZERO
-  // pixel waves spawn: a 1x1 scissor still spawns one pixel wave that blocks on
-  // the vertex shader's parameter-cache output, which is the Van Gogh wedge
-  // signature (PS_PARTIAL_FLUSH, pixel waves never retire). The next draw's
-  // UpdateFixedFunctionState restores the real scissor via SetScissorRect.
-  if (priming_draw) {
-    D3D12_RECT priming_scissor = {0, 0, 0, 0};
-    SetScissorRect(priming_scissor);
-  }
 
   // Draw.
   if (primitive_processing_result.index_buffer_type ==
@@ -2725,14 +2717,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
         memexport_total_size += memexport_range.size_bytes;
       }
-      // HAND PATCH (port of the Vulkan readback size cap): a stale-but-plausible
-      // stream descriptor can demand an enormous synchronous readback (full queue
-      // drain + huge allocation + memcpy back to a stale guest address), which
-      // stalls for seconds and can lose the device / corrupt guest memory. Skip
-      // oversized readbacks rather than risk the wedge.
-      const uint32_t kMemexportReadbackMaxBytes = 16u << 20;  // 16 MB
-      if (memexport_total_size != 0 &&
-          memexport_total_size <= kMemexportReadbackMaxBytes) {
+      if (memexport_total_size != 0) {
         if (REXCVAR_GET(readback_memexport_fast)) {
           IssueDraw_MemexportReadbackFastPath(memexport_total_size);
         } else {
@@ -2885,26 +2870,6 @@ bool D3D12CommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_s
   return true;
 }
 
-void D3D12CommandProcessor::InitializeTrace() {
-  CommandProcessor::InitializeTrace();
-
-  if (!BeginSubmission(false)) {
-    return;
-  }
-  bool render_target_cache_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
-  bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
-  if (!render_target_cache_submitted && !shared_memory_submitted) {
-    return;
-  }
-  AwaitAllQueueOperationsCompletion();
-  if (render_target_cache_submitted) {
-    render_target_cache_->InitializeTraceCompleteDownloads();
-  }
-  if (shared_memory_submitted) {
-    shared_memory_->InitializeTraceCompleteDownloads();
-  }
-}
-
 bool D3D12CommandProcessor::IssueCopy() {
 #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
   SCOPE_profile_cpu_f("gpu");
@@ -2913,7 +2878,8 @@ bool D3D12CommandProcessor::IssueCopy() {
     return false;
   }
   ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
-  if (readback_mode == ReadbackResolveMode::kDisabled) {
+  if (readback_mode == ReadbackResolveMode::kDisabled &&
+      REXCVAR_GET(readback_resolve_small_kb) <= 0) {
     uint32_t written_address, written_length;
     return render_target_cache_->Resolve(*memory_, *shared_memory_, *texture_cache_,
                                          written_address, written_length);
@@ -2933,6 +2899,16 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
   }
 
   if (!memory_->TranslatePhysical(written_address)) {
+    return true;
+  }
+
+  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
+  // Small resolves are mostly render-to-texture results that the CPU reads,
+  // such as save thumbnails. A delayed copy would give it an older capture.
+  if (written_length <= uint32_t(std::max(REXCVAR_GET(readback_resolve_small_kb), 0)) * 1024) {
+    readback_mode = ReadbackResolveMode::kFull;
+  }
+  if (readback_mode == ReadbackResolveMode::kDisabled) {
     return true;
   }
 
@@ -3104,7 +3080,6 @@ bool D3D12CommandProcessor::IssueCopy_ReadbackResolvePath() {
                                                written_address, written_length);
   }
 
-  ReadbackResolveMode readback_mode = GetReadbackResolveMode(REXCVAR_GET(d3d12_readback_resolve));
   bool use_delayed_sync =
       readback_mode == ReadbackResolveMode::kFast || readback_mode == ReadbackResolveMode::kSome;
   uint32_t read_index = write_index;
@@ -3398,14 +3373,6 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
     EvictOldReadbackBuffers(readback_buffers_);
     EvictOldReadbackBuffers(memexport_readback_buffers_);
 
-    pix_capturing_ = pix_capture_requested_.exchange(false, std::memory_order_relaxed);
-    if (pix_capturing_) {
-      IDXGraphicsAnalysis* graphics_analysis = GetD3D12Provider().GetGraphicsAnalysis();
-      if (graphics_analysis != nullptr) {
-        graphics_analysis->BeginCapture();
-      }
-    }
-
     primitive_processor_->BeginFrame();
 
     texture_cache_->BeginFrame();
@@ -3497,14 +3464,6 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
   if (is_closing_frame) {
     if (REXCVAR_GET(clear_memory_page_state) && shared_memory_) {
       shared_memory_->SetSystemPageBlocksValidWithGpuDataWritten();
-    }
-    // Close the capture after submitting.
-    if (pix_capturing_) {
-      IDXGraphicsAnalysis* graphics_analysis = provider.GetGraphicsAnalysis();
-      if (graphics_analysis != nullptr) {
-        graphics_analysis->EndCapture();
-      }
-      pix_capturing_ = false;
     }
     frame_open_ = false;
     // Submission already closed now, so minus 1.

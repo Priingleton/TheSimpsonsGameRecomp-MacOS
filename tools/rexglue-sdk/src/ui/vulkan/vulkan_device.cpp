@@ -10,7 +10,6 @@
  */
 
 #include <algorithm>
-#include <atomic>
 #include <cstring>
 #include <string>
 #include <unordered_map>
@@ -20,6 +19,7 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/platform.h>
+#include <rex/string.h>
 #include <rex/ui/vulkan/device.h>
 
 REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
@@ -30,11 +30,13 @@ REXCVAR_DEFINE_BOOL(vulkan_require_vertex_pipeline_stores_and_atomics, true, "UI
                     "Deprecated and ignored for parity; vertexPipelineStoresAndAtomics is always "
                     "required for Vulkan GPU emulation")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, true, "UI/Vulkan",
+// Apple Silicon / MoltenVK does not expose geometryShader or fillModeNonSolid;
+// default both to false on macOS so the device can still be selected.
+REXCVAR_DEFINE_BOOL(vulkan_require_geometry_shader, !REX_PLATFORM_MAC, "UI/Vulkan",
                     "Require geometryShader support for Vulkan GPU emulation (disable to allow "
                     "fallback primitive emulation paths)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
+REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, !REX_PLATFORM_MAC, "UI/Vulkan",
                     "Require fillModeNonSolid support for Vulkan GPU emulation (disable to "
                     "allow fallback to solid fill for line/point polygon modes)")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
@@ -42,10 +44,6 @@ REXCVAR_DEFINE_BOOL(vulkan_require_fill_mode_non_solid, true, "UI/Vulkan",
 namespace rex {
 namespace ui {
 namespace vulkan {
-
-// The device created with VK_KHR_present_id and VK_KHR_present_wait enabled,
-// for the presenter (kept outside VulkanDevice so its layout stays the same).
-std::atomic<VkDevice> g_present_wait_device{VK_NULL_HANDLE};
 
 template <typename Structure, VkStructureType StructureType>
 struct VulkanFeatures {
@@ -204,15 +202,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     // #2.
     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
   }
-  // For knowing when presented frames reach the display (vblank timing).
-  bool ext_KHR_present_id = false;
-  bool ext_KHR_present_wait = false;
-  if (with_swapchain && get_physical_device_properties2_supported) {
-    // #295.
-    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_present_id)
-    // #249.
-    XE_UI_VULKAN_LOCAL_EXTENSION(KHR_present_wait)
-  }
 
   bool ext_1_2_KHR_sampler_mirror_clamp_to_edge = false;
   bool ext_1_1_KHR_maintenance1 = false;
@@ -346,12 +335,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   VulkanFeatures<VkPhysicalDeviceRobustness2FeaturesEXT,
                  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT>
       features_EXT_robustness2;
-  VulkanFeatures<VkPhysicalDevicePresentIdFeaturesKHR,
-                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR>
-      features_KHR_present_id;
-  VulkanFeatures<VkPhysicalDevicePresentWaitFeaturesKHR,
-                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR>
-      features_KHR_present_wait;
 
   if (get_physical_device_properties2_supported) {
     if (properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
@@ -392,10 +375,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
     if (device->extensions_.ext_EXT_robustness2) {
       features_EXT_robustness2.Link(supported_features_2, device_create_info);
-    }
-    if (ext_KHR_present_id && ext_KHR_present_wait) {
-      features_KHR_present_id.Link(supported_features_2, device_create_info);
-      features_KHR_present_wait.Link(supported_features_2, device_create_info);
     }
     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
@@ -541,7 +520,8 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
   device->properties_.driverVersion = properties.driverVersion;
   device->properties_.vendorID = properties.vendorID;
   device->properties_.deviceID = properties.deviceID;
-  std::strcpy(device->properties_.deviceName, properties.deviceName);
+  rex::string::copy_truncating(device->properties_.deviceName, properties.deviceName,
+                               sizeof(device->properties_.deviceName));
 
   REXLOG_INFO(
       "Vulkan device '{}': API {}.{}.{}, vendor 0x{:04X}, device 0x{:04X}, "
@@ -751,17 +731,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     }
   }
 
-  bool present_wait_enabled = false;
-  if (ext_KHR_present_id && ext_KHR_present_wait) {
-    features_KHR_present_id.enabled.presentId = features_KHR_present_id.supported.presentId;
-    features_KHR_present_wait.enabled.presentWait = features_KHR_present_wait.supported.presentWait;
-    present_wait_enabled = features_KHR_present_id.supported.presentId &&
-                           features_KHR_present_wait.supported.presentWait;
-    if (present_wait_enabled) {
-      REXLOG_INFO("* presentId, presentWait");
-    }
-  }
-
 #undef XE_UI_VULKAN_LIMIT
 #undef XE_UI_VULKAN_ENUM_LIMIT
 #undef XE_UI_VULKAN_FEATURE
@@ -779,10 +748,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
         "'{}': {}",
         properties.deviceName, vk::to_string(vk::Result(device_create_result)));
     return nullptr;
-  }
-
-  if (present_wait_enabled) {
-    g_present_wait_device.store(device->device_, std::memory_order_relaxed);
   }
 
   // Load device functions.
@@ -881,14 +846,6 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
     if (memory_type_flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) {
       device->memory_types_.host_cached |= memory_type_bit;
     }
-  }
-  if (!device->memory_types_.device_local && memory_properties.memoryTypeCount) {
-    // Only compile-only devices without real memory (such as RADV's null
-    // device used to inspect shader compilation) have no device-local type.
-    // Treat all memory as device-local there so the renderer can start.
-    REXLOG_WARN("Vulkan device has no device-local memory type, using all {} memory types",
-                memory_properties.memoryTypeCount);
-    device->memory_types_.device_local = (uint32_t(1) << memory_properties.memoryTypeCount) - 1;
   }
 
   return device;

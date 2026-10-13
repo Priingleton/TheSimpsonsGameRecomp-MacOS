@@ -11,7 +11,6 @@
 
 #pragma once
 
-#include <cstdio>
 #include <mutex>
 #include <queue>
 #include <stack>
@@ -40,9 +39,6 @@ class SDLAudioDriver : public AudioDriver {
 
   SDL_AudioStream* sdl_stream_ = nullptr;
   bool sdl_initialized_ = false;
-  // Optional raw audio diagnostics belong to this driver and close on shutdown.
-  std::FILE* dump_ = nullptr;
-  std::FILE* dump_timestamps_ = nullptr;
   uint8_t sdl_device_channels_ = 0;
 
   static const uint32_t frame_frequency_ = 48000;
@@ -53,15 +49,6 @@ class SDLAudioDriver : public AudioDriver {
   std::queue<float*> frames_queued_ = {};
   std::stack<float*> frames_unused_ = {};
   std::mutex frames_mutex_ = {};
-
-  // audio_log_underruns diagnostics, protected by frames_mutex_.
-  uint32_t diag_played_frames_ = 0;
-  uint32_t diag_underrun_frames_ = 0;
-  uint32_t diag_submitted_frames_ = 0;
-  uint32_t diag_silent_submitted_frames_ = 0;
-  // Queue depth after each submission (sum and minimum).
-  uint64_t diag_queue_sum_ = 0;
-  uint32_t diag_queue_min_ = UINT32_MAX;
 };
 
 }  // namespace rex::audio::sdl

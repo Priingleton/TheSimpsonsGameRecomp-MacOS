@@ -19,7 +19,6 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/registers.h>
-#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/memory.h>
 
@@ -331,39 +330,6 @@ struct MemExportRange {
 void AddMemExportRanges(const RegisterFile& regs, const Shader& shader,
                         std::vector<MemExportRange>& ranges_out);
 
-// HAND PATCH: shared verdict on a draw whose vertex shader statically touches
-// fetch constants of the "invalid" type (this game marks streamed / absent
-// vertex streams that way). Both backends and the pipeline cache pre-check
-// need the exact same classification, so it lives here instead of being
-// duplicated per backend (the duplicated copies had already drifted apart
-// once, which is how admitted character draws ended up rasterization-muted).
-enum class InvalidVertexFetchVerdict : uint32_t {
-  // No used fetch slot has the invalid type - completely ordinary draw.
-  kNone,
-  // Every invalid slot is an all-zero OPTIONAL stream the shader references
-  // but never fetches a used result through (no vertex binding exists for
-  // it - the translator only creates one when a fetch result is consumed),
-  // so the draw is safe to rasterize like any valid one. Gated by
-  // gpu_allow_null_optional_streams.
-  kRasterize,
-  // Either a plausible stale address/size (a RenderWare streaming "priming"
-  // draw whose vertex shading + memexport must run so the CPU readback can
-  // finalize the entity), or an all-zero optional stream the shader REALLY
-  // reads through a stride-0 binding - rasterizing what those zeros produce
-  // has hung Van Gogh, RDNA2 Vulkan and D3D12 (#13/#16). In both shapes the
-  // rasterized output is garbage, so the caller must run the draw with
-  // rasterization fully disabled. Stale addresses are gated by
-  // gpu_allow_invalid_fetch_constants.
-  kPrimeWithoutRasterization,
-  // A null MAIN stream (entity genuinely mid-stream: all-zero vertex data
-  // collapses skinned positions into scan-converter poison), garbage
-  // constants, or the gating cvar for the shape found is off. Drop the draw.
-  kVeto,
-};
-
-InvalidVertexFetchVerdict ClassifyInvalidVertexFetch(const RegisterFile& regs,
-                                                     const Shader& vertex_shader);
-
 // To avoid passing values that the shader won't understand (even though
 // Direct3D 9 shouldn't pass them anyway).
 xenos::CopySampleSelect SanitizeCopySampleSelect(xenos::CopySampleSelect copy_sample_select,
@@ -546,13 +512,6 @@ struct ResolveInfo {
   uint32_t rb_color_clear;
   uint32_t rb_color_clear_lo;
 
-  // Top-left corner of the resolve rectangle in pixels relative to the
-  // surface origin, which is also the destination texel relative to
-  // copy_dest_base_raw (unadjusted RB_COPY_DEST_BASE).
-  uint32_t rect_x0;
-  uint32_t rect_y0;
-  uint32_t copy_dest_base_raw;
-
   bool IsCopyingDepth() const {
     return rb_copy_control.copy_src_select >= xenos::kMaxColorRenderTargets;
   }
@@ -623,8 +582,8 @@ struct ResolveInfo {
 // emulated as snorm, with range limited to -1...1, but with correct blending
 // within that range.
 bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
-                    TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
-                    uint32_t draw_resolution_scale_y, bool fixed_rg16_truncated_to_minus_1_to_1,
+                    uint32_t draw_resolution_scale_x, uint32_t draw_resolution_scale_y,
+                    bool fixed_rg16_truncated_to_minus_1_to_1,
                     bool fixed_rgba16_truncated_to_minus_1_to_1, ResolveInfo& info_out);
 
 }  // namespace rex::graphics::draw_util

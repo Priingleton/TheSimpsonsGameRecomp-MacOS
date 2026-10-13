@@ -1,3 +1,5 @@
+// GPU ring wait. From TheSimpsonsGameRecomp (simpsons/src/ring_wait.cpp).
+//
 // The game's Direct3D code waits for the GPU to consume its command ring before
 // reusing command memory (sub_824574B8, looping on the read pointer the GPU
 // writes back). Each loop iteration calls sub_82452018, which on the Xbox 360
@@ -9,15 +11,12 @@
 // word waited on is a fence in the scratch register writeback area) or 1 ms
 // passes.
 
-#include "guest_memory.h"
-
 #include <cstdint>
 #include <cstring>
 
 #include <rex/cvar.h>
 #include <rex/graphics/ring_progress.h>
 #include <rex/logging.h>
-#include <rex/platform.h>
 #include <rex/ppc.h>
 
 REXCVAR_DEFINE_BOOL(ring_wait_sleep, true, "GPU",
@@ -37,7 +36,11 @@ namespace {
 constexpr uint32_t kDeviceReadPointerAddress = 10896;
 constexpr uint32_t kWaitTimeoutUs = 1000;
 
-using simpsons::LoadGuestU32;
+uint32_t LoadBE32(const uint8_t* base, uint32_t address) {
+  uint32_t value;
+  std::memcpy(&value, base + address, sizeof(value));
+  return rex::byte_swap(value);
+}
 
 bool SleepEnabled() {
   static const bool enabled = REXCVAR_GET(ring_wait_sleep);
@@ -46,7 +49,7 @@ bool SleepEnabled() {
 
 }  // namespace
 
-REX_FUNC(sub_82452018) {
+extern "C" REX_FUNC(sub_82452018) {
   if (!SleepEnabled()) {
     __imp__sub_82452018(ctx, base);
     return;
@@ -54,11 +57,11 @@ REX_FUNC(sub_82452018) {
   static bool logged = false;
   if (!logged) {
     logged = true;
-    uint32_t device = LoadGuestU32(base, ctx.r3.u32);
+    uint32_t device = LoadBE32(base, ctx.r3.u32);
     REXLOG_INFO(
         "ring_wait_sleep: the game waits on the word at guest {:08X}; the command processor "
         "writes the read pointer back to physical {:08X}",
-        LoadGuestU32(base, device + kDeviceReadPointerAddress),
+        LoadBE32(base, device + kDeviceReadPointerAddress),
         rex::graphics::GetReadPointerWritebackAddress());
   }
   // Read before the check, so progress between the check and the wait still

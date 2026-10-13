@@ -37,12 +37,13 @@
 
 #include "image_patch.h"
 
-#include <cstdint>
 #include <algorithm>
 #include <bit>
 #include <charconv>
+#include <cstdint>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>

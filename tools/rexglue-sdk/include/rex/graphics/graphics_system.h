@@ -55,8 +55,8 @@ class GraphicsSystem : public system::IGraphicsSystem {
   memory::Memory* memory() const { return memory_; }
   runtime::FunctionDispatcher* function_dispatcher() const { return function_dispatcher_; }
   system::KernelState* kernel_state() const { return kernel_state_; }
-  ::rex::ui::GraphicsProvider* provider() const { return provider_.get(); }
-  ::rex::ui::Presenter* presenter() const { return presenter_.get(); }
+  ::rex::ui::GraphicsProvider* provider() const override { return provider_.get(); }
+  ::rex::ui::Presenter* presenter() const override { return presenter_.get(); }
 
   X_STATUS SetupPresentation(::rex::ui::WindowedAppContext* app_context) override;
   X_STATUS SetupGuestGpu(runtime::FunctionDispatcher* function_dispatcher,
@@ -71,31 +71,21 @@ class GraphicsSystem : public system::IGraphicsSystem {
   RegisterFile* register_file() { return &register_file_; }
   CommandProcessor* command_processor() const { return command_processor_.get(); }
 
-  virtual void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2);
-  virtual void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2);
+  void InitializeRingBuffer(uint32_t ptr, uint32_t size_log2) override;
+  void EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_size_log2) override;
 
-  virtual void SetInterruptCallback(uint32_t callback, uint32_t user_data);
+  void SetInterruptCallback(uint32_t callback, uint32_t user_data) override;
   void DispatchInterruptCallback(uint32_t source, uint32_t cpu);
-  // Raises the vblanks that are due, if no other thread is doing it right now.
-  // Called by the vblank thread, and by the command processor while it waits
-  // for the game (a vblank releases its swaps), so a vblank isn't late when
-  // the vblank thread is kept off a CPU for a while.
-  void DeliverDueVblanks();
 
   virtual void ClearCaches();
   virtual void InvalidateGpuMemory();
 
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
-                               bool blocking);
-
-  void RequestFrameTrace();
-  // Writes the currently presented guest output to <prefix>_shot_N.ppm.
-  void SaveGuestOutputScreenshot(const std::string& prefix);
-  void BeginTracing();
-  void EndTracing();
+                               bool blocking) override;
 
   bool is_paused() const { return paused_; }
   void Pause();
+  void SetBackgrounded(bool backgrounded) override;
   void Resume();
 
   bool Save(::rex::stream::ByteStream* stream);
@@ -136,6 +126,7 @@ class GraphicsSystem : public system::IGraphicsSystem {
   std::unique_ptr<CommandProcessor> command_processor_;
 
   bool paused_ = false;
+  std::atomic<bool> backgrounded_{false};
 
  private:
   std::unique_ptr<::rex::ui::Presenter> presenter_;
@@ -144,10 +135,3 @@ class GraphicsSystem : public system::IGraphicsSystem {
 };
 
 }  // namespace rex::graphics
-
-// The guest tick count (the timebase games read) of the last vblank raised
-// and the vblank interval in ticks, for games that pace their frames to the
-// vblank. Returns false before the first vblank. C linkage so a game can
-// reference it weakly and still run with runtimes that lack it.
-extern "C" bool rex_graphics_get_vblank_schedule(uint64_t* last_vblank_ticks,
-                                                 uint64_t* interval_ticks);

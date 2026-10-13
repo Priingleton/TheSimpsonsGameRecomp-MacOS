@@ -1,4 +1,4 @@
-// Subtitles setting.
+// Subtitles setting. From TheSimpsonsGameRecomp (simpsons/src/subtitles.cpp).
 //
 // The game keeps its subtitle option in bit 0 of a flags word in its settings
 // object and reads it through sub_823A0C08(settings, 0) wherever subtitles
@@ -17,7 +17,7 @@ REXCVAR_DEFINE_BOOL(subtitles, false, "Game",
 REX_EXTERN(__imp__sub_823A0C08);
 REX_EXTERN(sub_823A0C08);
 
-REX_FUNC(sub_823A0C08) {
+extern "C" REX_FUNC(sub_823A0C08) {
   if (ctx.r4.u32 == 0 && REXCVAR_GET(subtitles)) {
     ctx.r3.u64 = 1;
     return;

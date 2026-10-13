@@ -56,12 +56,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   void InitializeShaderStorage(const std::filesystem::path& cache_root, uint32_t title_id,
                                bool blocking) override;
 
-  void RequestFrameTrace(const std::filesystem::path& root_path) override;
-
-  void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
-
-  void RestoreEdramSnapshot(const void* snapshot) override;
-
   ui::d3d12::D3D12Provider& GetD3D12Provider() const {
     return *static_cast<ui::d3d12::D3D12Provider*>(graphics_system_->provider());
   }
@@ -224,8 +218,6 @@ class D3D12CommandProcessor : public CommandProcessor {
   bool IssueDraw(xenos::PrimitiveType primitive_type, uint32_t index_count,
                  IndexBufferInfo* index_buffer_info, bool major_mode_explicit) override;
   bool IssueCopy() override;
-
-  void InitializeTrace() override;
 
  private:
   static constexpr uint32_t kQueueFrames = 3;
@@ -420,6 +412,9 @@ class D3D12CommandProcessor : public CommandProcessor {
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(xenos::xe_gpu_depth_sample_counts* sample_counts,
                                  uint64_t samples);
+  void InvalidateAllVertexBufferResidency();
+  void InvalidateVertexBufferResidency(uint32_t vfetch_index);
+  void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
 
   void WriteGammaRampSRV(bool is_pwl, D3D12_CPU_DESCRIPTOR_HANDLE handle) const;
 
@@ -664,9 +659,12 @@ class D3D12CommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
-
-  std::atomic<bool> pix_capture_requested_ = false;
-  bool pix_capturing_;
+  struct VertexBufferState {
+    uint32_t address = UINT32_MAX;
+    uint32_t size = UINT32_MAX;
+  };
+  std::array<VertexBufferState, 96> vertex_buffer_states_{};
+  uint64_t vertex_buffers_in_sync_[2] = {};
 
   // The current fixed-function drawing state.
   D3D12_VIEWPORT ff_viewport_;

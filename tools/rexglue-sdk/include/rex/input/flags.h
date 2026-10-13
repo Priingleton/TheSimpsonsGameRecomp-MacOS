@@ -16,3 +16,12 @@
 REXCVAR_DECLARE(bool, guide_button);
 REXCVAR_DECLARE(std::string, hid_mappings_file);
 REXCVAR_DECLARE(std::string, input_backend);
+
+// On-screen gamepad (touch screens)
+REXCVAR_DECLARE(std::string, touch_controls);
+REXCVAR_DECLARE(bool, touch_haptics);
+REXCVAR_DECLARE(double, touch_controls_opacity);
+REXCVAR_DECLARE(double, touch_look_points_per_full_scale);
+REXCVAR_DECLARE(double, touch_look_vertical_scale);
+REXCVAR_DECLARE(double, touch_look_hold_seconds);
+REXCVAR_DECLARE(double, touch_button_tap_hold_seconds);

@@ -16,6 +16,8 @@
 
 #include <fmt/format.h>
 
+#include <fcntl.h>
+#include <unistd.h>
 #include <rex/filesystem.h>
 #include <rex/filesystem/devices/host_path_device.h>
 #include <rex/filesystem/devices/stfs_container_device.h>
@@ -46,8 +48,8 @@ ContentPackage::ContentPackage(KernelState* kernel_state, const std::string_view
   content_data_ = data;
 
   auto fs = kernel_state_->file_system();
-  auto device =
-      std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false);
+  auto device = std::make_unique<rex::filesystem::HostPathDevice>(device_path_, package_path, false,
+                                                                  /*allow_share_delete=*/true);
   device->Initialize();
   fs->RegisterDevice(std::move(device));
   fs->RegisterSymbolicLink(root_name_ + ":", device_path_);
@@ -139,6 +141,7 @@ std::filesystem::path ContentManager::ResolvePackageHeaderPath(const std::string
 std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device_id, uint64_t xuid,
                                                                  XContentType content_type,
                                                                  uint32_t title_id) {
+  RecoverInterruptedRewrites();
   std::vector<XCONTENT_AGGREGATE_DATA> result;
 
   if (title_id == kCurrentlyRunningTitleId) {
@@ -154,6 +157,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
       // Directories only.
       continue;
     }
+
     XCONTENT_AGGREGATE_DATA content_data;
     if (XSUCCEEDED(ReadContentHeaderFile(rex::path_to_utf8(file_info.name), xuid, title_id,
                                          content_type, content_data))) {
@@ -183,6 +187,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
 }
 
 bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  RecoverInterruptedRewrites();
   auto path = ResolvePackagePath(xuid, data);
   return std::filesystem::exists(path);
 }
@@ -315,6 +320,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t 
 
 X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
   ContentPackage* package = nullptr;
+  std::filesystem::path package_path;
   {
     auto global_lock = global_critical_region_.Acquire();
     // Some games use different casing between Create and Close (e.g. "save" vs "SAVE")
@@ -322,9 +328,14 @@ X_RESULT ContentManager::CloseContent(const std::string_view root_name) {
     if (it == open_packages_.end()) {
       return X_ERROR_FILE_NOT_FOUND;
     }
+    package_path = it->second->package_path();
     package = DetachPackage(it);
   }
   delete package;
+  // Closing is when a title has finished writing: commit a pending rewrite.
+  if (!package_path.empty()) {
+    CommitRewrite(package_path);
+  }
   return X_ERROR_SUCCESS;
 }
 
@@ -360,6 +371,111 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
     return X_ERROR_SUCCESS;
   } else {
     return X_ERROR_FILE_NOT_FOUND;
+  }
+}
+
+std::filesystem::path ContentManager::RewriteBackupPath(const std::filesystem::path& path) const {
+  std::error_code ec;
+  return root_path_ / ".rewrite" / std::filesystem::relative(path, root_path_, ec);
+}
+
+void ContentManager::RecoverInterruptedRewrites() {
+  std::call_once(rewrites_recovered_, [this] {
+    namespace fs = std::filesystem;
+    const fs::path backup_root = root_path_ / ".rewrite";
+    std::error_code ec;
+    if (!fs::exists(backup_root, ec)) {
+      return;
+    }
+    // Backups mirror the content tree: xuid/title/type/name for packages and
+    // xuid/title/Headers/type/name.header for their headers.
+    auto restore = [&](const fs::path& backup) {
+      const fs::path target = root_path_ / fs::relative(backup, backup_root, ec);
+      fs::remove_all(target, ec);
+      fs::create_directories(target.parent_path(), ec);
+      fs::rename(backup, target, ec);
+      REXLOG_WARN("Save rewrite was interrupted; restored the previous save at {}",
+                  target.string());
+    };
+    for (const auto& xuid : fs::directory_iterator(backup_root, ec)) {
+      for (const auto& title : fs::directory_iterator(xuid.path(), ec)) {
+        for (const auto& type : fs::directory_iterator(title.path(), ec)) {
+          for (const auto& entry : fs::directory_iterator(type.path(), ec)) {
+            if (type.path().filename() == kGameContentHeaderDirName) {
+              for (const auto& header : fs::directory_iterator(entry.path(), ec)) {
+                restore(header.path());
+              }
+            } else {
+              restore(entry.path());
+            }
+          }
+        }
+      }
+    }
+    fs::remove_all(backup_root, ec);
+  });
+}
+
+X_RESULT ContentManager::BeginRewrite(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+  namespace fs = std::filesystem;
+  RecoverInterruptedRewrites();
+  auto global_lock = global_critical_region_.Acquire();
+  if (IsContentOpen(data)) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  const fs::path package_path = ResolvePackagePath(xuid, data);
+  std::error_code ec;
+  if (!fs::exists(package_path, ec)) {
+    return X_ERROR_FILE_NOT_FOUND;
+  }
+  const fs::path package_backup = RewriteBackupPath(package_path);
+  fs::remove_all(package_backup, ec);
+  fs::create_directories(package_backup.parent_path(), ec);
+  fs::rename(package_path, package_backup, ec);
+  if (ec) {
+    return X_ERROR_ACCESS_DENIED;
+  }
+  uint64_t used_xuid = (data.xuid != uint64_t(-1) && data.xuid != 0) ? uint64_t(data.xuid) : xuid;
+  const fs::path header_path =
+      ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+  if (fs::exists(header_path, ec)) {
+    const fs::path header_backup = RewriteBackupPath(header_path);
+    fs::create_directories(header_backup.parent_path(), ec);
+    fs::rename(header_path, header_backup, ec);
+  }
+  rewrites_pending_.insert(package_path);
+  return X_ERROR_SUCCESS;
+}
+
+void ContentManager::CommitRewrite(const std::filesystem::path& package_path) {
+  namespace fs = std::filesystem;
+  {
+    auto global_lock = global_critical_region_.Acquire();
+    if (!rewrites_pending_.erase(package_path)) {
+      return;
+    }
+  }
+  // The new save must be on disk before the old one goes.
+  std::error_code ec;
+  for (const auto& entry : fs::recursive_directory_iterator(package_path, ec)) {
+    if (entry.is_regular_file(ec)) {
+      int fd = open(entry.path().c_str(), O_RDONLY);
+      if (fd >= 0) {
+        fsync(fd);
+        close(fd);
+      }
+    }
+  }
+  const fs::path package_backup = RewriteBackupPath(package_path);
+  fs::remove_all(package_backup, ec);
+  // The header backup sits under the same title folder of the backup tree.
+  const fs::path rel = fs::relative(package_path, root_path_, ec);  // xuid/title/type/name
+  auto it = rel.begin();
+  if (std::distance(rel.begin(), rel.end()) == 4) {
+    const fs::path xuid_dir = *it++, title_dir = *it++, type_dir = *it++, name = *it;
+    fs::remove(root_path_ / ".rewrite" / xuid_dir / title_dir / kGameContentHeaderDirName /
+                   type_dir / (name.string() + ".header"),
+               ec);
   }
 }
 

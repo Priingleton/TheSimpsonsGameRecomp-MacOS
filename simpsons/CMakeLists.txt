@@ -1,76 +1,53 @@
-# simpsons - ReXGlue Recompiled Project
+# The Simpsons Game - ReXGlue Recompiled Project (macOS).
 #
-# SDK boilerplate lives in generated/rexglue.cmake.
+# Runtime and generated sources come from the Apple/MoltenVK port used by
+# DevZer0D4Y/TheSimpsonsGame-iOS. This tree targets native macOS (Apple Silicon)
+# with SDL3 + Vulkan via MoltenVK. SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(simpsons LANGUAGES CXX)
+project(simpsons VERSION 0.2.4 LANGUAGES CXX)
+
+if(NOT APPLE)
+  message(FATAL_ERROR "This fork builds on macOS only (Apple Silicon / MoltenVK).")
+endif()
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  message(FATAL_ERROR "iOS builds were removed from this macOS-only fork.")
+endif()
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Keep build-machine paths (they contain the user name) out of the binary:
+# source file names end up in log and assert messages.
+add_compile_options("-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=simpsons")
+
 include(generated/rexglue.cmake)
 
-# Pass-through instrumentation of the guest draw-submission functions (see
-# src/draw_telemetry.cpp) is always compiled in and gated at RUNTIME by the
-# `draw_telemetry` cvar, which defaults off. It used to be a build option, but
-# that made a measurement session require a full rebuild of the 82k recompiled
-# functions on the player's machine -- and worse, `option()` writes a CACHE
-# entry, so flipping the default could not override the OFF already sitting in
-# an existing build directory: the build would silently produce a
-# telemetry-free binary that looked correct. With the hooks always present,
-# turning the cvar off costs one relaxed atomic load and a branch per draw.
 set(SIMPSONS_SOURCES
     src/main.cpp
-    src/audio.cpp
-    src/crt_native.cpp
-    src/draw_telemetry.cpp
     src/eye_shading.cpp
+    src/fps_unlock.cpp
     src/frame_pacing.cpp
     src/freecam.cpp
-    src/game_clock.cpp
     src/ink_outlines.cpp
-    src/physics_step.cpp
+    src/overlay_input.cpp
     src/ring_wait.cpp
     src/subtitles.cpp
-    src/tick_count.cpp
 )
 
-if(WIN32)
-    add_executable(simpsons WIN32 ${SIMPSONS_SOURCES})
-else()
-    add_executable(simpsons ${SIMPSONS_SOURCES})
-endif()
+add_executable(simpsons ${SIMPSONS_SOURCES})
 
-rexglue_setup_target(simpsons)
+# simpsons_register.cpp is one flat function of ~76k function-pointer
+# registrations, run once at startup, in a single basic block. LLVM is
+# quadratic on it: -O1 takes over 20 minutes on an M1, and so does -O0 on
+# arm64, where GlobalISel's Localizer pass walks the whole block for every
+# constant. -O0 with the classic instruction selector compiles it quickly. The
+# -O3 precompiled header cannot be used at -O0, so it is skipped here.
+set_source_files_properties(
+    ${CMAKE_CURRENT_SOURCE_DIR}/generated/default/simpsons_register.cpp
+    PROPERTIES COMPILE_OPTIONS "-O0;-mllvm;-global-isel=0" SKIP_PRECOMPILE_HEADERS ON)
 
-# draw_telemetry.cpp calls fmt directly; the prebuilt SDK exposes fmt headers
-# transitively, but REXSDK_DIR (add_subdirectory) builds -- what CI uses --
-# need the explicit link for the target to see fmt's usage requirements.
-if(TARGET fmt::fmt)
-    target_link_libraries(simpsons PRIVATE fmt::fmt)
-endif()
+# CFLocale, for the game language default (src/simpsons_app.h).
+target_link_libraries(simpsons PRIVATE "-framework CoreFoundation")
 
-# The generated translation units are where nearly all guest CPU time goes,
-# but CMake's stock RelWithDebInfo only compiles them at -O2, and local builds
-# never got the -march=x86-64-v3 that CI already ships in every release
-# (build.yml/release.yml pass it on the command line). Apply both directly on
-# the target so every build gets them: target_compile_options land after the
-# per-config flags on the compile line, so -O3 wins over the default -O2.
-# x86-64-v3 (AVX2/BMI2/FMA, Haswell/Zen1+) matches what releases already
-# require, so this adds no new hardware exposure. Releases also ship an
-# x86-64-v2 build for older CPUs (release.yml sets SIMPSONS_X86_MARCH).
-set(SIMPSONS_X86_MARCH "x86-64-v3" CACHE STRING
-    "x86-64 microarchitecture level to compile the game for (x86-64-v3 or x86-64-v2)")
-if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU"
-   AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    target_compile_options(simpsons PRIVATE
-        $<$<CONFIG:RelWithDebInfo,Release>:-O3>
-        -march=${SIMPSONS_X86_MARCH}
-    )
-endif()
-
-# Windows POSIX shims for the few generated TUs that reference <sys/mman.h>
-# (mprotect, neutered/no-op) and <unistd.h> (usleep). Scoped to this target.
-if(WIN32)
-    target_include_directories(simpsons PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/compat_win)
-endif()
+rexglue_setup_target(simpsons GPU_PLUGINS xenos)

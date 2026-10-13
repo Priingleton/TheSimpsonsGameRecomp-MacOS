@@ -12,10 +12,6 @@
 // Disable warnings about unused parameters for kernel functions
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
-#include <atomic>
-#include <chrono>
-
-#include <rex/cvar.h>
 #include <rex/filesystem/device.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
@@ -32,10 +28,6 @@
 #include <rex/system/xthread.h>
 #include <rex/system/xtypes.h>
 #include <rex/thread/mutex.h>
-
-
-REXCVAR_DEFINE_BOOL(log_file_opens, false, "Kernel",
-                    "Log every file the game opens successfully (diagnostic)");
 
 namespace rex::kernel::xboxkrnl {
 using namespace rex::system;
@@ -176,13 +168,17 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
 
   *handle_out = handle;
+  // DEVSTATS: everything off the game disc (saves, caches).
+  if (target_path.size() > 2 && !(target_path[0] == 'D' || target_path[0] == 'd') &&
+      target_path.rfind("game:", 0) != 0) {
+    REXLOG_INFO("[save] NtCreateFile '{}' access={:#x} disp={} -> {:#x} action {}", target_path,
+                uint32_t(desired_access), uint32_t(creation_disposition), uint32_t(result),
+                io_status_block ? uint32_t(io_status_block->information) : 0);
+  }
   if (XFAILED(result)) {
     REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", target_path, result);
   } else {
     REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x} handle={:#x}", result, handle);
-    if (REXCVAR_GET(log_file_opens)) {
-      REXKRNL_INFO("[file-open] {}", target_path);
-    }
   }
   return result;
 }
@@ -417,6 +413,10 @@ u32 NtWriteFile_entry(u32 file_handle, u32 event_handle, u32 apc_routine, mapped
       result = file->Write(buffer.guest_address(), buffer_length,
                            byte_offset_ptr ? static_cast<uint64_t>(*byte_offset_ptr) : -1,
                            &bytes_written, apc_context.guest_address());
+      REXLOG_INFO("[save] NtWriteFile '{}' {} bytes @{} -> {:#x} wrote {}", file->path(),
+                  uint32_t(buffer_length),
+                  byte_offset_ptr ? int64_t(*byte_offset_ptr) : int64_t(-1), uint32_t(result),
+                  bytes_written);  // DEVSTATS
 
       if (io_status_block) {
         io_status_block->status = result;

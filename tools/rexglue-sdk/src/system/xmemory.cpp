@@ -12,10 +12,13 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 #include <utility>
-#include <string>
-#include <vector>
-#include <unordered_map>
+
+#if REX_PLATFORM_MAC
+#include <sys/mman.h>
+#endif
 
 #include <fmt/format.h>
 
@@ -24,20 +27,14 @@
 #include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/math.h>
-#include <rex/platform.h>
 #include <rex/stream.h>
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/mmio_handler.h>
 #include <rex/system/xmemory.h>
-#include <rex/perf/counter.h>
 #include <rex/thread.h>
 
 // TODO(benvanik): move xbox.h out
 #include <rex/system/xtypes.h>
-
-#if !REX_PLATFORM_WIN32
-#include <dlfcn.h>
-#endif
 
 REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
@@ -47,43 +44,7 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
 
 REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
 
-REXCVAR_DEFINE_INT32(watch_fault_writer_stats, 0, "Memory",
-                     "Debugging: every this many guest write faults on memory the GPU reads, log "
-                     "the host instructions that caused the most (0 = off)");
-
-namespace rex::runtime {
-extern thread_local uintptr_t g_access_violation_pc;
-}  // namespace rex::runtime
-
 namespace rex::memory {
-
-// Diagnostic counters for the command processor's gpu_wait_stats log: host
-// page protection changes that arm GPU write watches, and the guest write
-// faults that fire them (host ticks).
-std::atomic<uint64_t> g_watch_protect_calls{0};
-std::atomic<uint64_t> g_watch_protect_ticks{0};
-std::atomic<uint64_t> g_watch_fault_count{0};
-// watch_fault_writer_stats: the host instructions of guest write faults.
-std::unordered_map<uintptr_t, uint32_t> g_watch_fault_pcs;
-std::unordered_map<uintptr_t, uint32_t> g_watch_fault_pc_addresses;
-uint64_t g_watch_fault_pcs_total = 0;
-std::atomic<uint64_t> g_watch_fault_ticks{0};
-// Per 1 MB region of physical memory: protect calls, pages protected, write
-// faults; and protect calls per physical heap view (A, C, E).
-std::atomic<uint32_t> g_watch_region_protects[512];
-std::atomic<uint32_t> g_watch_region_protect_pages[512];
-std::atomic<uint32_t> g_watch_region_faults[512];
-std::atomic<uint32_t> g_watch_view_protects[3];
-
-static void CountWatchProtect(uint32_t physical_address, uint32_t pages, uint32_t heap_base) {
-  uint32_t region = (physical_address >> 20) & 511;
-  g_watch_region_protects[region].fetch_add(1, std::memory_order_relaxed);
-  g_watch_region_protect_pages[region].fetch_add(pages, std::memory_order_relaxed);
-  uint32_t view = (heap_base >> 29) - 5;
-  if (view < 3) {
-    g_watch_view_protects[view].fetch_add(1, std::memory_order_relaxed);
-  }
-}
 
 uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
   return rex::round_up(value, page_size) >> page_size_shift;
@@ -178,16 +139,28 @@ bool Memory::Initialize() {
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
-  mapping_ =
-      rex::memory::CreateFileMappingHandle(file_name_,
-                                           // entire 4gb space + 512mb physical:
-                                           0x11FFFFFFF, rex::memory::PageAccess::kReadWrite, false);
+  // Round up to allocation granularity to accommodate platforms with large pages.
+  const size_t mapping_size =
+      rex::round_up(static_cast<size_t>(0x120000000ull) + system_allocation_granularity_,
+                    static_cast<size_t>(system_allocation_granularity_));
+  mapping_ = rex::memory::CreateFileMappingHandle(file_name_, mapping_size,
+                                                  rex::memory::PageAccess::kReadWrite, false);
   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
     assert_always();
     return false;
   }
 
+#if REX_PLATFORM_MAC
+  // On macOS, reserve a contiguous host range first, then carve guest views
+  // into it with MAP_SHARED|MAP_FIXED so all views share the same backing fd.
+  if (MapViewsMac()) {
+    REXSYS_ERROR("Unable to find a continuous block in the 64bit address space.");
+    assert_always();
+    return false;
+  }
+  mapping_base_ = views_.all_views[0];
+#else
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
@@ -203,8 +176,13 @@ bool Memory::Initialize() {
     assert_always();
     return false;
   }
+#endif
   virtual_membase_ = mapping_base_;
   physical_membase_ = mapping_base_ + 0x100000000ull;
+
+  REXSYS_INFO("Guest memory arena mapped: virtual base 0x{:016X}, physical base 0x{:016X}",
+              reinterpret_cast<uintptr_t>(virtual_membase_),
+              reinterpret_cast<uintptr_t>(physical_membase_));
 
   // Prepare virtual heaps.
   heaps_.v00000000.Initialize(this, virtual_membase_, memory::HeapType::kGuestVirtual, 0x00000000,
@@ -337,6 +315,52 @@ static const struct {
         0x0000000100000000ull,
     },
 };
+#if REX_PLATFORM_MAC
+int Memory::MapViewsMac() {
+  assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
+
+  // macOS does not guarantee that a non-MAP_FIXED mmap will honor a requested
+  // address. Reserve a contiguous range first, then MAP_FIXED each view within
+  // it so the guest layout is stable across runs.
+  const size_t total_size =
+      static_cast<size_t>(map_info[rex::countof(map_info) - 1].virtual_address_end -
+                          map_info[0].virtual_address_start + 1);
+
+  void* reserved_base = mmap(nullptr, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (reserved_base == MAP_FAILED) {
+    REXSYS_ERROR("MapViewsMac: reserve failed: {}", std::strerror(errno));
+    return 1;
+  }
+
+  uint8_t* mapping_base = reinterpret_cast<uint8_t*>(reserved_base);
+  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+
+  for (size_t n = 0; n < rex::countof(map_info); n++) {
+    size_t view_size = static_cast<size_t>(map_info[n].virtual_address_end -
+                                           map_info[n].virtual_address_start + 1);
+    size_t file_offset = static_cast<size_t>(map_info[n].target_address & granularity_mask);
+    void* target_address = mapping_base + map_info[n].virtual_address_start;
+    void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED,
+                        mapping_, file_offset);
+    if (result == MAP_FAILED || result != target_address) {
+      int err = errno;
+      REXSYS_ERROR(
+          "MapViewsMac: map failed view {} addr 0x{:016X} size 0x{:X} offset 0x{:X} err {} ({})", n,
+          reinterpret_cast<uintptr_t>(target_address), view_size, file_offset, err,
+          std::strerror(err));
+      munmap(reserved_base, total_size);
+      for (auto& view : views_.all_views) {
+        view = nullptr;
+      }
+      return 1;
+    }
+    views_.all_views[n] = reinterpret_cast<uint8_t*>(result);
+  }
+
+  return 0;
+}
+#endif  // REX_PLATFORM_MAC
+
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(rex::countof(map_info) == rex::countof(views_.all_views));
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
@@ -482,12 +506,26 @@ uint32_t Memory::SearchAligned(uint32_t start, uint32_t end, const uint32_t* val
 bool Memory::AddVirtualMappedRange(uint32_t virtual_address, uint32_t mask, uint32_t size,
                                    void* context, runtime::MMIOReadCallback read_callback,
                                    runtime::MMIOWriteCallback write_callback) {
-  if (!rex::memory::AllocFixed(TranslateVirtual(virtual_address), size,
-                               rex::memory::AllocationType::kCommit,
+  // AllocFixed rejects requests that don't cover whole host pages, so that a
+  // guest heap can never widen an mprotect over a neighbouring guest page that
+  // shares the host page. An MMIO window has no such neighbours - it owns its
+  // entire range - so rounding out to host page bounds is safe here, and it is
+  // required because callers describe these windows with mask-style sizes such
+  // as 0xFFFF, which is one byte short of 64 KB and therefore never a multiple
+  // of the 16 KB host page on Apple Silicon.
+  const size_t host_page_size = rex::memory::page_size();
+  uint8_t* const range_start = TranslateVirtual(virtual_address);
+  uint8_t* const aligned_start = reinterpret_cast<uint8_t*>(
+      reinterpret_cast<uintptr_t>(range_start) & ~(uintptr_t(host_page_size) - 1));
+  const size_t aligned_length =
+      rex::round_up(size_t(range_start - aligned_start) + size, host_page_size);
+  if (!rex::memory::AllocFixed(aligned_start, aligned_length, rex::memory::AllocationType::kCommit,
                                rex::memory::PageAccess::kNoAccess)) {
     REXSYS_ERROR("Unable to map range; commit/protect failed");
     return false;
   }
+  // The MMIO registration keeps the caller's original size - only the host
+  // reservation is rounded.
   return mmio_handler_->RegisterRange(virtual_address, mask, size, context, read_callback,
                                       write_callback);
 }
@@ -507,11 +545,8 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
   }
   uint32_t virtual_address = HostToGuestVirtual(host_address);
   BaseHeap* heap = LookupHeap(virtual_address);
-  if (!heap) {
-    return false;
-  }
-
-  bool is_physical_heap = heap->heap_type() == memory::HeapType::kGuestPhysical;
+  const bool is_physical_heap =
+      heap && heap->heap_type() == memory::HeapType::kGuestPhysical;
   if (is_physical_heap) {
     // Access violation callbacks from the guest are triggered when the global
     // critical region mutex is locked once.
@@ -519,73 +554,19 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
     // Will be rounded to physical page boundaries internally, so just pass 1 as
     // the length - guranteed not to cross page boundaries also.
     auto physical_heap = static_cast<PhysicalHeap*>(heap);
-    uint64_t fault_start_tick = rex::chrono::Clock::QueryHostTickCount();
-    bool handled = physical_heap->TriggerCallbacks(std::move(global_lock_locked_once),
-                                                   virtual_address, 1, is_write, false);
-    g_watch_fault_count.fetch_add(1, std::memory_order_relaxed);
-    g_watch_region_faults[(physical_heap->GetPhysicalAddress(virtual_address) >> 20) & 511]
-        .fetch_add(1, std::memory_order_relaxed);
-    uint64_t fault_ticks = rex::chrono::Clock::QueryHostTickCount() - fault_start_tick;
-    if (int32_t stats_interval = REXCVAR_GET(watch_fault_writer_stats); stats_interval > 0) {
-      // Under the global lock (the callback runs with it).
-      ++g_watch_fault_pcs[rex::runtime::g_access_violation_pc];
-      g_watch_fault_pc_addresses[rex::runtime::g_access_violation_pc] =
-          physical_heap->GetPhysicalAddress(virtual_address);
-      if (++g_watch_fault_pcs_total % uint64_t(stats_interval) == 0) {
-        std::vector<std::pair<uint32_t, uintptr_t>> top;
-        for (const auto& pc_count : g_watch_fault_pcs) {
-          top.emplace_back(pc_count.second, pc_count.first);
-        }
-        std::sort(top.rbegin(), top.rend());
-        std::string text;
-        for (size_t i = 0; i < std::min(top.size(), size_t(12)); ++i) {
-          uintptr_t offset = top[i].second;
-          const char* module = "?";
-#if !REX_PLATFORM_WIN32
-          Dl_info info = {};
-          if (dladdr(reinterpret_cast<void*>(top[i].second), &info) && info.dli_fbase) {
-            offset = top[i].second - uintptr_t(info.dli_fbase);
-            module = info.dli_fname ? info.dli_fname : "?";
-            if (const char* slash = std::strrchr(module, '/')) {
-              module = slash + 1;
-            }
-          }
-#endif
-          text += fmt::format(" {}+{:x}:{}@{:08X}", module, offset, top[i].first,
-                              g_watch_fault_pc_addresses[top[i].second]);
-        }
-        REXSYS_INFO("[fault-writers] {} faults, top:{}", g_watch_fault_pcs_total, text);
-        g_watch_fault_pcs.clear();
-        g_watch_fault_pc_addresses.clear();
-      }
-    }
-    g_watch_fault_ticks.fetch_add(fault_ticks, std::memory_order_relaxed);
-    PERF_counter_inc(kWatchFaults);
-    PERF_counter_add(kWatchFaultUs,
-                     int64_t(fault_ticks * 1000000 / rex::chrono::Clock::QueryHostTickFrequency()));
-    if (handled) {
+    if (physical_heap->TriggerCallbacks(std::move(global_lock_locked_once), virtual_address, 1,
+                                        is_write, false)) {
       return true;
     }
   }
 
-  // Recovery path for stale host protection state in guest memory: if guest
-  // metadata says the page is writable but host protection is still
-  // read-only / no-access, restore write access and resume execution.
-  //
-  // HAND PATCH: originally this whole function bailed out above unless
-  // heap_type() == kGuestPhysical (GPU/texture aliasing only). The identical
-  // stale-protection symptom -- a growable-buffer allocator (sub_82457CC8 and
-  // its ~140 callers) handing back a pointer whose page is still mapped
-  // read-only/no-access even though the guest-side heap metadata already
-  // marks it committed+writable -- recurs throughout plain kGuestVirtual
-  // allocations too (Lua/game-state buffers, not just GPU memory), and was
-  // being fixed one crash/call-site at a time via manual mprotect() calls
-  // added directly to generated code (HandPatchEnsureWritable*). QueryProtect
-  // and QueryRegionInfo below are plain BaseHeap methods backed by the same
-  // page_table_ for every heap type, so this recovery generalizes safely;
-  // only the GPU write-watch trigger above and the physical-alias fallback
-  // below remain physical-heap-specific.
-  if (is_write) {
+  // Recovery path for stale host protection state: if guest metadata says the
+  // page is writable but host protection is still read-only / no-access,
+  // restore write access and resume execution. Applies to every heap, not
+  // only physical memory: TheSimpsonsGameRecomp found the same stale state in
+  // plain virtual allocations (a growable-buffer allocator, sub_82457CC8, and
+  // its callers) and fixed it the same way in its SDK.
+  if (heap && is_write) {
     constexpr uint32_t kWriteProtectMask =
         memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine;
     uint32_t guest_protect = 0;
@@ -604,9 +585,7 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
         allow_write = true;
       } else if (is_physical_heap) {
         // Alias-aware fallback: consult canonical 0x00000000 physical heap
-        // metadata when this alias has stale tracking. Physical-heap-only:
-        // GetPhysicalAddress/heaps_.physical only make sense for physical
-        // aliases.
+        // metadata when this alias has stale tracking.
         uint32_t physical_address = GetPhysicalAddress(virtual_address);
         if (physical_address != UINT32_MAX) {
           uint32_t physical_protect = 0;
@@ -633,13 +612,39 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
                                rex::memory::PageAccess::kReadWrite, nullptr)) {
         REXSYS_WARN(
-            "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+            "Recovered stale {} page protection for guest {:08X} (host {:016X}, "
             "guest_protect {:08X})",
-            virtual_address, static_cast<uint64_t>(page_base), guest_protect);
+            is_physical_heap ? "physical" : "virtual", virtual_address,
+            static_cast<uint64_t>(page_base), guest_protect);
         return true;
       }
     }
+  }
 
+  if (!is_physical_heap) {
+    // The faulting instruction is retried after this returns unhandled, so an
+    // unrecoverable fault repeats forever. Logging every repeat buries the boot
+    // sequence under millions of identical lines (and rotates it out of the log
+    // entirely), so report each distinct address once.
+    static std::mutex av_mutex;
+    static std::unordered_set<uint64_t> av_seen;
+    const uint64_t key = (uint64_t(virtual_address) << 1) | (is_write ? 1u : 0u);
+    bool first = false;
+    {
+      std::lock_guard<std::mutex> lock(av_mutex);
+      first = av_seen.insert(key).second;
+    }
+    if (first) {
+      REXSYS_ERROR(
+          "Unhandled guest access violation: {} of guest 0x{:08X} (host 0x{:016X}) on thread "
+          "0x{:X}",
+          is_write ? "write" : "read", virtual_address,
+          reinterpret_cast<uintptr_t>(host_address), rex::thread::current_thread_id());
+    }
+    return false;
+  }
+
+  if (is_write) {
     uint32_t current_guest_protect = 0;
     heap->QueryProtect(virtual_address, &current_guest_protect);
     uint32_t physical_address = GetPhysicalAddress(virtual_address);
@@ -905,6 +910,68 @@ rex::memory::PageAccess ToPageAccess(uint32_t protect) {
   }
 }
 
+// The host access that the guest pages sharing one host page need between them.
+// Host pages can be larger than guest pages (16 KB on iOS and Apple Silicon
+// macOS, over the 4 KB-page heaps), so one host protection has to serve several
+// guest pages: grant the union of what the committed ones need. Physical
+// aliases are intentionally left accessible after release unless
+// protect_on_release is enabled, because GPU users may still reference them.
+// DEVSTATS (local only): host pages watched only thanks to the whole-host-page
+// rule - each one was a missed invalidation before it.
+std::atomic<uint64_t> g_rex_watch_gap_pages{0};
+uint64_t RexWatchGapPages() {
+  return g_rex_watch_gap_pages.load(std::memory_order_relaxed);
+}
+
+static rex::memory::PageAccess HostPageGuestAccess(const std::vector<PageEntry>& page_table,
+                                                   uint32_t host_page_number,
+                                                   uint32_t host_page_size,
+                                                   uint32_t host_address_offset,
+                                                   uint32_t heap_size, uint32_t page_size_shift,
+                                                   HeapType heap_type) {
+  const uint64_t host_page_start = uint64_t(host_page_number) * host_page_size;
+  const uint64_t host_page_end = host_page_start + host_page_size;
+  const uint64_t heap_host_start = host_address_offset;
+  const uint64_t heap_host_end = heap_host_start + heap_size;
+  const uint64_t overlap_start = std::max(host_page_start, heap_host_start);
+  const uint64_t overlap_end = std::min(host_page_end, heap_host_end);
+  if (overlap_start >= overlap_end) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+
+  const uint32_t guest_page_start = uint32_t(overlap_start - heap_host_start) >> page_size_shift;
+  const uint32_t guest_page_end = uint32_t(overlap_end - heap_host_start - 1) >> page_size_shift;
+
+  bool has_read = false;
+  bool has_write = false;
+  bool has_committed = false;
+  for (uint32_t page_number = guest_page_start; page_number <= guest_page_end; ++page_number) {
+    const PageEntry& page_entry = page_table[page_number];
+    if (!(page_entry.state & memory::kMemoryAllocationCommit)) {
+      continue;
+    }
+    has_committed = true;
+    const rex::memory::PageAccess page_access = ToPageAccess(page_entry.current_protect);
+    if (page_access == rex::memory::PageAccess::kReadWrite) {
+      has_read = true;
+      has_write = true;
+      break;
+    }
+    if (page_access == rex::memory::PageAccess::kReadOnly) {
+      has_read = true;
+    }
+  }
+
+  if (!has_committed && heap_type == memory::HeapType::kGuestPhysical &&
+      !REXCVAR_GET(protect_on_release)) {
+    return rex::memory::PageAccess::kReadWrite;
+  }
+  if (!has_read) {
+    return rex::memory::PageAccess::kNoAccess;
+  }
+  return has_write ? rex::memory::PageAccess::kReadWrite : rex::memory::PageAccess::kReadOnly;
+}
+
 uint32_t FromPageAccess(rex::memory::PageAccess protect) {
   switch (protect) {
     case memory::PageAccess::kNoAccess:
@@ -929,6 +996,86 @@ uint32_t FromPageAccess(rex::memory::PageAccess protect) {
 BaseHeap::BaseHeap() : membase_(nullptr), heap_base_(0), heap_size_(0), page_size_(0) {}
 
 BaseHeap::~BaseHeap() = default;
+
+std::unique_lock<std::recursive_mutex> BaseHeap::AcquireHostPageReconcileLock() const {
+  if (page_size_ >= memory_->system_page_size_) {
+    return {};
+  }
+  return rex::thread::global_critical_region::AcquireDirect();
+}
+
+bool BaseHeap::SyncHostPageAccess(uint32_t start_page_number, uint32_t end_page_number) {
+  const uint32_t host_page_size = memory_->system_page_size_;
+  if (page_size_ >= host_page_size) {
+    return true;
+  }
+
+  // The global critical region guards the watch flags read below and must
+  // already be held by the caller (AcquireHostPageReconcileLock), acquired
+  // ahead of heap_mutex_ so this never inverts against PhysicalHeap.
+
+  // Multiple guest pages may share one host page. Keep the guest page table as
+  // the source of truth, then grant the host page the union of the access needed
+  // by its committed guest pages. This can't enforce stricter access for one
+  // guest page while a neighbor needs broader access, but it keeps neighboring
+  // committed pages usable and allows guest protection metadata to stay exact.
+  const auto get_host_page_access = [&](uint32_t host_page_number) {
+    rex::memory::PageAccess access =
+        HostPageGuestAccess(page_table_, host_page_number, host_page_size, host_address_offset_,
+                            heap_size_, page_size_shift_, heap_type_);
+
+    // The guest page table is not the whole truth: a physical heap page may
+    // also be write-watched for GPU invalidation. EnableAccessCallbacks records
+    // that in notify_on_invalidation and skips any page whose bit is already
+    // set, so handing write access back here would stop the watch firing
+    // permanently. One host page covers several guest pages, so an unrelated
+    // operation on a neighbour reaches this code constantly - clamp instead.
+    // Leaving the page read-only can only cause a spurious invalidation, which
+    // is safe; restoring write access loses invalidations, which is not.
+    if (access == rex::memory::PageAccess::kReadWrite && IsHostPageWriteWatched(host_page_number)) {
+      access = rex::memory::PageAccess::kReadOnly;
+    }
+    return access;
+  };
+
+  const uint64_t guest_byte_start = uint64_t(start_page_number) << page_size_shift_;
+  const uint64_t guest_byte_end = ((uint64_t(end_page_number) + 1) << page_size_shift_) - 1;
+  const uint32_t host_page_first =
+      uint32_t((guest_byte_start + host_address_offset_) / host_page_size);
+  const uint32_t host_page_last =
+      uint32_t((guest_byte_end + host_address_offset_) / host_page_size);
+
+  // Coalesce neighbouring host pages that resolve to the same access into one
+  // Protect call. A bulk commit spans thousands of host pages and almost always
+  // wants a single uniform access for all of them, so protecting page by page
+  // would cost thousands of syscalls where one suffices.
+  uint8_t* const heap_host_base = membase_ + heap_base_;
+  uint32_t run_first_page = host_page_first;
+  rex::memory::PageAccess run_access = get_host_page_access(host_page_first);
+  const auto flush_run = [&](uint32_t run_last_page) {
+    const size_t run_length = (size_t(run_last_page - run_first_page) + 1) * host_page_size;
+    uint8_t* const run_pointer = heap_host_base + size_t(run_first_page) * host_page_size;
+    if (!rex::memory::Protect(run_pointer, run_length, run_access, nullptr)) {
+      REXSYS_ERROR("BaseHeap::SyncHostPageAccess failed for heap {:08X} host pages {}-{}",
+                   heap_base_, run_first_page, run_last_page);
+      return false;
+    }
+    return true;
+  };
+
+  for (uint32_t host_page = host_page_first + 1; host_page <= host_page_last; ++host_page) {
+    const rex::memory::PageAccess access = get_host_page_access(host_page);
+    if (access == run_access) {
+      continue;
+    }
+    if (!flush_run(host_page - 1)) {
+      return false;
+    }
+    run_first_page = host_page;
+    run_access = access;
+  }
+  return flush_run(host_page_last);
+}
 
 void BaseHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType heap_type,
                           uint32_t heap_base, uint32_t heap_size, uint32_t page_size,
@@ -1068,6 +1215,14 @@ bool BaseHeap::Save(stream::ByteStream* stream) {
 bool BaseHeap::Restore(stream::ByteStream* stream) {
   REXSYS_DEBUG("Heap {:08X}-{:08X}", heap_base_, heap_base_ + (heap_size_ - 1));
 
+  const uint32_t host_page_size = memory_->system_page_size_;
+  const bool reconcile_host_pages = page_size_ < host_page_size;
+  uint32_t writable_host_page = UINT32_MAX;
+
+  // Restore doesn't take heap_mutex_, but SyncHostPageAccess below still needs
+  // the global critical region held by its caller.
+  auto global_lock = AcquireHostPageReconcileLock();
+
   for (size_t i = 0; i < page_table_.size(); i++) {
     auto& page = page_table_[i];
     page.qword = stream->Read<uint64_t>();
@@ -1084,23 +1239,50 @@ bool BaseHeap::Restore(stream::ByteStream* stream) {
       page_access = memory::PageAccess::kReadOnly;
     }
 
-    // Commit the memory if it isn't already. We do not need to reserve any
-    // memory, as the mapping has already taken care of that.
-    if (page.state & memory::kMemoryAllocationCommit) {
-      rex::memory::AllocFixed(TranslateRelative(i << page_size_shift_), page_size_,
-                              memory::AllocationType::kCommit, memory::PageAccess::kReadWrite);
+    if (!(page.state & memory::kMemoryAllocationCommit)) {
+      continue;
     }
 
-    // Now read into memory. We'll set R/W protection first, then set the
-    // protection back to its previous state.
-    // TODO(DrChat): read compressed with snappy.
-    if (page.state & memory::kMemoryAllocationCommit) {
-      void* addr = TranslateRelative(i << page_size_shift_);
+    void* addr = TranslateRelative(i << page_size_shift_);
+    if (!reconcile_host_pages) {
+      // Commit the memory if it isn't already. We do not need to reserve any
+      // memory, as the mapping has already taken care of that.
+      rex::memory::AllocFixed(addr, page_size_, memory::AllocationType::kCommit,
+                              memory::PageAccess::kReadWrite);
+      // Read into memory with R/W protection, then restore the saved
+      // protection.
+      // TODO(DrChat): read compressed with snappy.
       rex::memory::Protect(addr, page_size_, memory::PageAccess::kReadWrite, nullptr);
-
       stream->Read(addr, page_size_);
-
       rex::memory::Protect(addr, page_size_, page_access, nullptr);
+      continue;
+    }
+
+    // Guest pages are smaller than host pages, so a per-guest-page commit is
+    // rejected and a per-guest-page protect is misaligned - either way the
+    // target would never become writable and the read below would fault or be
+    // silently lost. Make the containing host page writable once instead;
+    // guest pages are visited in ascending order, so one commit covers the
+    // whole run that shares a host page. Real protections are reconciled from
+    // the restored page table after the loop.
+    const uint32_t host_page =
+        uint32_t(((uint64_t(i) << page_size_shift_) + host_address_offset_) / host_page_size);
+    if (host_page != writable_host_page) {
+      uint8_t* host_page_pointer = membase_ + heap_base_ + size_t(host_page) * host_page_size;
+      if (!rex::memory::AllocFixed(host_page_pointer, host_page_size,
+                                   memory::AllocationType::kCommit,
+                                   memory::PageAccess::kReadWrite)) {
+        REXSYS_ERROR("BaseHeap::Restore failed to make host page {} writable", host_page);
+        return false;
+      }
+      writable_host_page = host_page;
+    }
+    stream->Read(addr, page_size_);
+  }
+
+  if (reconcile_host_pages && !page_table_.empty()) {
+    if (!SyncHostPageAccess(0, uint32_t(page_table_.size()) - 1)) {
+      return false;
     }
   }
 
@@ -1179,6 +1361,9 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     return false;
   }
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // - If we are reserving the entire range requested must not be already
@@ -1207,7 +1392,7 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
   // Allocate from host.
   if (allocation_type == memory::kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
-  } else {
+  } else if (page_size_ >= memory_->system_page_size_) {
     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
                           ? rex::memory::AllocationType::kCommit
                           : rex::memory::AllocationType::kReserve;
@@ -1217,10 +1402,6 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     if (!result) {
       REXSYS_ERROR("BaseHeap::AllocFixed failed to alloc range from host");
       return false;
-    }
-
-    if (REXCVAR_GET(scribble_heap) && protect & memory::kMemoryProtectWrite) {
-      std::memset(result, 0xCD, page_count << page_size_shift_);
     }
   }
 
@@ -1238,6 +1419,16 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
     page_entry.allocation_protect = protect;
     page_entry.current_protect = protect;
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
+  }
+
+  if (!SyncHostPageAccess(start_page_number, end_page_number)) {
+    return false;
+  }
+
+  if (allocation_type != memory::kMemoryAllocationReserve && REXCVAR_GET(scribble_heap) &&
+      (protect & memory::kMemoryProtectWrite)) {
+    std::memset(TranslateRelative(start_page_number << page_size_shift_), 0xCD,
+                page_count << page_size_shift_);
   }
 
   return true;
@@ -1271,6 +1462,9 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     return false;
   }
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Find a free page range.
@@ -1361,7 +1555,7 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
   // Allocate from host.
   if (allocation_type == memory::kMemoryAllocationReserve) {
     // Reserve is not needed, as we are mapped already.
-  } else {
+  } else if (page_size_ >= memory_->system_page_size_) {
     auto alloc_type = (allocation_type & memory::kMemoryAllocationCommit)
                           ? rex::memory::AllocationType::kCommit
                           : rex::memory::AllocationType::kReserve;
@@ -1371,10 +1565,6 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     if (!result) {
       REXSYS_ERROR("BaseHeap::Alloc failed to alloc range from host");
       return false;
-    }
-
-    if (REXCVAR_GET(scribble_heap) && (protect & memory::kMemoryProtectWrite)) {
-      std::memset(result, 0xCD, page_count << page_size_shift_);
     }
   }
 
@@ -1391,6 +1581,16 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t 
     page_entry.state = memory::kMemoryAllocationReserve | allocation_type;
   }
 
+  if (!SyncHostPageAccess(start_page_number, end_page_number)) {
+    return false;
+  }
+
+  if (allocation_type != memory::kMemoryAllocationReserve && REXCVAR_GET(scribble_heap) &&
+      (protect & memory::kMemoryProtectWrite)) {
+    std::memset(TranslateRelative(start_page_number << page_size_shift_), 0xCD,
+                page_count << page_size_shift_);
+  }
+
   *out_address = heap_base_ + (start_page_number << page_size_shift_);
   return true;
 }
@@ -1402,6 +1602,9 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
   start_page_number = std::min(uint32_t(page_table_.size()) - 1, start_page_number);
   end_page_number = std::min(uint32_t(page_table_.size()) - 1, end_page_number);
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Release from host.
@@ -1421,10 +1624,17 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
     page_entry.state &= ~memory::kMemoryAllocationCommit;
   }
 
+  if (!SyncHostPageAccess(start_page_number, end_page_number)) {
+    return false;
+  }
+
   return true;
 }
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Given address must be a region base address.
@@ -1476,6 +1686,10 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
     unreserved_page_count_++;
   }
 
+  if (!SyncHostPageAccess(base_page_number, end_page_number)) {
+    return false;
+  }
+
   return true;
 }
 
@@ -1512,6 +1726,9 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
     return false;
   }
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Ensure all pages are in the same reserved region and all are committed.
@@ -1530,12 +1747,10 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
     }
   }
 
-  // Attempt host change (hopefully won't fail).
-  // We can only do this if our size matches system page granularity.
-  uint32_t page_count = end_page_number - start_page_number + 1;
-  if (page_size_ == rex::memory::page_size() ||
-      (((page_count << page_size_shift_) % rex::memory::page_size() == 0) &&
-       ((start_page_number << page_size_shift_) % rex::memory::page_size() == 0))) {
+  // Change host protection directly when guest pages are at least as large as
+  // host pages. Smaller guest pages are reconciled after the page table update.
+  if (page_size_ >= memory_->system_page_size_) {
+    const uint32_t page_count = end_page_number - start_page_number + 1;
     memory::PageAccess old_protect_access;
     if (!rex::memory::Protect(TranslateRelative(start_page_number << page_size_shift_),
                               page_count << page_size_shift_, ToPageAccess(protect),
@@ -1548,14 +1763,19 @@ bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect, uint32
       *old_protect = FromPageAccess(old_protect_access);
     }
   } else {
-    REXSYS_WARN("BaseHeap::Protect: ignoring request as not 4k page aligned");
-    return false;
+    if (old_protect) {
+      *old_protect = page_table_[start_page_number].current_protect;
+    }
   }
 
   // Perform table change.
   for (uint32_t page_number = start_page_number; page_number <= end_page_number; ++page_number) {
     auto& page_entry = page_table_[page_number];
     page_entry.current_protect = protect;
+  }
+
+  if (!SyncHostPageAccess(start_page_number, end_page_number)) {
+    return false;
   }
 
   return true;
@@ -1730,6 +1950,9 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1760,6 +1983,9 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1793,6 +2019,9 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
   size = rex::round_up(size, page_size_);
   alignment = rex::round_up(alignment, page_size_);
 
+  // Global critical region before heap_mutex_ - see
+  // AcquireHostPageReconcileLock for why the order matters.
+  auto global_lock = AcquireHostPageReconcileLock();
   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
 
   // Allocate from parent heap (gets our physical address in 0-512mb).
@@ -1920,11 +2149,7 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
                                                : rex::memory::PageAccess::kReadOnly;
   uint8_t* protect_base = membase_ + heap_base_;
   uint32_t protect_system_page_first = UINT32_MAX;
-  auto global_lock = global_critical_region_.TryAcquire();
-  if (!global_lock.owns_lock()) {
-    rex::perf::ScopedCounterTimer wait_timer(rex::perf::CounterId::kUploadLockWaitUs);
-    global_lock.lock();
-  }
+  auto global_lock = global_critical_region_.Acquire();
   for (uint32_t i = system_page_first; i <= system_page_last; ++i) {
     // Check if need to enable callbacks for the page and raise its protection.
     //
@@ -1951,8 +2176,31 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
     uint64_t page_flags_bit = uint64_t(1) << (i & 63);
     uint32_t guest_page_number =
         rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
+    if (guest_page_number >= page_table_.size()) {
+      REXSYS_ERROR("Access callback page OOB: system_page={} guest_page={} offset=0x{:X}", i,
+                   guest_page_number, host_address_offset());
+      assert_always();
+      continue;
+    }
+    // A host page larger than a guest page holds several guest pages, and the
+    // first of them is not necessarily the one holding GPU data. Judging by it
+    // alone left writable GPU data unwatched whenever the first page was free
+    // or read-only, so CPU writes there never invalidated the GPU copy and
+    // stale data was drawn (old chunk meshes showing up as ghost blocks).
+    // Judge the host page by what all of its guest pages need, as its host
+    // protection already is.
     rex::memory::PageAccess current_page_access =
-        ToPageAccess(page_table_[guest_page_number].current_protect);
+        page_size_ < system_page_size_
+            ? HostPageGuestAccess(page_table_, i, system_page_size_, host_address_offset(),
+                                  heap_size_, page_size_shift_, heap_type_)
+            : ToPageAccess(page_table_[guest_page_number].current_protect);
+    if (page_size_ < system_page_size_ &&
+        current_page_access == rex::memory::PageAccess::kReadWrite &&
+        ToPageAccess(page_table_[guest_page_number].current_protect) !=
+            rex::memory::PageAccess::kReadWrite &&
+        (page_flags_block.notify_on_invalidation & page_flags_bit) == 0) {
+      g_rex_watch_gap_pages.fetch_add(1, std::memory_order_relaxed);  // DEVSTATS
+    }
     bool protect_system_page = false;
     // Don't do anything with inaccessible pages - don't protect, don't enable
     // callbacks - because real access violations are needed there. And don't
@@ -1977,36 +2225,16 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
       }
     } else {
       if (protect_system_page_first != UINT32_MAX) {
-        uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
-        rex::perf::ScopedCounterTimer protect_timer(rex::perf::CounterId::kWatchProtectUs);
         rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
-                             size_t(i - protect_system_page_first) * system_page_size_,
-                             protect_access);
-        protect_timer.Stop();
-        g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
-        PERF_counter_inc(kWatchProtects);
-        CountWatchProtect(physical_address, i - protect_system_page_first, heap_base_);
-        g_watch_protect_ticks.fetch_add(
-            rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,
-            std::memory_order_relaxed);
+                             (i - protect_system_page_first) * system_page_size_, protect_access);
         protect_system_page_first = UINT32_MAX;
       }
     }
   }
   if (protect_system_page_first != UINT32_MAX) {
-    uint64_t protect_start_tick = rex::chrono::Clock::QueryHostTickCount();
-    rex::perf::ScopedCounterTimer protect_timer(rex::perf::CounterId::kWatchProtectUs);
-    rex::memory::Protect(
-        protect_base + protect_system_page_first * system_page_size_,
-        size_t(system_page_last + 1 - protect_system_page_first) * system_page_size_,
-        protect_access);
-    protect_timer.Stop();
-    g_watch_protect_calls.fetch_add(1, std::memory_order_relaxed);
-    PERF_counter_inc(kWatchProtects);
-    CountWatchProtect(physical_address, system_page_last + 1 - protect_system_page_first,
-                      heap_base_);
-    g_watch_protect_ticks.fetch_add(rex::chrono::Clock::QueryHostTickCount() - protect_start_tick,
-                                    std::memory_order_relaxed);
+    rex::memory::Protect(protect_base + protect_system_page_first * system_page_size_,
+                         (system_page_last + 1 - protect_system_page_first) * system_page_size_,
+                         protect_access);
   }
 }
 
@@ -2127,8 +2355,13 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       if (unprotect_page) {
         uint32_t guest_page_number =
             rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
-        if (ToPageAccess(page_table_[guest_page_number].current_protect) !=
-            rex::memory::PageAccess::kReadWrite) {
+        // Same whole-host-page rule as EnableAccessCallbacks.
+        rex::memory::PageAccess guest_access =
+            page_size_ < system_page_size_
+                ? HostPageGuestAccess(page_table_, i, system_page_size_, host_address_offset(),
+                                      heap_size_, page_size_shift_, heap_type_)
+                : ToPageAccess(page_table_[guest_page_number].current_protect);
+        if (guest_access != rex::memory::PageAccess::kReadWrite) {
           unprotect_page = false;
         }
       }
@@ -2139,17 +2372,16 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
       } else {
         if (unprotect_system_page_first != UINT32_MAX) {
           rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
-                               size_t(i - unprotect_system_page_first) * system_page_size_,
+                               (i - unprotect_system_page_first) * system_page_size_,
                                rex::memory::PageAccess::kReadWrite);
           unprotect_system_page_first = UINT32_MAX;
         }
       }
     }
     if (unprotect_system_page_first != UINT32_MAX) {
-      rex::memory::Protect(
-          protect_base + unprotect_system_page_first * system_page_size_,
-          size_t(system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
-          rex::memory::PageAccess::kReadWrite);
+      rex::memory::Protect(protect_base + unprotect_system_page_first * system_page_size_,
+                           (system_page_last + 1 - unprotect_system_page_first) * system_page_size_,
+                           rex::memory::PageAccess::kReadWrite);
     }
   }
 
@@ -2166,6 +2398,24 @@ bool PhysicalHeap::TriggerCallbacks(std::unique_lock<std::recursive_mutex> globa
   }
 
   return true;
+}
+
+std::unique_lock<std::recursive_mutex> PhysicalHeap::AcquireHostPageReconcileLock() const {
+  auto lock = BaseHeap::AcquireHostPageReconcileLock();
+  if (!lock.owns_lock() && parent_heap_ && parent_heap_->page_size() < memory_->system_page_size_) {
+    lock = rex::thread::global_critical_region::AcquireDirect();
+  }
+  return lock;
+}
+
+bool PhysicalHeap::IsHostPageWriteWatched(uint32_t host_page_number) const {
+  // Indices match EnableAccessCallbacks: both count host pages from
+  // membase_ + heap_base_, including host_address_offset().
+  if (host_page_number >= system_page_count_) {
+    return false;
+  }
+  return (system_page_flags_[host_page_number >> 6].notify_on_invalidation &
+          (uint64_t(1) << (host_page_number & 63))) != 0;
 }
 
 uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -19,7 +20,8 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/shared_memory.h>
-#include <rex/perf/counter.h>
+#include <rex/graphics/vulkan/upload_policy.h>
+#include <rex/graphics/vulkan/development_stats.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/util.h>
@@ -28,63 +30,84 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
                     "Use sparse shared memory on Vulkan")
     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
 
-REXCVAR_DEFINE_BOOL(gpu_memory_mirror_on_demand, true, "GPU",
-                    "Create the GPU copy of guest memory only when something first needs it - "
-                    "with the native paths, normally never")
-    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
-
-REXCVAR_DECLARE(bool, shared_memory_census);
-
 namespace rex::graphics::vulkan {
+extern std::atomic<uint64_t> g_rex_perf_upload_bytes;  // DEVSTATS, command_processor.cpp
+extern std::atomic<uint64_t> g_rex_upload_region_bytes[512];  // DEVSTATS census, command_processor.cpp
+extern std::atomic<uint64_t> g_rex_upload_calls, g_rex_upload_ranges;  // DEVSTATS
+extern std::atomic<uint64_t> g_rex_direct_upload_bytes;  // DEVSTATS
+extern std::atomic<uint64_t> g_rex_thumbsrc_uploads, g_rex_thumbsrc_upload_bytes;  // DEVSTATS
 
 VulkanSharedMemory::VulkanSharedMemory(VulkanCommandProcessor& command_processor,
-                                       memory::Memory& memory, TraceWriter& trace_writer,
+                                       memory::Memory& memory,
                                        VkPipelineStageFlags guest_shader_pipeline_stages)
     : SharedMemory(memory),
       command_processor_(command_processor),
-      trace_writer_(trace_writer),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
 VulkanSharedMemory::~VulkanSharedMemory() {
   Shutdown(true);
 }
 
+REXCVAR_DEFINE_BOOL(vulkan_shared_memory_direct_upload, false, "GPU/Vulkan",
+                    "On unified-memory GPUs, keep the guest memory buffer in host-visible "
+                    "memory and write CPU-modified pages straight into it when no recorded or "
+                    "in-flight GPU work reads them, instead of recording a copy - each copy "
+                    "ends the render pass, which tile-based GPUs pay for heavily.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
+void VulkanSharedMemory::RecordDeferredUploads(VkCommandBuffer command_buffer) {
+  if (deferred_pages_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice::Functions& dfn = command_processor_.GetVulkanDevice()->functions();
+  const VkDeviceSize page_size = VkDeviceSize(1) << page_size_log2();
+  VkBufferMemoryBarrier barrier = {};
+  barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+  barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+  barrier.buffer = buffer_;
+  barrier.offset = 0;
+  barrier.size = VK_WHOLE_SIZE;
+  barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &barrier, 0, nullptr);
+  upload_regions_.clear();
+  VkBuffer source = deferred_pages_.front().buffer;
+  for (const DeferredPage& deferred : deferred_pages_) {
+    if (deferred.buffer != source) {
+      dfn.vkCmdCopyBuffer(command_buffer, source, buffer_, uint32_t(upload_regions_.size()),
+                          upload_regions_.data());
+      upload_regions_.clear();
+      source = deferred.buffer;
+    }
+    VkBufferCopy& region = upload_regions_.emplace_back();
+    region.srcOffset = deferred.offset;
+    region.dstOffset = VkDeviceSize(deferred.page) << page_size_log2();
+    region.size = page_size;
+    page_deferred_slot_[deferred.page] = 0;
+    MarkPagesStagedCopy(deferred.page, 1);
+  }
+  dfn.vkCmdCopyBuffer(command_buffer, source, buffer_, uint32_t(upload_regions_.size()),
+                      upload_regions_.data());
+  upload_regions_.clear();
+  barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+  dfn.vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 1, &barrier, 0,
+                           nullptr);
+  deferred_pages_.clear();
+}
+
+REXCVAR_DEFINE_BOOL(vulkan_defer_cpu_uploads, false, "GPU/Vulkan",
+                    "With direct uploads, hold back CPU writes to pages earlier submissions still "
+                    "read and write them right before the submission is queued, instead of a "
+                    "copy command that ends the render pass.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 bool VulkanSharedMemory::Initialize() {
   InitializeCommon();
 
-  // The first usage will likely be uploading.
-  last_usage_ = Usage::kTransferDestination;
-  last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
-
-  upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
-      command_processor_.GetVulkanDevice(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
-                                                                           << page_size_log2()));
-
-  if (REXCVAR_GET(gpu_memory_mirror_on_demand)) {
-    buffer_deferred_ = true;
-    return true;
-  }
-  return CreateBuffer();
-}
-
-bool VulkanSharedMemory::EnsureHostBuffer() {
-  if (!buffer_deferred_) {
-    return buffer_ != VK_NULL_HANDLE;
-  }
-  buffer_deferred_ = false;
-  if (!CreateBuffer()) {
-    return false;
-  }
-  REXGPU_INFO("Shared memory: created the GPU copy of guest memory, first needed by {}",
-              DescribeCodeAddress(__builtin_return_address(0)));
-  return true;
-}
-
-bool VulkanSharedMemory::CreateBuffer() {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kMemoryMirror, 0, "allocate the guest-memory mirror");
-  uint64_t resident_size = 0;
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
@@ -150,18 +173,26 @@ bool VulkanSharedMemory::CreateBuffer() {
     buffer_create_info.flags &= ~sparse_flags;
     if (dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &buffer_) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to create the {} MB Vulkan buffer", kBufferSize >> 20);
-      DestroyBuffer();
+      Shutdown();
       return false;
     }
     VkMemoryRequirements buffer_memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
-    if (!rex::bit_scan_forward(
+    const auto& memory_types = vulkan_device->memory_types();
+    const uint32_t mappable_device_local = buffer_memory_requirements.memoryTypeBits &
+                                           memory_types.device_local & memory_types.host_visible &
+                                           memory_types.host_coherent;
+    const bool direct_upload =
+        REXCVAR_GET(vulkan_shared_memory_direct_upload) && mappable_device_local;
+    if (direct_upload) {
+      rex::bit_scan_forward(mappable_device_local, &buffer_memory_type_);
+    } else if (!rex::bit_scan_forward(
             buffer_memory_requirements.memoryTypeBits & vulkan_device->memory_types().device_local,
             &buffer_memory_type_)) {
       REXGPU_ERROR(
           "Shared memory: Failed to get a device-local Vulkan memory type for "
           "the buffer");
-      DestroyBuffer();
+      Shutdown();
       return false;
     }
     VkMemoryAllocateInfo buffer_memory_allocate_info;
@@ -188,40 +219,38 @@ bool VulkanSharedMemory::CreateBuffer() {
           "Shared memory: Failed to allocate {} MB of memory for the Vulkan "
           "buffer",
           kBufferSize >> 20);
-      DestroyBuffer();
+      Shutdown();
       return false;
     }
     buffer_memory_.push_back(buffer_memory);
-    resident_size = buffer_memory_allocate_info.allocationSize;
     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
-      DestroyBuffer();
+      Shutdown();
       return false;
+    }
+    if (direct_upload) {
+      void* mapping = nullptr;
+      if (dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS) {
+        buffer_mapping_ = static_cast<uint8_t*>(mapping);
+        EnableReadTracking();
+        REXGPU_INFO("Shared memory: host-visible buffer, direct uploads enabled");
+      }
     }
   }
 
-  // UploadRanges copies with CopyPagesForUpload.
-  streamed_page_shadows_supported_ = true;
-  command_processor_.native_gpu_diagnostics().RecordAllocation(
-      NativeGpuDiagnostics::Allocation::kMemoryMirror, kBufferSize, resident_size);
+  // The first usage will likely be uploading.
+  last_usage_ = Usage::kTransferDestination;
+  last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
+
+  upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+      vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
+                                                                           << page_size_log2()));
 
   return true;
 }
 
-void VulkanSharedMemory::DestroyBuffer() {
-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
-  for (VkDeviceMemory memory : buffer_memory_) {
-    dfn.vkFreeMemory(device, memory, nullptr);
-  }
-  buffer_memory_.clear();
-}
-
 void VulkanSharedMemory::Shutdown(bool from_destructor) {
-  ResetTraceDownload();
-
   upload_buffer_pool_.reset();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
@@ -249,40 +278,7 @@ void VulkanSharedMemory::EndSubmission() {
   upload_buffer_pool_->FlushWrites();
 }
 
-bool VulkanSharedMemory::FlushGpuWrittenRange(uint32_t start, uint32_t length, bool writing) {
-  return !native_resolve_memory_flusher_ || native_resolve_memory_flusher_(start, length, writing);
-}
-
-void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range,
-                             std::pair<uint32_t, uint32_t> read_range) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kMemoryMirror,
-      uint64_t(written_range.second) + read_range.second,
-      fmt::format("usage {} at {}", uint32_t(usage),
-                  DescribeCodeAddress(__builtin_return_address(0))));
-  if (!EnsureHostBuffer()) {
-    return;
-  }
-  if (REXCVAR_GET(shared_memory_census)) {
-    auto range = usage == Usage::kRead ? read_range : written_range;
-    CensusRecord(__builtin_return_address(0), 1 + uint32_t(usage),
-                 range.second ? range.second : kBufferSize);
-  }
-  auto access_range = usage == Usage::kRead ? read_range : written_range;
-  if (!access_range.second) {
-    access_range = {0, kBufferSize};
-  }
-  const void* census_trigger_previous = CensusTrigger();
-  if (REXCVAR_GET(shared_memory_census)) {
-    CensusTrigger() = __builtin_return_address(0);
-  }
-  bool flushed =
-      FlushGpuWrittenRange(access_range.first, access_range.second, usage != Usage::kRead);
-  CensusTrigger() = census_trigger_previous;
-  if (!flushed) {
-    REXGPU_ERROR("Shared memory: failed to make native GPU data visible to the mirror");
-    return;
-  }
+void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
   written_range.first = std::min(written_range.first, kBufferSize);
   written_range.second = std::min(written_range.second, kBufferSize - written_range.first);
   assert_true(usage != Usage::kRead || !written_range.second);
@@ -312,75 +308,6 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
   last_written_range_ = written_range;
 }
 
-bool VulkanSharedMemory::InitializeTraceSubmitDownloads() {
-  ResetTraceDownload();
-  PrepareForTraceDownload();
-  uint32_t download_page_count = trace_download_page_count();
-  if (!download_page_count) {
-    return false;
-  }
-
-  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          command_processor_.GetVulkanDevice(), download_page_count << page_size_log2(),
-          VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
-          trace_download_buffer_, trace_download_buffer_memory_)) {
-    REXGPU_ERROR(
-        "Shared memory: Failed to create a {} KB GPU-written memory download "
-        "buffer for frame tracing",
-        download_page_count << page_size_log2() >> 10);
-    ResetTraceDownload();
-    return false;
-  }
-
-  Use(Usage::kRead);
-  command_processor_.SubmitBarriers(true);
-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
-
-  size_t download_range_count = trace_download_ranges().size();
-  VkBufferCopy* download_regions = command_buffer.CmdCopyBufferEmplace(
-      buffer_, trace_download_buffer_, uint32_t(download_range_count));
-  VkDeviceSize download_buffer_offset = 0;
-  for (size_t i = 0; i < download_range_count; ++i) {
-    VkBufferCopy& download_region = download_regions[i];
-    const std::pair<uint32_t, uint32_t>& download_range = trace_download_ranges()[i];
-    download_region.srcOffset = download_range.first;
-    download_region.dstOffset = download_buffer_offset;
-    download_region.size = download_range.second;
-    download_buffer_offset += download_range.second;
-  }
-
-  command_processor_.PushBufferMemoryBarrier(
-      trace_download_buffer_, 0, VK_WHOLE_SIZE, VK_PIPELINE_STAGE_TRANSFER_BIT,
-      VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
-
-  return true;
-}
-
-void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
-  if (!trace_download_buffer_memory_) {
-    return;
-  }
-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  void* download_mapping;
-  if (dfn.vkMapMemory(device, trace_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
-                      &download_mapping) == VK_SUCCESS) {
-    uint32_t download_buffer_offset = 0;
-    for (const auto& download_range : trace_download_ranges()) {
-      trace_writer_.WriteMemoryRead(
-          download_range.first, download_range.second,
-          reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
-    }
-    dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
-  } else {
-    REXGPU_ERROR(
-        "Shared memory: Failed to map the GPU-written memory download buffer "
-        "for frame tracing");
-  }
-  ResetTraceDownload();
-}
-
 bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_allocations,
                                                           uint32_t length_allocations) {
   if (!length_allocations) {
@@ -403,8 +330,6 @@ bool VulkanSharedMemory::AllocateSparseHostGpuMemoryRange(uint32_t offset_alloca
     return false;
   }
   buffer_memory_.push_back(memory);
-  command_processor_.native_gpu_diagnostics().RecordAllocation(
-      NativeGpuDiagnostics::Allocation::kMemoryMirror, 0, memory_allocate_info.allocationSize);
 
   VkSparseMemoryBind bind;
   bind.resourceOffset = offset_allocations << host_gpu_memory_sparse_granularity_log2();
@@ -429,12 +354,142 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+  if (DevelopmentStatsEnabled()) {
+    // DEVSTATS (local only)
+    uint64_t rex_pages = 0;
+    for (const auto& rex_range : upload_page_ranges) {
+      rex_pages += rex_range.second;
+    }
+    g_rex_perf_upload_bytes.fetch_add(rex_pages << page_size_log2(), std::memory_order_relaxed);
+    for (const auto& rex_range : upload_page_ranges) {  // DEVSTATS census by 1 MB region
+      const uint64_t lo = uint64_t(rex_range.first) << page_size_log2();
+      const uint64_t hi = uint64_t(rex_range.first + rex_range.second) << page_size_log2();
+      for (uint64_t a = lo; a < hi;) {
+        const uint64_t next = std::min<uint64_t>(hi, (a & ~uint64_t(0xFFFFF)) + 0x100000);
+        g_rex_upload_region_bytes[(a >> 20) & 511].fetch_add(next - a, std::memory_order_relaxed);
+        a = next;
+      }
+    }
+    g_rex_upload_calls.fetch_add(1, std::memory_order_relaxed);
+    g_rex_upload_ranges.fetch_add(upload_page_ranges.size(), std::memory_order_relaxed);
+    // Uploads from guest RAM over the save-thumbnail source (1F34C000+398000),
+    // which only the GPU writes. Counted here, logged from IssueSwap: never log
+    // under this lock.
+    for (const auto& rex_range : upload_page_ranges) {
+      const uint64_t lo = uint64_t(rex_range.first) << page_size_log2();
+      const uint64_t hi = uint64_t(rex_range.first + rex_range.second) << page_size_log2();
+      const uint64_t a = std::max<uint64_t>(lo, 0x1F34C000), b = std::min<uint64_t>(hi, 0x1F6E4000);
+      if (a < b) {
+        g_rex_thumbsrc_uploads.fetch_add(1, std::memory_order_relaxed);
+        g_rex_thumbsrc_upload_bytes.fetch_add(b - a, std::memory_order_relaxed);
+      }
+    }
+  }
+  // Pages no recorded or in-flight GPU work reads: write them straight into
+  // the mapped buffer, no copy command - and so no render pass end.
+  const std::vector<std::pair<uint32_t, uint32_t>>* staged_ranges = &upload_page_ranges;
+  if (buffer_mapping_) {
+    const uint64_t completed = command_processor_.GetCompletedSubmission();
+    staged_upload_ranges_.clear();
+    auto stage = [this](uint32_t page) {
+      if (!staged_upload_ranges_.empty() &&
+          staged_upload_ranges_.back().first + staged_upload_ranges_.back().second == page) {
+        ++staged_upload_ranges_.back().second;
+      } else {
+        staged_upload_ranges_.emplace_back(page, 1);
+      }
+    };
+    // Runs of directly writable pages are made valid and copied as one range -
+    // MakeRangeValid re-protects the pages, a system call each time.
+    uint32_t run_first = 0, run_count = 0;
+    auto flush_run = [&]() {
+      if (!run_count) {
+        return;
+      }
+      const uint32_t offset = run_first << page_size_log2();
+      const uint32_t length = run_count << page_size_log2();
+      MakeRangeValid(offset, length, false);
+      std::memcpy(buffer_mapping_ + offset, memory().TranslatePhysical(offset), length);
+      if (DevelopmentStatsEnabled()) g_rex_direct_upload_bytes.fetch_add(length, std::memory_order_relaxed);  // DEVSTATS
+      run_count = 0;
+    };
+    const uint32_t page_size = uint32_t(1) << page_size_log2();
+    if (page_deferred_slot_.empty()) {
+      page_deferred_slot_.assign(kBufferSize >> page_size_log2(), 0);
+    }
+    for (const auto& range : upload_page_ranges) {
+      for (uint32_t page = range.first; page < range.first + range.second; ++page) {
+        const uint32_t offset = page << page_size_log2();
+        // Earlier submissions still read the old contents, but nothing recorded
+        // in this one has touched the page yet: the copy can go at the very
+        // start of this submission, ahead of every render pass, instead of
+        // ending the current one.
+        uint32_t& slot = page_deferred_slot_[page];
+        const bool touched = PageTouchedInCurrentSubmission(page);
+        // Never compare against the old mapped page to decide whether a
+        // pending prelude snapshot can be changed after a recorded reader.
+        const bool direct = !(slot && touched) &&
+                            PageDirectWritable(page, completed, buffer_mapping_ + offset);
+        if (DevelopmentStatsEnabled()) {
+          extern std::atomic<uint64_t> g_rex_up_why[4];
+          g_rex_up_why[direct ? 0 : slot ? 3 : touched ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+        }
+        const CpuUploadPath path = SelectCpuUploadPath(
+            slot != 0, touched, REXCVAR_GET(vulkan_defer_cpu_uploads), direct);
+        if (path == CpuUploadPath::kDeferred) {
+          if (!slot) {
+            DeferredPage deferred;
+            deferred.page = page;
+            VkDeviceSize size = 0;
+            deferred.mapping = upload_buffer_pool_->RequestPartial(
+                command_processor_.GetCurrentSubmission(), page_size, page_size, deferred.buffer,
+                deferred.offset, size);
+            if (!deferred.mapping || size < page_size) {
+              flush_run();
+              stage(page);
+              continue;
+            }
+            deferred_pages_.push_back(deferred);
+            slot = uint32_t(deferred_pages_.size());
+          }
+          flush_run();
+          MakeRangeValid(offset, page_size, false);
+          std::memcpy(deferred_pages_[slot - 1].mapping, memory().TranslatePhysical(offset),
+                      page_size);
+          if (DevelopmentStatsEnabled()) g_rex_direct_upload_bytes.fetch_add(page_size, std::memory_order_relaxed);  // DEVSTATS
+          continue;
+        }
+        if (path == CpuUploadPath::kDirect) {
+          if (run_count && run_first + run_count == page) {
+            ++run_count;
+          } else {
+            flush_run();
+            run_first = page;
+            run_count = 1;
+          }
+        } else {
+          flush_run();
+          stage(page);
+        }
+      }
+    }
+    flush_run();
+    if (staged_upload_ranges_.empty()) {
+      return true;
+    }
+    for (const auto& range : staged_upload_ranges_) {
+      MarkPagesStagedCopy(range.first, range.second);
+    }
+    staged_ranges = &staged_upload_ranges_;
+  }
+  const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges_staged = *staged_ranges;
+
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
-      std::make_pair(upload_page_ranges.front().first << page_size_log2(),
-                     (upload_page_ranges.back().first + upload_page_ranges.back().second -
-                      upload_page_ranges.front().first)
+      std::make_pair(upload_page_ranges_staged.front().first << page_size_log2(),
+                     (upload_page_ranges_staged.back().first + upload_page_ranges_staged.back().second -
+                      upload_page_ranges_staged.front().first)
                          << page_size_log2()));
   command_processor_.SubmitBarriers(true);
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
@@ -442,30 +497,24 @@ bool VulkanSharedMemory::UploadRanges(
   bool successful = true;
   upload_regions_.clear();
   VkBuffer upload_buffer_previous = VK_NULL_HANDLE;
-  for (auto upload_range : upload_page_ranges) {
+  for (auto upload_range : upload_page_ranges_staged) {
     uint32_t upload_range_start = upload_range.first;
     uint32_t upload_range_length = upload_range.second;
-    trace_writer_.WriteMemoryRead(upload_range_start << page_size_log2(),
-                                  upload_range_length << page_size_log2());
     while (upload_range_length) {
       VkBuffer upload_buffer;
       VkDeviceSize upload_buffer_offset, upload_buffer_size;
-      rex::perf::ScopedCounterTimer pool_timer(rex::perf::CounterId::kUploadPoolUs);
       uint8_t* upload_buffer_mapping = upload_buffer_pool_->RequestPartial(
           submission_current, upload_range_length << page_size_log2(),
           size_t(1) << page_size_log2(), upload_buffer, upload_buffer_offset, upload_buffer_size);
-      pool_timer.Stop();
       if (upload_buffer_mapping == nullptr) {
         REXGPU_ERROR("Shared memory: Failed to get a Vulkan upload buffer");
         successful = false;
         break;
       }
-      {
-        rex::perf::ScopedCounterTimer valid_timer(rex::perf::CounterId::kUploadValidUs);
-        MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
-      }
-      CopyPagesForUpload(upload_range_start, uint32_t(upload_buffer_size >> page_size_log2()),
-                         upload_buffer_mapping);
+      MakeRangeValid(upload_range_start << page_size_log2(), uint32_t(upload_buffer_size), false);
+      std::memcpy(upload_buffer_mapping,
+                  memory().TranslatePhysical(upload_range_start << page_size_log2()),
+                  upload_buffer_size);
       if (upload_buffer_previous != upload_buffer && !upload_regions_.empty()) {
         assert_true(upload_buffer_previous != VK_NULL_HANDLE);
         command_buffer.CmdVkCopyBuffer(upload_buffer_previous, buffer_,
@@ -521,15 +570,6 @@ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_
     default:
       assert_unhandled_case(usage);
   }
-}
-
-void VulkanSharedMemory::ResetTraceDownload() {
-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
-  const VkDevice device = vulkan_device->device();
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, trace_download_buffer_);
-  ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device, trace_download_buffer_memory_);
-  ReleaseTraceDownloadRanges();
 }
 
 }  // namespace rex::graphics::vulkan

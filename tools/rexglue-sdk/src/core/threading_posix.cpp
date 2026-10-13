@@ -13,6 +13,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <signal.h>
 
+#include <algorithm>
 #include <atomic>
 #include <array>
 #include <cerrno>
@@ -21,10 +22,16 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <deque>
 #include <limits>
 #include <memory>
+#include <vector>
 
 #include <pthread.h>
 #include <semaphore.h>
-#include <sys/eventfd.h>
+
+#if defined(__APPLE__)
+#include <cstdio>
+
+#include <fcntl.h>
+#endif
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -41,7 +48,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <dlfcn.h>
 
 #include <rex/main_android.h>
-#include <rex/string/util.h>
+#include <rex/string.h>
 #endif
 
 #if REX_PLATFORM_LINUX
@@ -110,13 +117,39 @@ enum class SignalType {
 };
 
 int GetSystemSignal(SignalType num) {
+#if defined(__APPLE__)
+  // macOS has no realtime signals (SIGRTMIN..SIGRTMAX); map the runtime's
+  // signals onto the two user-defined signals.
+  switch (num) {
+    case SignalType::kThreadSuspend:
+      return SIGUSR1;
+    case SignalType::kThreadUserCallback:
+      return SIGUSR2;
+    default:
+      assert_unhandled_case(num);
+      return SIGUSR1;
+  }
+#else
   auto result = SIGRTMIN + static_cast<int>(num);
   assert_true(result < SIGRTMAX);
   return result;
+#endif
 }
 
 SignalType GetSystemSignalType(int num) {
+#if defined(__APPLE__)
+  switch (num) {
+    case SIGUSR1:
+      return SignalType::kThreadSuspend;
+    case SIGUSR2:
+      return SignalType::kThreadUserCallback;
+    default:
+      assert_unhandled_case(num);
+      return SignalType::kThreadSuspend;
+  }
+#else
   return static_cast<SignalType>(num - SIGRTMIN);
+#endif
 }
 
 std::array<std::atomic<bool>, static_cast<size_t>(SignalType::k_Count)> signal_handler_installed =
@@ -145,7 +178,11 @@ void EnableAffinityConfiguration() {}
 // uint64_t ticks() { return mach_absolute_time(); }
 
 uint32_t current_thread_system_id() {
+#if defined(__APPLE__)
+  return static_cast<uint32_t>(pthread_mach_thread_np(pthread_self()));
+#else
   return static_cast<uint32_t>(syscall(SYS_gettid));
+#endif
 }
 
 void MaybeYield() {
@@ -213,11 +250,30 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
          0;
 }
 
+#if defined(__APPLE__)
+// macOS does not implement unnamed POSIX semaphores (sem_init fails with
+// ENOSYS). Emulate one with a named semaphore that is unlinked immediately
+// after creation: the name is released but the descriptor stays valid until
+// sem_close, and sem_wait/sem_post remain async-signal-safe (needed because
+// WaitSuspended() runs from a signal handler).
+static sem_t* RexCreateAnonymousSemaphore() {
+  static std::atomic<uint64_t> counter{0};
+  char name[64];
+  std::snprintf(name, sizeof(name), "/rexsusp_%d_%llu", static_cast<int>(getpid()),
+                static_cast<unsigned long long>(counter.fetch_add(1, std::memory_order_relaxed)));
+  sem_t* sem = sem_open(name, O_CREAT | O_EXCL, 0600, 0);
+  if (sem != SEM_FAILED) {
+    sem_unlink(name);
+  }
+  return sem;
+}
+#endif  // __APPLE__
+
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if REX_PLATFORM_LINUX
-    // Use robust mutexes so waits can recover if owner thread terminates.
+#if REX_PLATFORM_GNU_LINUX
+    // Use robust mutexes (glibc only; bionic has no PTHREAD_MUTEX_ROBUST) so waits can recover if owner thread terminates.
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr) == 0) {
       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
@@ -233,26 +289,10 @@ class PosixConditionBase {
   virtual ~PosixConditionBase() = default;
   virtual bool Signal() = 0;
 
-  // Locks mutex_, recovering it if its owner died while holding it.
-  std::unique_lock<std::mutex> LockRobust() {
-#if REX_PLATFORM_LINUX
-    auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
-    int lock_result = pthread_mutex_lock(native_mutex);
-    if (lock_result == EOWNERDEAD) {
-      pthread_mutex_consistent(native_mutex);
-    } else if (lock_result != 0) {
-      return std::unique_lock<std::mutex>();
-    }
-    return std::unique_lock<std::mutex>(mutex_, std::adopt_lock);
-#else
-    return std::unique_lock<std::mutex>(mutex_);
-#endif
-  }
-
   WaitResult Wait(std::chrono::milliseconds timeout) {
     bool executed;
     auto predicate = [this] { return this->signaled(); };
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_GNU_LINUX
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
@@ -292,128 +332,131 @@ class PosixConditionBase {
       return std::make_pair(result, 0);
     }
 
-    // Multi-waits used to poll: check every handle, sleep 1 ms, repeat -- and
-    // once less than a millisecond of the timeout was left the sleep rounded
-    // down to zero and the loop spun flat out. The Audio Worker and every
-    // guest KeWaitForMultipleObjects went through it; on the title screen the
-    // Audio Worker burnt half a core here, power a Steam Deck's GPU then
-    // lacked, and every wake-up came up to 1 ms late. Now every state change
-    // that can satisfy a wait bumps the multi-wait epoch and wakes the
-    // multi-waiters (NotifyMultiWaiters), which sleep until that happens.
-    const bool infinite_timeout = timeout == std::chrono::milliseconds::max();
-    auto end_time = std::chrono::steady_clock::time_point::max();
-    if (!infinite_timeout) {
-      end_time = std::chrono::steady_clock::now() + timeout;
-    }
+    auto start_time = std::chrono::steady_clock::now();
+    auto end_time = (timeout == std::chrono::milliseconds::max())
+                        ? std::chrono::steady_clock::time_point::max()
+                        : start_time + timeout;
 
-    // Registered before the first check, so a signaler that changes a handle
-    // after that check is guaranteed to see this waiter and notify.
-    MultiWaitState& multi_wait = multi_wait_state();
-    multi_wait.waiters.fetch_add(1, std::memory_order_seq_cst);
-    struct WaiterRegistration {
-      MultiWaitState& state;
-      ~WaiterRegistration() { state.waiters.fetch_sub(1, std::memory_order_seq_cst); }
-    } waiter_registration{multi_wait};
-
-    std::vector<std::unique_lock<std::mutex>> locks;
-    if (wait_all) {
-      locks.reserve(handles.size());
+    // Park on a private condition variable that every handle's signal
+    // notifies, instead of polling the handles in 1 ms sleeps. That polling
+    // made every multi-object wait return at least a millisecond late - long
+    // enough to starve the audio callback, which waits this way per frame.
+    // Shared with the handles, so a thread that dies mid-wait without
+    // unregistering leaves them a valid object to notify.
+    auto waiter = std::make_shared<MultiWaiter>();
+    for (PosixConditionBase* handle : handles) {
+      std::lock_guard<std::mutex> lock(handle->mutex_);
+      handle->multi_waiters_.push_back(waiter);
     }
+    // Declared before the loop's handle locks, so it runs after they are
+    // released on every return path.
+    struct Unregister {
+      std::vector<PosixConditionBase*>& handles;
+      MultiWaiter* waiter;
+      ~Unregister() {
+        for (PosixConditionBase* handle : handles) {
+          std::lock_guard<std::mutex> lock(handle->mutex_);
+          auto& waiters = handle->multi_waiters_;
+          auto it = std::find_if(waiters.begin(), waiters.end(),
+                                 [this](const auto& entry) { return entry.get() == waiter; });
+          if (it != waiters.end()) {
+            waiters.erase(it);
+          }
+        }
+      }
+    } unregister{handles, waiter.get()};
 
     while (true) {
-      // Read before checking the handles: a change after the check moves it.
-      uint64_t epoch = multi_wait.epoch.load(std::memory_order_seq_cst);
+      // Clear before checking the handles: a signal after the check sets it
+      // again, so the wait below can't miss it.
+      {
+        std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+        waiter->notified = false;
+      }
 
-      if (!wait_all) {
-        // One handle locked at a time, so a plain blocking lock cannot
-        // deadlock against other waiters or signalers.
-        for (size_t i = 0; i < handles.size(); ++i) {
-          std::unique_lock<std::mutex> lock = handles[i]->LockRobust();
-          if (!lock.owns_lock()) {
-            return std::make_pair<WaitResult, size_t>(WaitResult::kFailed, 0);
+      size_t first_signaled = std::numeric_limits<size_t>::max();
+      bool condition_met = false;
+      bool all_locked = true;
+
+      std::vector<std::unique_lock<std::mutex>> locks;
+      locks.reserve(handles.size());
+
+      for (size_t i = 0; i < handles.size(); ++i) {
+#if REX_PLATFORM_GNU_LINUX
+        auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
+        int result = pthread_mutex_trylock(native_mutex);
+        if (result == 0 || result == EOWNERDEAD) {
+          if (result == EOWNERDEAD) {
+            pthread_mutex_consistent(native_mutex);
           }
-          if (handles[i]->signaled()) {
-            handles[i]->post_execution();
-            return std::make_pair(WaitResult::kSuccess, i);
-          }
+          locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
+        } else {
+          all_locked = false;
+          break;
         }
-      } else {
-        // All handles have to be checked and taken atomically, so hold every
-        // lock at once, backing off on contention instead of deadlocking.
-        bool all_locked = true;
-        for (size_t i = 0; i < handles.size(); ++i) {
-#if REX_PLATFORM_LINUX
-          auto native_mutex = static_cast<pthread_mutex_t*>(handles[i]->mutex_.native_handle());
-          int result = pthread_mutex_trylock(native_mutex);
-          if (result == 0 || result == EOWNERDEAD) {
-            if (result == EOWNERDEAD) {
-              pthread_mutex_consistent(native_mutex);
-            }
-            locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
-          } else {
-            all_locked = false;
-            break;
-          }
 #else
-          locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
-          if (!locks.back().owns_lock()) {
-            locks.pop_back();
-            all_locked = false;
-            break;
-          }
+        locks.emplace_back(handles[i]->mutex_, std::try_to_lock);
+        if (!locks.back().owns_lock()) {
+          all_locked = false;
+          break;
+        }
 #endif
-        }
-        if (!all_locked) {
-          locks.clear();
-          std::this_thread::sleep_for(std::chrono::microseconds(50));
-          if (!infinite_timeout && std::chrono::steady_clock::now() >= end_time) {
-            return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
-          }
-          continue;
-        }
+      }
+
+      if (!all_locked) {
+        locks.clear();
+        std::this_thread::yield();
+        continue;
+      }
+
+      if (wait_all) {
         bool all_signaled = true;
         for (size_t i = 0; i < handles.size(); ++i) {
           if (!handles[i]->signaled()) {
             all_signaled = false;
             break;
           }
+          if (first_signaled == std::numeric_limits<size_t>::max()) {
+            first_signaled = i;
+          }
         }
-        if (all_signaled) {
+        condition_met = all_signaled;
+      } else {
+        for (size_t i = 0; i < handles.size(); ++i) {
+          if (handles[i]->signaled()) {
+            first_signaled = i;
+            condition_met = true;
+            break;
+          }
+        }
+      }
+
+      if (condition_met) {
+        if (wait_all) {
           for (size_t i = 0; i < handles.size(); ++i) {
             handles[i]->post_execution();
           }
-          locks.clear();
-          return std::make_pair<WaitResult, size_t>(WaitResult::kSuccess, 0);
+        } else {
+          handles[first_signaled]->post_execution();
         }
-        locks.clear();
+        return std::make_pair(WaitResult::kSuccess, first_signaled);
       }
 
-      // Nothing to take yet: sleep until some handle changes state.
-      std::unique_lock<std::mutex> wait_lock(multi_wait.mutex);
-      auto changed = [&multi_wait, epoch] {
-        return multi_wait.epoch.load(std::memory_order_seq_cst) != epoch;
-      };
-      if (infinite_timeout) {
-        multi_wait.cond.wait(wait_lock, changed);
-      } else if (!multi_wait.cond.wait_until(wait_lock, end_time, changed)) {
+      locks.clear();
+
+      auto now = std::chrono::steady_clock::now();
+      if (now >= end_time) {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
-    }
-  }
 
-  // Wakes the threads in WaitMultiple after a state change that can satisfy
-  // a wait (a signal, a release, a thread exit). Call it after releasing
-  // mutex_.
-  static void NotifyMultiWaiters() {
-    MultiWaitState& multi_wait = multi_wait_state();
-    if (!multi_wait.waiters.load(std::memory_order_seq_cst)) {
-      return;
+      // The periodic re-check is only a safety net; signals wake the waiter.
+      auto wake_time = now + std::chrono::milliseconds(100);
+      if (end_time < wake_time) {
+        wake_time = end_time;
+      }
+      std::unique_lock<std::mutex> waiter_lock(waiter->mutex);
+      waiter->cond.wait_until(waiter_lock, wake_time, [&waiter] { return waiter->notified; });
     }
-    {
-      std::lock_guard<std::mutex> lock(multi_wait.mutex);
-      multi_wait.epoch.fetch_add(1, std::memory_order_seq_cst);
-    }
-    multi_wait.cond.notify_all();
   }
 
   virtual void* native_handle() const {
@@ -421,26 +464,31 @@ class PosixConditionBase {
   }
 
  protected:
+  // A thread in WaitMultiple sleeps on its own condition variable and is
+  // registered with every handle it waits on, so a signal on any of them
+  // wakes it immediately.
+  struct MultiWaiter {
+    std::mutex mutex;
+    std::condition_variable cond;
+    bool notified = false;
+  };
+
+  // Wakes Wait() and WaitMultiple() callers. Call with mutex_ held, after a
+  // change that can satisfy a wait.
+  void NotifyWaitersLocked() {
+    cond_.notify_all();
+    for (const std::shared_ptr<MultiWaiter>& waiter : multi_waiters_) {
+      std::lock_guard<std::mutex> waiter_lock(waiter->mutex);
+      waiter->notified = true;
+      waiter->cond.notify_one();
+    }
+  }
+
   inline virtual bool signaled() const = 0;
   inline virtual void post_execution() = 0;
   std::condition_variable cond_;
   std::mutex mutex_;
-
- private:
-  // Threads inside WaitMultiple, and the counter NotifyMultiWaiters bumps for
-  // them (see WaitMultiple). Never destroyed: threads may still wait or signal
-  // while the process exits, and destroying a condition variable that still
-  // has waiters blocks forever.
-  struct MultiWaitState {
-    std::atomic<uint32_t> waiters{0};
-    std::atomic<uint64_t> epoch{0};
-    std::mutex mutex;
-    std::condition_variable cond;
-  };
-  static MultiWaitState& multi_wait_state() {
-    static MultiWaitState* state = new MultiWaitState();
-    return *state;
-  }
+  std::vector<std::shared_ptr<MultiWaiter>> multi_waiters_;  // Guarded by mutex_.
 };
 
 // There really is no native POSIX handle for a single wait/signal construct
@@ -458,12 +506,9 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
-    {
-      auto lock = std::unique_lock<std::mutex>(mutex_);
-      signal_ = true;
-      cond_.notify_all();
-    }
-    NotifyMultiWaiters();
+    auto lock = std::unique_lock<std::mutex>(mutex_);
+    signal_ = true;
+    NotifyWaitersLocked();
     return true;
   }
 
@@ -492,18 +537,15 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   bool Signal() override { return Release(1, nullptr); }
 
   bool Release(uint32_t release_count, int* out_previous_count) {
-    {
-      auto lock = std::unique_lock<std::mutex>(mutex_);
-      if (release_count > maximum_count_ - count_) {
-        return false;
-      }
-      if (out_previous_count) {
-        *out_previous_count = count_;
-      }
-      count_ += release_count;
-      cond_.notify_all();
+    auto lock = std::unique_lock<std::mutex>(mutex_);
+    if (release_count > maximum_count_ - count_) {
+      return false;
     }
-    NotifyMultiWaiters();
+    if (out_previous_count) {
+      *out_previous_count = count_;
+    }
+    count_ += release_count;
+    NotifyWaitersLocked();
     return true;
   }
 
@@ -531,18 +573,11 @@ class PosixCondition<Mutant> : public PosixConditionBase {
 
   bool Release() {
     if (owner_ == std::this_thread::get_id() && count_ > 0) {
-      bool freed;
-      {
-        auto lock = std::unique_lock<std::mutex>(mutex_);
-        --count_;
-        // Free to be acquired by another thread
-        freed = count_ == 0;
-        if (freed) {
-          cond_.notify_all();
-        }
-      }
-      if (freed) {
-        NotifyMultiWaiters();
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      --count_;
+      // Free to be acquired by another thread
+      if (count_ == 0) {
+        NotifyWaitersLocked();
       }
       return true;
     }
@@ -572,12 +607,9 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      signal_ = true;
-      cond_.notify_all();
-    }
-    NotifyMultiWaiters();
+    std::lock_guard<std::mutex> lock(mutex_);
+    signal_ = true;
+    NotifyWaitersLocked();
     return true;
   }
 
@@ -664,7 +696,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
         exit_code_(0),
         state_(State::kUninitialized),
         suspend_count_(0) {
+#if defined(__APPLE__)
+    suspend_sem_ = RexCreateAnonymousSemaphore();
+#else
     sem_init(&suspend_sem_, 0, 0);
+#endif
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -706,7 +742,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
         exit_code_(0),
         state_(State::kRunning),
         suspend_count_(0) {
+#if defined(__APPLE__)
+    suspend_sem_ = RexCreateAnonymousSemaphore();
+#else
     sem_init(&suspend_sem_, 0, 0);
+#endif
 #if REX_PLATFORM_ANDROID
     android_pre_api_26_name_[0] = '\0';
 #endif
@@ -735,7 +775,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
         }
       } else {
         std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
-        std::strcpy(result.data(), android_pre_api_26_name_);
+        rex::string::copy_truncating(result.data(), android_pre_api_26_name_, result.size());
       }
 #else
       if (pthread_getname_np(thread_, result.data(), result.size() - 1) != 0) {
@@ -750,7 +790,14 @@ class PosixCondition<Thread> : public PosixConditionBase {
     WaitStarted();
     std::unique_lock<std::mutex> lock(state_mutex_);
     if (state_ != State::kUninitialized && state_ != State::kFinished) {
+#if defined(__APPLE__)
+      // macOS pthread_setname_np() only names the calling thread.
+      if (pthread_equal(thread_, pthread_self())) {
+        pthread_setname_np(std::string(name).c_str());
+      }
+#else
       pthread_setname_np(thread_, std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
       SetAndroidPreApi26Name(name);
 #endif
@@ -763,15 +810,28 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
     std::lock_guard<std::mutex> lock(android_pre_api_26_name_mutex_);
-    rex::string::util_copy_truncating(android_pre_api_26_name_, name,
-                                      rex::countof(android_pre_api_26_name_));
+    rex::string::copy_truncating(android_pre_api_26_name_, name,
+                                 rex::countof(android_pre_api_26_name_));
   }
 #endif
 
+#if defined(__APPLE__)
+  uint32_t system_id() const { return static_cast<uint32_t>(pthread_mach_thread_np(thread_)); }
+#else
   uint32_t system_id() const { return static_cast<uint32_t>(thread_); }
+#endif
 
   uint64_t affinity_mask() {
     WaitStarted();
+#if defined(__APPLE__)
+    // macOS doesn't expose Linux-style pthread affinity masks; report every
+    // logical processor as available.
+    auto cpu_count = std::min<uint32_t>(logical_processor_count(), 64);
+    if (cpu_count == 64) {
+      return std::numeric_limits<uint64_t>::max();
+    }
+    return (uint64_t(1) << cpu_count) - 1;
+#else
     cpu_set_t cpu_set;
 #if REX_PLATFORM_ANDROID
     if (sched_getaffinity(pthread_gettid_np(thread_), sizeof(cpu_set_t), &cpu_set) != 0) {
@@ -789,10 +849,16 @@ class PosixCondition<Thread> : public PosixConditionBase {
       result |= set << i;
     }
     return result;
+#endif
   }
 
   void set_affinity_mask(uint64_t mask) {
     WaitStarted();
+#if defined(__APPLE__)
+    // macOS doesn't expose Linux-style pthread affinity masks; keep this a
+    // no-op so higher layers can build and run.
+    (void)mask;
+#else
     cpu_set_t cpu_set;
     CPU_ZERO(&cpu_set);
     for (auto i = 0u; i < 64; i++) {
@@ -808,6 +874,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (pthread_setaffinity_np(thread_, sizeof(cpu_set_t), &cpu_set) != 0) {
       assert_always();
     }
+#endif
 #endif
   }
 
@@ -860,6 +927,11 @@ class PosixCondition<Thread> : public PosixConditionBase {
       return;
     }
 
+#if defined(__APPLE__)
+    // macOS has no sigqueue/pthread_sigqueue; pthread_kill delivers the signal
+    // without the sigval payload.
+    int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadUserCallback));
+#else
     sigval value{};
     value.sival_ptr = this;
 #if REX_PLATFORM_ANDROID
@@ -867,6 +939,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
                           GetSystemSignal(SignalType::kThreadUserCallback), value);
 #else
     int result = pthread_sigqueue(thread_, GetSystemSignal(SignalType::kThreadUserCallback), value);
+#endif
 #endif
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
@@ -911,7 +984,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (suspend_count_ == 0 && state_ == State::kSuspended) {
       state_ = State::kRunning;
       // Async-signal-safe wakeup for WaitSuspended() from signal handler path.
-      sem_post(&suspend_sem_);
+      sem_post(suspend_sem_ptr());
     }
     state_signal_.notify_all();
     return true;
@@ -964,9 +1037,8 @@ class PosixCondition<Thread> : public PosixConditionBase {
 
       exit_code_ = exit_code;
       signaled_ = true;
-      cond_.notify_all();
+      NotifyWaitersLocked();
     }
-    NotifyMultiWaiters();
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
     } else {
@@ -991,7 +1063,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
   void WaitSuspended() {
     int ret;
     do {
-      ret = sem_wait(&suspend_sem_);
+      ret = sem_wait(suspend_sem_ptr());
     } while (ret == -1 && errno == EINTR);
   }
 
@@ -1004,14 +1076,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (thread_) {
       pthread_join(thread_, nullptr);
     }
+#if defined(__APPLE__)
+    if (suspend_sem_ != SEM_FAILED) {
+      sem_close(suspend_sem_);
+      suspend_sem_ = SEM_FAILED;
+    }
+#else
     sem_destroy(&suspend_sem_);
+#endif
   }
   pthread_t thread_;
   bool signaled_;
   int exit_code_;
   State state_;             // Protected by state_mutex_
   uint32_t suspend_count_;  // Protected by state_mutex_
+#if defined(__APPLE__)
+  sem_t* suspend_sem_ = SEM_FAILED;
+  sem_t* suspend_sem_ptr() { return suspend_sem_; }
+#else
   sem_t suspend_sem_;
+  sem_t* suspend_sem_ptr() { return &suspend_sem_; }
+#endif
   mutable std::mutex state_mutex_;
   mutable std::mutex callback_mutex_;
   mutable std::condition_variable state_signal_;
@@ -1394,17 +1479,21 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
   {
     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
     thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
-    // The suspend count must change together with the state. Resume() may run
-    // as soon as WaitStarted() sees the new state, and with a zero count it
-    // does nothing, which left the thread suspended forever.
+    // Arm the suspend counter in the SAME critical section that publishes the
+    // started state. Resume() only waits for state_ != kUninitialized, so if it
+    // observed the state published here while suspend_count_ was still 0 it
+    // would take the "not suspended" path, return false without decrementing,
+    // and the wait below would then never be satisfied.
     if (create_suspended) {
       thread->handle_.suspend_count_ = 1;
     }
     thread->handle_.state_signal_.notify_all();
-    if (create_suspended) {
-      thread->handle_.state_signal_.wait(lock,
-                                         [thread] { return thread->handle_.suspend_count_ == 0; });
-    }
+  }
+
+  if (create_suspended) {
+    std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+    thread->handle_.state_signal_.wait(lock,
+                                       [thread] { return thread->handle_.suspend_count_ == 0; });
   }
 
   start_routine();
@@ -1418,9 +1507,8 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     std::unique_lock<std::mutex> lock(thread->handle_.mutex_);
     thread->handle_.exit_code_ = 0;
     thread->handle_.signaled_ = true;
-    thread->handle_.cond_.notify_all();
+    thread->handle_.NotifyWaitersLocked();
   }
-  PosixConditionBase::NotifyMultiWaiters();
 
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;
@@ -1480,7 +1568,11 @@ void Thread::Exit(int exit_code) {
 }
 
 void set_current_thread_name(const std::string_view name) {
+#if defined(__APPLE__)
+  pthread_setname_np(std::string(name).c_str());
+#else
   pthread_setname_np(pthread_self(), std::string(name).c_str());
+#endif
 #if REX_PLATFORM_ANDROID
   if (!android_pthread_getname_np_ && current_thread_) {
     current_thread_->condition().SetAndroidPreApi26Name(name);

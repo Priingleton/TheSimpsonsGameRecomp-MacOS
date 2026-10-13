@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include <unordered_set>
+
 #include <memory>
 #include <string>
 
@@ -77,13 +79,14 @@ class DiscImageDevice : public Device {
     size_t root_sector;  // Offset (sector) of root.
     size_t root_offset;  // Offset (bytes) of root.
     size_t root_size;    // Size (bytes) of root.
+    std::unordered_set<size_t> visited;
   } ParseState;
 
   Error Verify(ParseState* state);
   bool VerifyMagic(ParseState* state, size_t offset);
   Error ReadAllEntries(ParseState* state, const uint8_t* root_buffer);
   bool ReadEntry(ParseState* state, const uint8_t* buffer, uint16_t entry_ordinal,
-                 DiscImageEntry* parent);
+                 DiscImageEntry* parent, size_t table_size, size_t depth = 0);
 };
 
 }  // namespace rex::filesystem

@@ -11,7 +11,6 @@
  */
 
 #include <algorithm>
-#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <set>
@@ -676,20 +675,10 @@ class Shader {
     std::string message;
   };
 
-  // Fetch index derived before control flow: (index + c[offset]) * c[scale].
-  // Constants are float components, checked at the draw for exact integer
-  // addition and power-of-two scaling.
-  struct VertexIndexExpression {
-    bool valid = false;
-    uint32_t offset_constant = UINT32_MAX;
-    uint32_t scale_constant = UINT32_MAX;
-  };
-
   struct VertexBinding {
     struct Attribute {
       // Fetch instruction with all parameters.
       ParsedVertexFetchInstruction fetch_instr;
-      VertexIndexExpression index_expression;
     };
 
     // Index within the vertex binding listing.
@@ -804,16 +793,6 @@ class Shader {
       host_disassembly_ = std::move(disassembly);
     }
 
-    // Ahead-of-time cache injection: installs an externally compiled binary
-    // as this translation's result, skipping the runtime translator. The
-    // binary must have been produced for exactly this (ucode, modification)
-    // pair by the same translator revision.
-    void InstallPrecompiledBinary(std::vector<uint8_t> binary) {
-      translated_binary_ = std::move(binary);
-      is_translated_ = true;
-      is_valid_ = true;
-    }
-
     // For dumping after translation. Dumps the shader's translated code, and,
     // if available, translated disassembly, to files in the given directory
     // based on ucode hash. Returns {binary path, disassembly path if written}.
@@ -869,10 +848,6 @@ class Shader {
 
   // All vertex bindings used in the shader.
   const std::vector<VertexBinding>& vertex_bindings() const { return vertex_bindings_; }
-
-  // Vertex fetches precede control flow and use proved input-index
-  // expressions. Their constants and buffer bounds are checked at the draw.
-  bool has_static_vertex_addresses() const { return has_static_vertex_addresses_; }
 
   // All texture bindings used in the shader.
   const std::vector<TextureBinding>& texture_bindings() const { return texture_bindings_; }
@@ -1026,10 +1001,6 @@ class Shader {
   // translation modifications in this case), also some info needed for drawing
   // is collected during the ucode analysis.
   bool is_ucode_analyzed_ = false;
-  bool has_static_vertex_addresses_ = true;
-  std::array<VertexIndexExpression, 64 * 4> vertex_index_registers_{};
-  VertexIndexExpression previous_vfetch_index_expression_;
-  uint32_t static_vertex_fetch_cf_bound_ = UINT32_MAX;
 
   std::string ucode_disassembly_;
   std::vector<VertexBinding> vertex_bindings_;
@@ -1076,9 +1047,6 @@ class Shader {
   void GatherAluInstructionInformation(const ucode::AluInstruction& op, uint32_t exec_cf_index,
                                        string::StringBuffer& ucode_disasm_buffer);
   void GatherOperandInformation(const InstructionOperand& operand);
-  VertexIndexExpression GetVertexIndexExpression(const InstructionOperand& operand,
-                                                 uint32_t component) const;
-  void InvalidateVertexIndexRegisters(const InstructionResult& result);
   void GatherFetchResultInformation(const InstructionResult& result);
   void GatherAluResultInformation(const InstructionResult& result, uint32_t exec_cf_index);
 };

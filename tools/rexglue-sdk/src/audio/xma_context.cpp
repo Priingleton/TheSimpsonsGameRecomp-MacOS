@@ -13,12 +13,12 @@
 #include <cstring>
 
 #include <atomic>
-
 #include <rex/audio/xma/context.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/audio/xma/helpers.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/development_stats.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/platform.h>
 #include <rex/stream.h>
@@ -100,11 +100,6 @@ bool XmaContext::Work() {
   }
 
   std::lock_guard<std::mutex> lock(lock_);
-  // A synchronous kick or cancellation may finish while we wait for the
-  // context lock. Only the caller that still owns enabled work may decode.
-  if (!is_allocated() || !is_enabled()) {
-    return false;
-  }
   set_is_enabled(false);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
@@ -193,6 +188,26 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
   data->output_buffer_read_offset = 0;
   data->output_buffer_write_offset = 0;
 
+  ResetDecoderState();
+}
+
+void XmaContext::ResetDecoderState() {
+  // A freed or re-initialized context is a new logical stream, so the previous
+  // wave's MDCT overlap-add tail must not survive into frame 0 of the next one.
+  // avcodec_flush_buffers() cannot drop it: ff_xmaframes_decoder declares no
+  // flush callback, so the call never reaches the code clearing channel[].out.
+  // Invalidating the cached format makes PrepareDecoder reopen the codec on the
+  // next decode, which does discard the history.
+  if (av_context_) {
+    av_context_->sample_rate = 0;
+    av_context_->channels = 0;
+  }
+  raw_frame_.fill(0);
+  decoded_frame_.fill(0);
+  carry_frame_.fill(0);
+  carry_valid_ = false;
+  pending_output_limit_ = 0;
+  pending_start_skip_ = 0;
   current_frame_remaining_subframes_ = 0;
   loop_frame_output_limit_ = 0;
   loop_start_skip_pending_ = false;
@@ -208,6 +223,7 @@ void XmaContext::Release() {
   assert_true(is_allocated());
 
   set_is_allocated(false);
+  ResetDecoderState();
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   std::memset(context_ptr, 0, sizeof(XMA_CONTEXT_DATA));
 }
@@ -385,39 +401,31 @@ kPacketInfo XmaContext::GetPacketInfo(uint8_t* packet, uint32_t frame_offset) {
 
 void XmaContext::StoreContextMerged(const XMA_CONTEXT_DATA& data,
                                     const XMA_CONTEXT_DATA& initial_data, uint8_t* context_ptr) {
-  uint32_t mask = 31u << 27;
-  uint32_t value = uint32_t(data.output_buffer_write_offset) << 27;
-  if (data.loop_count != initial_data.loop_count) {
-    mask |= 255u << 12;
-    value |= uint32_t(data.loop_count) << 12;
-  }
+  XMA_CONTEXT_DATA fresh(context_ptr);
+
+  fresh.loop_count = data.loop_count;
+  fresh.output_buffer_write_offset = data.output_buffer_write_offset;
   if (initial_data.input_buffer_0_valid && !data.input_buffer_0_valid) {
-    mask |= 1u << 20;
+    fresh.input_buffer_0_valid = 0;
   }
   if (initial_data.input_buffer_1_valid && !data.input_buffer_1_valid) {
-    mask |= 1u << 21;
+    fresh.input_buffer_1_valid = 0;
   }
-  // Never write the consumer's read offset (word 9) or resource pointers.
-  // The mixer can advance while a native decode is still producing samples.
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 0, mask, value);
+
   if (initial_data.output_buffer_valid && !data.output_buffer_valid) {
-    XMA_CONTEXT_DATA::UpdateWord(context_ptr, 1, 1u << 31, 0);
+    fresh.output_buffer_valid = 0;
   }
-  mask = 0;
-  value = 0;
-  if (data.input_buffer_read_offset != initial_data.input_buffer_read_offset) {
-    mask |= 0x03FFFFFFu;
-    value |= uint32_t(data.input_buffer_read_offset);
-  }
-  if (data.error_status != initial_data.error_status) {
-    mask |= 31u << 26;
-    value |= uint32_t(data.error_status) << 26;
-  }
-  XMA_CONTEXT_DATA::UpdateWord(context_ptr, 2, mask, value);
-  if (data.current_buffer != initial_data.current_buffer) {
-    XMA_CONTEXT_DATA::UpdateWord(context_ptr, 4, 1u << 31, uint32_t(data.current_buffer) << 31);
-  }
+
+  fresh.input_buffer_read_offset = data.input_buffer_read_offset;
+  fresh.error_status = data.error_status;
+  fresh.current_buffer = data.current_buffer;
+  fresh.output_buffer_read_offset = data.output_buffer_read_offset;
+
+  fresh.Store(context_ptr);
 }
+
+// DEVSTATS (local only): decoded PCM written to guest output buffers.
+std::atomic<uint64_t> g_rex_xma_out_bytes{0};
 
 void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* data) {
   if (!current_frame_remaining_subframes_) {
@@ -456,6 +464,10 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
 
   output_rb->Write(raw_frame_.data() + (kOutputBytesPerBlock * raw_frame_read_offset),
                    subframes_to_write * kOutputBytesPerBlock);
+  if (rex::AudioDevelopmentStatsEnabled()) {
+    g_rex_xma_out_bytes.fetch_add(uint64_t(subframes_to_write) * kOutputBytesPerBlock,
+                                 std::memory_order_relaxed);
+  }
 
   const int8_t headroom = (current_frame_remaining_subframes_ - subframes_to_write == 0)
                               ? data->output_buffer_padding
@@ -467,17 +479,6 @@ void XmaContext::Consume(memory::RingBuffer* output_rb, const XMA_CONTEXT_DATA* 
 
 int XmaContext::PrepareDecoder(int sample_rate, bool is_two_channel) {
   sample_rate = GetSampleRate(sample_rate);
-  // HAND PATCH DIAGNOSTIC: in-game audio is crunchy/slowed while menu audio
-  // is fine -- log per-context rates to see if low-rate voices are involved.
-  {
-    static std::atomic<uint32_t> hp_counts[4]{};
-    int hp_idx = sample_rate == 24000 ? 0 : sample_rate == 32000 ? 1 : sample_rate == 44100 ? 2 : 3;
-    uint32_t hp_n = ++hp_counts[hp_idx];
-    if ((hp_n & (hp_n - 1)) == 0) {  // powers of two only
-      REXAPU_WARN("[XMA-DIAG] PrepareDecoder rate={} (count {}) two_ch={}", sample_rate, hp_n,
-                  is_two_channel);
-    }
-  }
 
   uint32_t channels = is_two_channel ? 2 : 1;
   if (av_context_->sample_rate != sample_rate ||
@@ -555,14 +556,13 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
 
   input_buffer_.fill(0);
 
-  // Detect loop end frame before UpdateLoopStatus resets the offset.
+  // Loop-end frame: decode it here (output limited to loop_subframe_end),
+  // jump to loop_start afterwards in the next-offset step.
   bool is_loop_end_frame = false;
   if (data->loop_count > 0) {
     const uint32_t loop_end = std::max(kBitsPerPacketHeader, data->loop_end);
     is_loop_end_frame = (data->input_buffer_read_offset == loop_end);
   }
-
-  UpdateLoopStatus(data);
 
   if (!data->output_buffer_block_count) {
     REXAPU_ERROR("XmaContext {}: Error - Received 0 for output_buffer_block_count!", id());
@@ -667,33 +667,63 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
   const uint32_t padding_start =
       static_cast<uint8_t>(stream.Copy(xma_frame_.data() + 1, packet_info.current_frame_size_));
 
-  raw_frame_.fill(0);
+  decoded_frame_.fill(0);
 
-  PrepareDecoder(data->sample_rate, bool(data->is_stereo));
+  if (PrepareDecoder(data->sample_rate, bool(data->is_stereo)) == 1) {
+    // Reopening the codec restarts its output; the carried tail belongs to the
+    // old stream.
+    carry_valid_ = false;
+  }
   PreparePacket(packet_info.current_frame_size_, padding_start);
-  if (DecodePacket(av_context_, av_packet_, av_frame_)) {
+  const bool decoded = DecodePacket(av_context_, av_packet_, av_frame_);
+  if (decoded) {
     ConvertFrame(reinterpret_cast<const uint8_t**>(&av_frame_->data), bool(data->is_stereo),
-                 raw_frame_.data());
-    current_frame_remaining_subframes_ = 4 << data->is_stereo;
+                 decoded_frame_.data());
+
+    // Realign the decoder's output onto the bitstream's sample numbering: the
+    // samples of the frame just decoded run from kDecoderStartPadding into this
+    // block and finish in the head of the next one.
+    const size_t pad_bytes = kDecoderStartPadding * kBytesPerSample << data->is_stereo;
+    const size_t carry_bytes = (kBytesPerFrameChannel << data->is_stereo) - pad_bytes;
 
     // Loop end: limit output to subframes 0..loop_subframe_end.
-    if (is_loop_end_frame) {
-      loop_frame_output_limit_ = (data->loop_subframe_end + 1) << data->is_stereo;
-    } else {
-      loop_frame_output_limit_ = 0;
+    const uint8_t decoded_output_limit =
+        is_loop_end_frame ? static_cast<uint8_t>((data->loop_subframe_end + 1) << data->is_stereo)
+                          : 0;
+    // Loop start: skip leading subframes per loop_subframe_skip. skip == 4
+    // means the whole frame is a warm-up frame (frame-aligned loop start):
+    // decode seeds the codec state, output is fully discarded.
+    const uint8_t decoded_start_skip =
+        loop_start_skip_pending_ ? static_cast<uint8_t>(data->loop_subframe_skip << data->is_stereo)
+                                 : 0;
+    loop_start_skip_pending_ = false;
+
+    if (carry_valid_) {
+      std::memcpy(raw_frame_.data(), carry_frame_.data(), carry_bytes);
+      std::memcpy(raw_frame_.data() + carry_bytes, decoded_frame_.data(), pad_bytes);
+
+      current_frame_remaining_subframes_ = 4 << data->is_stereo;
+      loop_frame_output_limit_ = pending_output_limit_;
+      current_frame_remaining_subframes_ -=
+          std::min(pending_start_skip_, current_frame_remaining_subframes_);
     }
 
-    // Loop start: skip leading subframes per loop_subframe_skip.
-    if (loop_start_skip_pending_) {
-      const uint8_t skip = data->loop_subframe_skip << data->is_stereo;
-      if (skip < current_frame_remaining_subframes_) {
-        current_frame_remaining_subframes_ -= skip;
-      }
-      loop_start_skip_pending_ = false;
-    }
+    std::memcpy(carry_frame_.data(), decoded_frame_.data() + pad_bytes, carry_bytes);
+    carry_valid_ = true;
+    pending_output_limit_ = decoded_output_limit;
+    pending_start_skip_ = decoded_start_skip;
+  } else {
+    // A dropped frame breaks the carry's adjacency; re-prime rather than splice
+    // two blocks that are not neighbors.
+    carry_valid_ = false;
   }
 
   // Compute where to go next.
+  if (is_loop_end_frame) {
+    UpdateLoopStatus(data);
+    return;
+  }
+
   if (!packet_info.isLastFrameInPacket()) {
     const uint32_t next_frame_offset =
         (data->input_buffer_read_offset + bits_to_copy) % kBitsPerPacket;

@@ -1,0 +1,19 @@
+{
+  "name": "tsg-launcher",
+  "productName": "TSG Launcher",
+  "version": "0.1.0",
+  "description": "TSG Launcher — macOS launcher for The Simpsons Game Recompiled",
+  "main": "main/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "pack": "node scripts/pack-app.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@electron/packager": "^18.3.6",
+    "electron": "^33.2.1"
+  }
+}

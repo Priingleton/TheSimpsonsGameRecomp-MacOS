@@ -15,9 +15,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <cstdlib>
 #include <memory>
-#include <mutex>
 #include <vector>
 
 #include <rex/chrono/clock.h>
@@ -228,7 +226,7 @@ u32 NtSuspendThread_entry(u32 handle, mapped_u32 suspend_count_ptr) {
     }
 
     REXKRNL_TRACE("[NtSuspendThread] handle={:08X} thread={}", uint32_t(handle), thread->name());
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
     auto* current_thread = XThread::GetCurrentThread();
     bool is_self_suspend = current_thread && current_thread == thread.get();
     if (is_self_suspend) {
@@ -790,57 +788,6 @@ u32 NtSetTimerEx_entry(u32 timer_handle, mapped_u64 due_time_ptr,
 
   uint64_t due_time = *due_time_ptr;
 
-  // REX_TIMER_STATS (logged as warnings, as the kernel log is quiet by
-  // default): per timer handle, how often the game arms it and
-  // the real time between two arms (a one-shot timer re-armed after it fired
-  // gives its tick rate).
-  static const bool timer_stats = std::getenv("REX_TIMER_STATS") != nullptr;
-  if (timer_stats) {
-    struct Stat {
-      uint32_t handle = 0, count = 0;
-      int64_t due = 0;
-      std::chrono::steady_clock::time_point last{}, start{};
-      double gap_sum_us = 0, gap_max_us = 0;
-    };
-    static std::mutex stats_mutex;
-    static Stat stats[8];
-    std::lock_guard<std::mutex> guard(stats_mutex);
-    auto now = std::chrono::steady_clock::now();
-    Stat* s = nullptr;
-    for (auto& e : stats) {
-      if (e.handle == timer_handle || e.handle == 0) {
-        s = &e;
-        break;
-      }
-    }
-    if (s) {
-      if (s->handle == 0) {
-        s->handle = timer_handle;
-        s->start = now;
-      } else {
-        double gap = std::chrono::duration<double, std::micro>(now - s->last).count();
-        s->gap_sum_us += gap;
-        s->gap_max_us = std::max(s->gap_max_us, gap);
-        ++s->count;
-      }
-      s->last = now;
-      s->due = int64_t(due_time);
-      double elapsed = std::chrono::duration<double>(now - s->start).count();
-      if (elapsed >= 5.0) {
-        // Negative due times are relative, in 100 ns units.
-        REXKRNL_WARN(
-            "[timer-stats] timer {:08X}: armed {:.1f}/s, due {}, period {} ms, "
-            "gap avg {:.0f} us max {:.0f} us",
-            timer_handle, s->count / elapsed,
-            s->due < 0 ? fmt::format("in {:.3f} ms", -s->due / 10000.0) : "absolute", period_ms,
-            s->count ? s->gap_sum_us / s->count : 0.0, s->gap_max_us);
-        s->count = 0;
-        s->gap_sum_us = s->gap_max_us = 0;
-        s->start = now;
-      }
-    }
-  }
-
   X_STATUS result = X_STATUS_SUCCESS;
 
   auto timer = REX_KERNEL_OBJECTS()->LookupObject<XTimer>(timer_handle);
@@ -1020,8 +967,9 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
-  assert_true(lock->prcb_of_owner != rex::byte_swap(pcr_addr));  // deadlock detection
-  while (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
+  const uint32_t self = rex::byte_swap(pcr_addr);
+  assert_true(lock->prcb_of_owner.value != self);  // self-deadlock detection
+  while (!rex::thread::atomic_cas(0u, self, &lock->prcb_of_owner.value)) {
     rex::thread::MaybeYield();
   }
   return old_irql;

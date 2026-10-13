@@ -36,14 +36,8 @@ std::filesystem::path GetExecutablePath();
 // Get executable folder.
 std::filesystem::path GetExecutableFolder();
 
-// Get the per-user folder applications should keep their data in: the local
-// (non-roaming) app data folder on Windows, the XDG data home on POSIX.
+// Get user folder.
 std::filesystem::path GetUserFolder();
-
-// The folder GetUserFolder() used to return, or empty if it never differed on
-// this platform. Only for migrating data left behind by an older build --
-// nothing new should ever be written here.
-std::filesystem::path GetLegacyUserFolder();
 
 // Creates the parent folder of the specified path if needed.
 // This can be used to ensure the destination path for a new file exists before
@@ -85,7 +79,8 @@ class FileHandle {
   // Opens the file, failing if it doesn't exist.
   // The desired_access bitmask denotes the permissions on the file.
   static std::unique_ptr<FileHandle> OpenExisting(const std::filesystem::path& path,
-                                                  uint32_t desired_access);
+                                                  uint32_t desired_access,
+                                                  bool allow_share_delete = false);
 
   virtual ~FileHandle() = default;
 

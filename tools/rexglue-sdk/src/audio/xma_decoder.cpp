@@ -9,8 +9,11 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/platform.h>
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+#include <pthread/qos.h>
+#endif
 #include <rex/audio/xma/context.h>
-#include <rex/audio/thread_priority.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/cvar.h>
 #include <rex/dbg.h>
@@ -22,8 +25,6 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/thread_state.h>
 #include <rex/system/xthread.h>
-
-#include <SDL3/SDL_error.h>
 
 extern "C" {
 #include "libavutil/log.h"
@@ -54,14 +55,6 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 // the 64b pointer in user memory so they can party on it. If the game doesn't
 // do this, it's likely they are either passing the context to XAudio or
 // using the XMA* functions.
-
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <pthread.h>
-#include <unistd.h>
-#include <cerrno>
-#endif
 
 namespace rex::audio {
 
@@ -149,13 +142,10 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 }
 
 void XmaDecoder::WorkerThreadMain() {
-  // HAND PATCH: raise XMA decode priority -- in-game audio (many XMA
-  // voices) went crunchy/slowed when this thread fell behind under load;
-  // menu/cutscene audio (fewer voices) was fine. Same approach as the
-  // AudioSystem worker.
-  if (!rex_audio_set_thread_priority()) {
-    REXAPU_WARN("XMA: cannot raise decoder thread priority: {}", SDL_GetError());
-  }
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+  // Decodes audio the output is waiting for; see AudioSystem::WorkerThreadMain.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   while (worker_running_) {
     // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
@@ -303,16 +293,26 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
 
     // The context ID is a bit in the range of the entire context array.
     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
+    uint32_t kicked_value = value;
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         context.Enable();
-        // Decode synchronously on the calling thread to avoid context-switching bottlenecks!
-        context.Work();
-        context.SignalWorkDone();
       }
     }
+    // Decode inline. waiting on the worker sweep stalls the realtime
+    // audio thread 50-100ms during kick bursts.
+    for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
+      if (kicked_value & 1) {
+        uint32_t context_id = base_context_id + i;
+        auto& context = contexts_[context_id];
+        if (context.Work()) {
+          context.SignalWorkDone();
+        }
+      }
+    }
+    work_event_->Set();
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
     // Context lock command.
     // This requests a lock by flagging the context.

@@ -9,12 +9,16 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <rex/cvar.h>
+
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include <rex/assert.h>
 #include <rex/graphics/pipeline/shader/spirv_builder.h>
+
+REXCVAR_DECLARE(bool, shader_no_contraction);
 
 namespace rex::graphics {
 
@@ -49,7 +53,9 @@ spv::Id SpirvBuilder::createNoContractionUnaryOp(spv::Op op_code, spv::Id type_i
 spv::Id SpirvBuilder::createNoContractionBinOp(spv::Op op_code, spv::Id type_id, spv::Id operand1,
                                                spv::Id operand2) {
   spv::Id result = createBinOp(op_code, type_id, operand1, operand2);
-  addDecoration(result, spv::DecorationNoContraction);
+  if (REXCVAR_GET(shader_no_contraction)) {
+    addDecoration(result, spv::DecorationNoContraction);
+  }
   return result;
 }
 
@@ -124,7 +130,9 @@ void SpirvBuilder::IfBuilder::makeBeginElse(bool branchToMerge) {
   assert_true(currentBranch == Branch::kThen);
 #endif
 
-  if (branchToMerge) {
+  // A block may have only one terminator, and glslang's createBranch appends
+  // unconditionally - check here, like SwitchBuilder::endSegment does.
+  if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
     // Close out the "then" by having it jump to the mergeBlock.
     thenPhiParent = builder.getBuildPoint()->getId();
     builder.createBranch(mergeBlock);
@@ -147,7 +155,8 @@ void SpirvBuilder::IfBuilder::makeEndIf(bool branchToMerge) {
   assert_true(currentBranch == Branch::kThen || currentBranch == Branch::kElse);
 #endif
 
-  if (branchToMerge) {
+  // Don't add a second terminator, as in makeBeginElse.
+  if (branchToMerge && !builder.getBuildPoint()->isTerminated()) {
     // Jump to the merge block.
     (elseBlock ? elsePhiParent : thenPhiParent) = builder.getBuildPoint()->getId();
     builder.createBranch(mergeBlock);

@@ -23,7 +23,6 @@
 #include <rex/graphics/pipeline/texture/util.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/xenos.h>
-#include <rex/perf/counter.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 
@@ -143,12 +142,16 @@ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCo
     {4, 4, 2, 4},
     // kR5G6B5ToB5G6R5
     {4, 4, 2, 4},
+    // kR5G6B5ToRGBA8
+    {4, 4, 4, 4},
     // kR5G5B6ToB5G6R5WithRBGASwizzle
     {4, 4, 2, 4},
     // kRGBA4ToBGRA4
     {4, 4, 2, 4},
     // kRGBA4ToARGB4
     {4, 4, 2, 4},
+    // kRGBA4ToRGBA8
+    {4, 4, 4, 4},
     // kGBGR8ToGRGB8
     {4, 4, 4, 3},
     // kGBGR8ToRGB8
@@ -279,13 +282,6 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
     if (!limit_hard_exceeded && (texture->last_usage_time() + limit_soft_lifetime) > current_time) {
       break;
     }
-    if (texture->scaled_memory_pending()) {
-      // Holds resolved data not written back to the scaled resolve memory yet:
-      // keep it, moving it to the end of the usage list (with the current
-      // submission index, so this loop stops when it comes around again).
-      texture->MarkAsUsed();
-      continue;
-    }
     if (!destroyed_any) {
       destroyed_any = true;
       // The texture being destroyed might have been bound in the previous
@@ -322,27 +318,14 @@ void TextureCache::BeginFrame() {
   ResetTextureBindings();
 }
 
-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
-                                       bool unscaled) {
+void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
   if (length_unscaled == 0) {
     return;
   }
   start_unscaled &= 0x1FFFFFFF;
   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
 
-  if (IsDrawResolutionScaled() && unscaled) {
-    // Not scaled resolve memory anymore.
-    uint32_t page_first = start_unscaled >> 12;
-    uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
-    auto global_lock = global_critical_region_.Acquire();
-    for (uint32_t page = page_first; page <= page_last; ++page) {
-      uint32_t block = page >> 5;
-      scaled_resolve_pages_[block] &= ~(UINT32_C(1) << (page & 31));
-      if (!scaled_resolve_pages_[block]) {
-        scaled_resolve_pages_l2_[block >> 6] &= ~(UINT64_C(1) << (block & 63));
-      }
-    }
-  } else if (IsDrawResolutionScaled()) {
+  if (IsDrawResolutionScaled()) {
     uint32_t page_first = start_unscaled >> 12;
     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
     uint32_t block_first = page_first >> 5;
@@ -410,35 +393,8 @@ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pend
   pending_load_out.load_base = base_outdated;
   pending_load_out.load_mips = mips_outdated;
   pending_range_count_out = 0;
-  pending_load_out.from_cpu = CanLoadTextureDataFromCpu(texture, base_outdated, mips_outdated);
-  pending_load_out.from_native_gpu =
-      !pending_load_out.from_cpu &&
-      CanLoadTextureDataFromNativeGpu(texture, base_outdated, mips_outdated);
-  if (pending_load_out.from_cpu || pending_load_out.from_native_gpu) {
-    return true;
-  }
 
   TextureKey texture_key = texture.key();
-  if (SharedMemory::CensusEnabled()) {
-    // Diagnostics: the textures still loaded from the guest memory mirror.
-    static uint32_t logged = 0;
-    if (logged < 32) {
-      ++logged;
-      uint32_t base = texture_key.base_page << 12, mips = texture_key.mip_page << 12;
-      REXGPU_INFO(
-          "[mirror-texture] {} {}x{} {} fmt={} tiled={} scaled={} pitch={} base {:08X}+{:X} "
-          "(GPU-written {}) mips {:08X}+{:X} (GPU-written {}) load base={} mips={}",
-          texture_key.GetLogDimensionName(), texture_key.GetWidth(), texture_key.GetHeight(),
-          texture_key.GetDepthOrArraySize(), uint32_t(texture_key.format),
-          uint32_t(texture_key.tiled), uint32_t(texture_key.scaled_resolve),
-          uint32_t(texture_key.pitch) << 5, base, texture.GetGuestBaseSize(),
-          base_outdated && shared_memory().IsRangeGpuWritten(base, texture.GetGuestBaseSize()),
-          mips, texture.GetGuestMipsSize(),
-          mips_outdated && texture.GetGuestMipsSize() &&
-              shared_memory().IsRangeGpuWritten(mips, texture.GetGuestMipsSize()),
-          base_outdated, mips_outdated);
-    }
-  }
   if (base_outdated) {
     PendingSharedMemoryRange pending_range;
     pending_range.start = texture_key.base_page << 12;
@@ -464,7 +420,7 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
 
   Texture& texture = *pending_load.texture;
   TextureKey texture_key = texture.key();
-  if (texture_key.scaled_resolve && !pending_load.from_native_gpu) {
+  if (texture_key.scaled_resolve) {
     // Make sure all the scaled resolve memory is resident and accessible from
     // the shader, including any possible padding that hasn't yet been touched
     // by an actual resolve, but is still included in the texture size, so the
@@ -479,17 +435,8 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
     }
   }
 
-  if (pending_load.from_cpu) {
-    if (!LoadTextureDataFromCpuImpl(texture, pending_load.load_base, pending_load.load_mips)) {
-      return false;
-    }
-  } else if (pending_load.from_native_gpu) {
-    if (!LoadTextureDataFromNativeGpuImpl(texture, pending_load.load_base,
-                                          pending_load.load_mips)) {
-      return false;
-    }
-  } else if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
-                                                    pending_load.load_mips)) {
+  if (!LoadTextureDataFromResidentMemoryImpl(texture, pending_load.load_base,
+                                             pending_load.load_mips)) {
     return false;
   }
 
@@ -498,31 +445,9 @@ bool TextureCache::CommitPreparedTextureLoad(const PendingTextureLoad& pending_l
   // regular texture or a vertex buffer, and thus the scaled resolve version is
   // not up to date anymore.
   texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
-  if (pending_load.from_cpu) {
-    // Watches must catch reuse and in-place texture updates without marking
-    // the mirror valid: no bytes were uploaded to that mirror.
-    if (pending_load.load_base) {
-      shared_memory().WatchCpuMemoryRange(texture_key.base_page << 12, texture.GetGuestBaseSize());
-    }
-    if (pending_load.load_mips) {
-      shared_memory().WatchCpuMemoryRange(texture_key.mip_page << 12, texture.GetGuestMipsSize());
-    }
-  }
   texture.LogAction("Loaded");
 
   return true;
-}
-
-void TextureCache::InvalidateCpuTextureInputsForTrace() {
-  auto invalidate = [&](uint32_t page, uint32_t length) {
-    uint32_t address = page << 12;
-    shared_memory().InvalidateCpuMemoryRangeForTrace(address, length);
-  };
-  for (const auto& entry : textures_) {
-    const Texture& texture = *entry.second;
-    invalidate(texture.key().base_page, texture.GetGuestBaseSize());
-    invalidate(texture.key().mip_page, texture.GetGuestMipsSize());
-  }
 }
 
 void TextureCache::RequestTextures(uint32_t used_texture_mask) {
@@ -738,16 +663,6 @@ TextureCache::Texture::Texture(TextureCache& texture_cache, const TextureKey& ke
 }
 
 TextureCache::Texture::~Texture() {
-  if (key_.base_page) {
-    auto range = texture_cache_.textures_by_base_page_.equal_range(uint32_t(key_.base_page));
-    for (auto it = range.first; it != range.second; ++it) {
-      if (it->second == this) {
-        texture_cache_.textures_by_base_page_.erase(it);
-        break;
-      }
-    }
-  }
-
   if (mips_watch_handle_) {
     texture_cache().shared_memory().UnwatchMemoryRange(mips_watch_handle_);
   }
@@ -946,10 +861,8 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
   // previously 0, now not 0, to save memory - common case in streaming.
   auto found_texture_it = textures_.find(key);
   if (found_texture_it != textures_.end()) {
-    PROFILE_TEXTURE_CACHE_HIT();
     return found_texture_it->second.get();
   }
-  PROFILE_TEXTURE_CACHE_MISS();
 
   // Create the texture and add it to the map.
   Texture* texture;
@@ -962,16 +875,9 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
     assert_true(new_texture->key() == key);
     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
   }
-  if (key.base_page) {
-    textures_by_base_page_.emplace(uint32_t(key.base_page), texture);
-  }
   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
   texture->LogAction("Created");
   return texture;
-}
-
-void TextureCache::MarkTextureBaseWrittenByGpu(Texture& texture) {
-  texture.MakeUpToDateAndWatch(global_critical_region_.Acquire());
 }
 
 bool TextureCache::LoadTextureData(Texture& texture) {

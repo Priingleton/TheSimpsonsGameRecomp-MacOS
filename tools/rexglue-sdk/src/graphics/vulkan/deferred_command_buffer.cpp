@@ -10,57 +10,19 @@
  */
 
 #include <algorithm>
-#include <vector>
-#include <functional>
 #include <cstddef>
 #include <cstdint>
-#include <cstdlib>
 #include <cstring>
-#include <map>
-#include <string>
-#include <utility>
 
 #include <rex/assert.h>
+#include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
-#include <rex/logging.h>
 #include <rex/math.h>
-#include <rex/perf/counter.h>
-
-namespace rex::graphics {
-extern uint64_t g_upload_request_stats[3 + 32];
-extern uint64_t g_streamed_skip_stats[2];
-extern std::map<std::pair<uint32_t, uint32_t>, std::pair<uint64_t, uint64_t>>
-    g_upload_request_ranges;
-}  // namespace rex::graphics
 
 namespace rex::graphics::vulkan {
-
-namespace {
-// Debugging aid: REX_CMD_STATS=1 logs the average mix of commands per executed command buffer.
-struct CommandStats {
-  bool enabled = std::getenv("REX_CMD_STATS") != nullptr;
-  uint64_t executions = 0;
-  uint64_t counts[64] = {};
-  uint64_t buffer_barriers = 0;
-  uint64_t image_barriers = 0;
-  std::map<std::pair<uint32_t, uint32_t>, uint64_t> barrier_stages;
-};
-CommandStats& GetCommandStats() {
-  static CommandStats stats;
-  return stats;
-}
-constexpr const char* kCommandStatNames[] = {
-    "BeginRenderPass", "BeginQuery", "BindDescriptorSets", "BindIndexBuffer", "BindPipeline",
-    "BindVertexBuffers", "ClearAttachments", "ClearColorImage", "CopyBuffer", "FillBuffer",
-    "CopyBufferToImage", "CopyImageToBuffer", "CopyQueryPoolResults", "Dispatch", "Draw",
-    "DrawIndexed", "EndQuery", "EndRenderPass", "BeginRendering", "EndRendering",
-    "PipelineBarrier", "PushConstants", "ResetQueryPool", "SetBlendConstants", "SetDepthBias",
-    "SetScissor", "SetStencilCompareMask", "SetStencilReference", "SetStencilWriteMask",
-    "SetViewport", "WriteTimestamp", "CopyImage"};
-}  // namespace
 
 DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& command_processor,
                                              size_t initial_size)
@@ -68,8 +30,118 @@ DeferredCommandBuffer::DeferredCommandBuffer(const VulkanCommandProcessor& comma
   command_stream_.reserve(initial_size / sizeof(uintmax_t));
 }
 
+REXCVAR_DEFINE_BOOL(vulkan_tight_render_area, false, "GPU/Vulkan",
+                    "Limit each render pass to the region its draws and clears write instead of "
+                    "the whole host render target (down to the end of EDRAM). Tile-based GPUs "
+                    "load and store every tile of the render area per pass.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 void DeferredCommandBuffer::Reset() {
   command_stream_.clear();
+}
+
+void DeferredCommandBuffer::TightenRenderAreas() {
+  uintmax_t* stream = command_stream_.data();
+  size_t stream_remaining = command_stream_.size();
+  VkRect2D* open_area = nullptr;
+  VkRect2D full_area = {};
+  int32_t x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+  bool scissor_known = false;
+  VkRect2D scissor = {};
+  auto add = [&](const VkRect2D& rect) {
+    const int32_t rx1 = rect.offset.x + int32_t(rect.extent.width);
+    const int32_t ry1 = rect.offset.y + int32_t(rect.extent.height);
+    if (rx1 <= rect.offset.x || ry1 <= rect.offset.y) {
+      return;
+    }
+    if (x1 <= x0 || y1 <= y0) {
+      x0 = rect.offset.x;
+      y0 = rect.offset.y;
+      x1 = rx1;
+      y1 = ry1;
+    } else {
+      x0 = std::min(x0, rect.offset.x);
+      y0 = std::min(y0, rect.offset.y);
+      x1 = std::max(x1, rx1);
+      y1 = std::max(y1, ry1);
+    }
+  };
+  auto open = [&](VkRect2D* area) {
+    open_area = area;
+    full_area = *area;
+    x0 = y0 = x1 = y1 = 0;
+  };
+  auto close = [&]() {
+    if (!open_area) {
+      return;
+    }
+    const int32_t ax1 = full_area.offset.x + int32_t(full_area.extent.width);
+    const int32_t ay1 = full_area.offset.y + int32_t(full_area.extent.height);
+    const int32_t ux0 = std::max(x0, full_area.offset.x), uy0 = std::max(y0, full_area.offset.y);
+    const int32_t ux1 = std::min(x1, ax1), uy1 = std::min(y1, ay1);
+    if (ux1 <= ux0 || uy1 <= uy0) {
+      // Nothing drawn - one pixel keeps the load and store to a single tile.
+      open_area->offset = full_area.offset;
+      open_area->extent = {1, 1};
+    } else {
+      open_area->offset = {ux0, uy0};
+      open_area->extent = {uint32_t(ux1 - ux0), uint32_t(uy1 - uy0)};
+    }
+    open_area = nullptr;
+  };
+  while (stream_remaining) {
+    const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+    uint8_t* args = reinterpret_cast<uint8_t*>(stream + kCommandHeaderSizeElements);
+    switch (header.command) {
+      case Command::kVkBeginRenderPass:
+        open(&reinterpret_cast<ArgsVkBeginRenderPass*>(args)->render_area);
+        break;
+      case Command::kVkBeginRendering:
+        open(&reinterpret_cast<ArgsVkBeginRendering*>(args)->render_area);
+        break;
+      case Command::kVkEndRenderPass:
+      case Command::kVkEndRendering:
+        close();
+        break;
+      case Command::kVkSetScissor: {
+        const auto& scissor_args = *reinterpret_cast<const ArgsVkSetScissor*>(args);
+        if (scissor_args.first_scissor == 0 && scissor_args.scissor_count) {
+          scissor = *reinterpret_cast<const VkRect2D*>(
+              args + rex::align(sizeof(ArgsVkSetScissor), alignof(VkRect2D)));
+          scissor_known = true;
+        }
+      } break;
+      case Command::kVkDraw:
+      case Command::kVkDrawIndexed:
+        if (open_area) {
+          add(scissor_known ? scissor : full_area);
+        }
+        break;
+      case Command::kVkClearAttachments:
+        if (open_area) {
+          const auto& clear_args = *reinterpret_cast<const ArgsVkClearAttachments*>(args);
+          size_t rects_offset =
+              rex::align(sizeof(ArgsVkClearAttachments), alignof(VkClearAttachment));
+          rects_offset = rex::align(rects_offset + sizeof(VkClearAttachment) *
+                                                       clear_args.attachment_count,
+                                    alignof(VkClearRect));
+          const auto* rects = reinterpret_cast<const VkClearRect*>(args + rects_offset);
+          for (uint32_t i = 0; i < clear_args.rect_count; ++i) {
+            add(rects[i].rect);
+          }
+        }
+        break;
+      default:
+        break;
+    }
+    const size_t command_elements = kCommandHeaderSizeElements + header.arguments_size_elements;
+    stream += command_elements;
+    stream_remaining -= command_elements;
+  }
+  // A pass left open here continues elsewhere - keep its full area.
+  if (open_area) {
+    *open_area = full_area;
+  }
 }
 
 void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
@@ -77,18 +149,18 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
   SCOPE_profile_cpu_f("gpu");
 #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
 
+  if (REXCVAR_GET(vulkan_tight_render_area)) {
+    TightenRenderAreas();
+  }
+
   const ui::vulkan::VulkanDevice::Functions& dfn =
       command_processor_.GetVulkanDevice()->functions();
   const uintmax_t* stream = command_stream_.data();
   size_t stream_remaining = command_stream_.size();
-  CommandStats& command_stats = GetCommandStats();
   while (stream_remaining) {
     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
     stream += kCommandHeaderSizeElements;
     stream_remaining -= kCommandHeaderSizeElements;
-    if (command_stats.enabled) {
-      ++command_stats.counts[uint32_t(header.command) & 63];
-    }
 
     switch (header.command) {
       case Command::kVkBeginRenderPass: {
@@ -182,11 +254,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkClearColorImage), alignof(VkImageSubresourceRange))));
       } break;
 
-      case Command::kVkFillBuffer: {  // HAND PATCH
-        auto& args = *reinterpret_cast<const ArgsVkFillBuffer*>(stream);
-        dfn.vkCmdFillBuffer(command_buffer, args.buffer, args.offset, args.size, args.data);
-      } break;
-
       case Command::kVkCopyBuffer: {
         auto& args = *reinterpret_cast<const ArgsVkCopyBuffer*>(stream);
         dfn.vkCmdCopyBuffer(command_buffer, args.src_buffer, args.dst_buffer, args.region_count,
@@ -205,25 +272,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
       } break;
 
-      case Command::kVkCopyImage: {
-        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
-        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
-                           args.dst_image_layout, args.region_count,
-                           reinterpret_cast<const VkImageCopy*>(
-                               reinterpret_cast<const uint8_t*>(stream) +
-                               rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
-      } break;
-
-      case Command::kVkCopyImageToBuffer: {
-        auto& args = *reinterpret_cast<const ArgsVkCopyImageToBuffer*>(stream);
-        dfn.vkCmdCopyImageToBuffer(
-            command_buffer, args.src_image, args.src_image_layout, args.dst_buffer,
-            args.region_count,
-            reinterpret_cast<const VkBufferImageCopy*>(
-                reinterpret_cast<const uint8_t*>(stream) +
-                rex::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy))));
-      } break;
-
       case Command::kVkCopyQueryPoolResults: {
         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
@@ -239,16 +287,12 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
       case Command::kVkDraw: {
         auto& args = *reinterpret_cast<const ArgsVkDraw*>(stream);
-        PROFILE_DRAW_CALL();
-        PROFILE_VERTICES(int64_t(args.vertex_count) * args.instance_count);
         dfn.vkCmdDraw(command_buffer, args.vertex_count, args.instance_count, args.first_vertex,
                       args.first_instance);
       } break;
 
       case Command::kVkDrawIndexed: {
         auto& args = *reinterpret_cast<const ArgsVkDrawIndexed*>(stream);
-        PROFILE_DRAW_CALL();
-        PROFILE_VERTICES(int64_t(args.index_count) * args.instance_count);
         dfn.vkCmdDrawIndexed(command_buffer, args.index_count, args.instance_count,
                              args.first_index, args.vertex_offset, args.first_instance);
       } break;
@@ -325,12 +369,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
               reinterpret_cast<const uint8_t*>(stream) + barrier_offset_bytes);
           barrier_offset_bytes += sizeof(VkImageMemoryBarrier) * args.image_memory_barrier_count;
         }
-        if (command_stats.enabled) {
-          ++command_stats.barrier_stages[{uint32_t(args.src_stage_mask),
-                                          uint32_t(args.dst_stage_mask)}];
-          command_stats.buffer_barriers += args.buffer_memory_barrier_count;
-          command_stats.image_barriers += args.image_memory_barrier_count;
-        }
         dfn.vkCmdPipelineBarrier(command_buffer, args.src_stage_mask, args.dst_stage_mask,
                                  args.dependency_flags, args.memory_barrier_count, memory_barriers,
                                  args.buffer_memory_barrier_count, buffer_memory_barriers,
@@ -342,13 +380,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
         dfn.vkCmdPushConstants(
             command_buffer, args.layout, args.stage_flags, args.offset, args.size,
             reinterpret_cast<const uint8_t*>(stream) + sizeof(ArgsVkPushConstants));
-      } break;
-
-      case Command::kVkWriteTimestamp: {
-        auto& args = *reinterpret_cast<const ArgsVkWriteTimestamp*>(stream);
-        if (cmd_write_timestamp_) {
-          cmd_write_timestamp_(command_buffer, args.pipeline_stage, args.query_pool, args.query);
-        }
       } break;
 
       case Command::kVkResetQueryPool: {
@@ -406,60 +437,6 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
 
     stream += header.arguments_size_elements;
     stream_remaining -= header.arguments_size_elements;
-  }
-  static const uint64_t stats_every = [] {
-    const char* every = std::getenv("REX_CMD_STATS_EVERY");
-    return every ? std::max(uint64_t(1), uint64_t(std::strtoull(every, nullptr, 10))) : uint64_t(20);
-  }();
-  if (command_stats.enabled && ++command_stats.executions % stats_every == 0) {
-    std::string line;
-    for (size_t i = 0; i < std::size(kCommandStatNames); ++i) {
-      if (command_stats.counts[i]) {
-        line += fmt::format(" {}={:.1f}", kCommandStatNames[i], command_stats.counts[i] / double(stats_every));
-      }
-    }
-    REXGPU_INFO("[cmd-stats] per command buffer:{} | buffer barriers {:.1f}, image barriers {:.1f}",
-                line, command_stats.buffer_barriers / double(stats_every), command_stats.image_barriers / double(stats_every));
-    for (const auto& [stages, count] : command_stats.barrier_stages) {
-      REXGPU_INFO("[cmd-stats]   barrier src={:08X} dst={:08X}: {:.1f}", stages.first,
-                  stages.second, count / double(stats_every));
-    }
-    {
-      std::string histogram;
-      for (uint32_t i = 0; i < 32; ++i) {
-        if (g_upload_request_stats[3 + i]) {
-          histogram += fmt::format(" <{}B:{:.1f}", uint64_t(1) << i,
-                                   g_upload_request_stats[3 + i] / double(stats_every));
-        }
-      }
-      REXGPU_INFO("[cmd-stats] upload requests {:.1f}, requested {:.1f} KB, uploaded {:.1f} KB "
-                  "(unchanged streamed pages skipped {:.1f}, requests skipped {:.1f}) |{}",
-                  g_upload_request_stats[0] / double(stats_every), g_upload_request_stats[1] / (double(stats_every) * 1024.0),
-                  g_upload_request_stats[2] / (double(stats_every) * 1024.0), g_streamed_skip_stats[0] / double(stats_every),
-                  g_streamed_skip_stats[1] / double(stats_every), histogram);
-      g_streamed_skip_stats[0] = 0;
-      g_streamed_skip_stats[1] = 0;
-      std::memset(g_upload_request_stats, 0, sizeof(g_upload_request_stats));
-      if (!g_upload_request_ranges.empty()) {
-        std::vector<std::pair<uint64_t, std::pair<uint32_t, uint32_t>>> ranked;
-        for (const auto& [range, entry] : g_upload_request_ranges) {
-          ranked.emplace_back(entry.second, range);
-        }
-        std::sort(ranked.begin(), ranked.end(), std::greater<>());
-        for (size_t i = 0; i < std::min(ranked.size(), size_t(25)); ++i) {
-          const auto& entry = g_upload_request_ranges[ranked[i].second];
-          REXGPU_INFO("[cmd-stats]   range {:08X}+{:X}: {:.1f} requests, {:.1f} KB uploaded",
-                      ranked[i].second.first, ranked[i].second.second, entry.first / double(stats_every),
-                      entry.second / (double(stats_every) * 1024.0));
-        }
-        REXGPU_INFO("[cmd-stats]   {} distinct ranges", g_upload_request_ranges.size());
-        g_upload_request_ranges.clear();
-      }
-    }
-    std::memset(command_stats.counts, 0, sizeof(command_stats.counts));
-    command_stats.buffer_barriers = 0;
-    command_stats.image_barriers = 0;
-    command_stats.barrier_stages.clear();
   }
 }
 

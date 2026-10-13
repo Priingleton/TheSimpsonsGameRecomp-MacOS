@@ -25,9 +25,10 @@
 #include "image_patch.h"
 
 #include <cstdint>
-#include <iterator>
 #include <cstring>
+#include <iterator>
 #include <string>
+#include <vector>
 
 #include <rex/cvar.h>
 #include <rex/logging.h>

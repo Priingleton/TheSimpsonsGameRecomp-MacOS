@@ -70,8 +70,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
       // For domain host vertex shader types only, xenos::TessellationMode.
       uint32_t tessellation_mode : 2;
-      // Vertex fetch constants describe a compact immutable host snapshot.
-      uint32_t native_vertex_streams : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -90,15 +88,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
-      // Every component of every texture the shader fetches is unsigned, so
-      // texture fetches read only the unsigned binding and skip the
-      // per-component signedness handling (see AreTextureFetchesPlain).
-      uint32_t textures_plain : 1;
-      // Every texture the shader fetches has a single mip level, no
-      // anisotropic filtering and the same magnification and minification
-      // filter, so implicit-LOD fetches sample level 0 instead of using
-      // gradients (see AreTextureFetchesLevel0).
-      uint32_t textures_level0 : 1;
     } pixel;
     uint64_t value = 0;
 
@@ -429,12 +418,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
   uint64_t GetDefaultPixelShaderModification(
       uint32_t dynamic_addressable_register_count) const override;
 
-  // Version of the translated SPIR-V. Increase it whenever a translator change
-  // makes modules translated earlier behave differently, so stored ones (the
-  // ahead-of-time shader set) are no longer used. 1: reads from vertex fetch
-  // constants with zero size are skipped instead of going to guest address 0.
-  static constexpr uint32_t kTranslatedModuleVersion = 1;
-
   static constexpr uint32_t GetSharedMemoryStorageBufferCountLog2(
       uint32_t max_storage_buffer_range) {
     if (max_storage_buffer_range >= 512 * 1024 * 1024) {
@@ -551,23 +534,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
                                         Shader::HostVertexShaderType::kRectangleListAsTriangleStrip;
   }
 
-  // Texture fetches of the plain texture variant: with only unsigned
-  // components, the result is the unsigned sample (times the exponent bias),
-  // fetched without branching, so the host compiler can issue the fetches of a
-  // block together instead of waiting for each before the next.
-  bool AreTextureFetchesPlain() const {
-    return is_pixel_shader() && GetSpirvShaderModification().pixel.textures_plain &&
-           features_.image_view_format_swizzle;
-  }
-
-  // Texture fetches of the level 0 variant: with a single mip level, no
-  // anisotropic filtering and the same filter either way, gradients can't
-  // change what a fetch using the fetch constant's filters returns, so it
-  // samples level 0 directly, without computing them.
-  bool AreTextureFetchesLevel0() const {
-    return is_pixel_shader() && GetSpirvShaderModification().pixel.textures_level0;
-  }
-
   bool IsExecutionModeEarlyFragmentTests() const {
     return is_pixel_shader() &&
            GetSpirvShaderModification().pixel.depth_stencil_mode ==
@@ -670,9 +636,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // replaces the value with +0 if the minimum of the two operands is 0. This
   // must be called with absolute values of operands - use GetAbsoluteOperand!
   spv::Id ZeroIfAnyOperandIsZero(spv::Id value, spv::Id operand_0_abs, spv::Id operand_1_abs);
-  // HAND PATCH: returns `position` with NaN/Inf components replaced by 0
-  // (cvar gpu_sanitize_vertex_position; see flags.cpp for the rationale).
-  spv::Id SanitizeVertexPosition(spv::Id position);
   // Conditionally discard the current fragment. Changes the build point.
   void KillPixel(spv::Id condition, uint8_t memexport_eM_potentially_written_before);
   // Return type is a rex::bit_count(result.GetUsedResultComponents())-component
@@ -995,14 +958,6 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_predicate_;
   // uint4.
   spv::Id var_main_loop_count_;
-  // HAND PATCH: uint counter of passes through the main control-flow dispatch
-  // loop, used as a defensive bound against translated-shader livelocks that
-  // would otherwise hang the GPU (see gpu_shader_max_cf_iterations).
-  // spv::NoResult when the guard is disabled.
-  spv::Id var_main_cf_iteration_guard_;
-  // Budget baked into the shader at translation time from
-  // gpu_shader_max_cf_iterations; 0 disables the guard.
-  uint32_t main_cf_iteration_budget_ = 0;
   // int4.
   spv::Id var_main_loop_address_;
   // int.
@@ -1036,8 +991,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id main_memexport_allowed_;
   // VS rectangle-list fallback only - uint.
   spv::Id var_main_rectangle_guest_vertex_index_;
-  // VS rectangle-list fallback only - gl_PerVertex[3].
+  // VS rectangle-list fallback only - float4[3] (gl_Position). Not the
+  // gl_PerVertex block type, whose BuiltIn member decorations are only valid
+  // for Input and Output variables.
   spv::Id var_main_rectangle_per_vertex_;
+  // One per user clip plane, plus one more cull distance for vertex killing.
+  static constexpr size_t kMaxRectanglePerVertexDistances = 8;
+  // VS rectangle-list fallback only - float[3] for each clip and cull distance.
+  // Separate variables rather than one float[3][count], to keep the
+  // ArrayStride-decorated gl_PerVertex member type out of Function storage.
+  std::array<spv::Id, kMaxRectanglePerVertexDistances> var_main_rectangle_clip_distances_;
+  std::array<spv::Id, kMaxRectanglePerVertexDistances> var_main_rectangle_cull_distances_;
   // VS rectangle-list fallback only - float4[3] for each used interpolator.
   std::array<spv::Id, xenos::kMaxInterpolators> var_main_rectangle_interpolators_;
   // VS only - float3 (special exports).

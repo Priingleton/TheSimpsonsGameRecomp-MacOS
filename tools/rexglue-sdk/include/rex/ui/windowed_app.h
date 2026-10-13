@@ -24,10 +24,15 @@
 #include <rex/platform.h>
 #include <rex/ui/windowed_app_context.h>
 
-#if REX_PLATFORM_ANDROID
-// Multiple apps in a single library instead of separate executables.
-#define XE_UI_WINDOWED_APPS_IN_LIBRARY 1
-#endif
+// Xenia shipped several apps (emulator, vfs-dump, ...) inside one Android .so
+// and selected between them through a name->creator registry. A ReXGlue project
+// is one recompiled game per binary, and windowed_app_main_sdl.cpp calls
+// GetWindowedAppCreator() unconditionally, which the registry mode does not
+// define. Keep the single-app model on every platform; on Android the "separate
+// executable" is libmain.so, loaded by SDLActivity.
+//
+// Define XE_UI_WINDOWED_APPS_IN_LIBRARY=1 before including this header to opt
+// back into the registry.
 
 namespace rex {
 namespace ui {

@@ -27,7 +27,6 @@
 #include <rex/graphics/pipeline/shader/shader.h>
 #include <rex/graphics/register_file.h>
 #include <rex/graphics/shared_memory.h>
-#include <rex/graphics/trace_writer.h>
 #include <rex/graphics/xenos.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -149,12 +148,6 @@ class PrimitiveProcessor {
     // only valid for index_buffer_type kHostConverted, kHostBuiltinForAuto and
     // kHostBuiltinForDMA.
     size_t host_index_buffer_handle;
-    // Exact CPU copy of a native DMA index stream, valid until the next
-    // Process call. Bounds scans must not read a write-combined GPU mapping.
-    const void* native_index_snapshot;
-    // A triangle list (strips converted) that can be drawn as three-point
-    // patches, as requested for smooth tessellation.
-    bool triangle_patches;
     bool IsTessellated() const {
       return Shader::IsHostVertexShaderTypeDomain(host_vertex_shader_type);
     }
@@ -175,20 +168,13 @@ class PrimitiveProcessor {
 
   // Submission must be open to call (may request the index buffer in the shared
   // memory).
-  // native_dma_indices snapshots supported CPU index streams into a host
-  // buffer for this draw, without uploading them to the guest memory mirror.
-  // triangle_patches asks for a triangle list that can be drawn as patches:
-  // indexed triangle lists stay as they are, indexed strips are converted.
-  bool Process(ProcessingResult& result_out, bool native_dma_indices = false,
-               bool triangle_patches = false);
+  bool Process(ProcessingResult& result_out);
 
   // Invalidates the cache within the range.
   std::pair<uint32_t, uint32_t> MemoryInvalidationCallback(uint32_t physical_address_start,
                                                            uint32_t length, bool exact_range);
 
  protected:
-  SharedMemory& shared_memory() const { return shared_memory_; }
-
   // For host-side index buffer creation, the biggest possibly needed contiguous
   // allocation, in indices.
   // - No conversion: up to 0xFFFF vertices (as the vertex count in
@@ -211,11 +197,8 @@ class PrimitiveProcessor {
       sizeof(uint32_t) * (UINT16_MAX - 2) * 3 * +XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE;
 
   PrimitiveProcessor(const RegisterFile& register_file, memory::Memory& memory,
-                     TraceWriter& trace_writer, SharedMemory& shared_memory)
-      : register_file_(register_file),
-        memory_(memory),
-        trace_writer_(trace_writer),
-        shared_memory_(shared_memory) {}
+                     SharedMemory& shared_memory)
+      : register_file_(register_file), memory_(memory), shared_memory_(shared_memory) {}
 
   // Call from the backend-specific initialization function.
   // - full_32bit_vertex_indices_supported:
@@ -315,18 +298,7 @@ class PrimitiveProcessor {
       xenos::IndexFormat format, uint32_t index_count, bool coalign_for_simd,
       uint32_t coalignment_original_address, size_t& backend_handle_out) = 0;
 
-  // A backend may retain an immutable native DMA buffer after comparing its
-  // CPU shadow with the current source bytes. The shadow and buffer must stay
-  // alive through the current frame. False keeps the ordinary fresh snapshot.
-  virtual bool TryRetainedNativeIndexBuffer(uint32_t, uint32_t, const void*, size_t&,
-                                            const void*&) {
-    return false;
-  }
-
  private:
-  // Refilled for every native DMA draw, never reused by guest address.
-  std::vector<uint8_t> native_index_snapshot_;
-
 #if XE_GPU_PRIMITIVE_PROCESSOR_SIMD_SIZE
 #if REX_ARCH_AMD64
   // SSSE3 or AVX.
@@ -540,38 +512,6 @@ class PrimitiveProcessor {
     }
   }
 
-  // Triangle strips as triangle lists, every other triangle with its last two
-  // vertices swapped to keep the winding and the first (provoking) vertex, as
-  // the host draws strips: (v0, v1, v2), (v1, v3, v2), (v2, v3, v4), ...
-  // Degenerate triangles of joined strips stay, for the host to drop.
-  static constexpr uint32_t GetTriangleStripListIndexCount(uint32_t strip_index_count) {
-    return strip_index_count > 2 ? (strip_index_count - 2) * 3 : 0;
-  }
-  template <typename Index, typename IndexTransform>
-  static void TriangleStripToList(Index* dest, const Index* source, uint32_t source_index_count,
-                                  const IndexTransform& index_transform) {
-    if (source_index_count <= 2) {
-      // To match GetTriangleStripListIndexCount.
-      return;
-    }
-    Index index_previous_previous = index_transform(source[0]);
-    Index index_previous = index_transform(source[1]);
-    for (uint32_t i = 2; i < source_index_count; ++i) {
-      Index index_current = index_transform(source[i]);
-      if (i & 1) {
-        *(dest++) = index_previous_previous;
-        *(dest++) = index_current;
-        *(dest++) = index_previous;
-      } else {
-        *(dest++) = index_previous_previous;
-        *(dest++) = index_previous;
-        *(dest++) = index_current;
-      }
-      index_previous_previous = index_previous;
-      index_previous = index_current;
-    }
-  }
-
   static constexpr uint32_t GetLineLoopStripIndexCount(uint32_t loop_index_count) {
     // Even if 2 vertices are supplied, two lines are still drawn between them.
     // https://www.khronos.org/opengl/wiki/Primitive
@@ -603,21 +543,22 @@ class PrimitiveProcessor {
   static constexpr uint32_t GetQuadListTriangleListIndexCount(uint32_t quad_list_index_count) {
     return (quad_list_index_count / 4) * 6;
   }
-  // The vertices of a quad, in the order of the two triangles it's converted
-  // to (quad_list_triangle_order, set on initialization).
-  static inline uint32_t quad_list_triangle_vertices_[6] = {0, 1, 2, 0, 2, 3};
   template <typename Index, typename IndexTransform>
   static void QuadListToTriangleList(Index* dest, const Index* source, uint32_t source_index_count,
                                      const IndexTransform& index_transform) {
     uint32_t quad_count = source_index_count / 4;
     for (uint32_t i = 0; i < quad_count; ++i) {
-      Index quad[4];
-      for (uint32_t j = 0; j < 4; ++j) {
-        quad[j] = index_transform(*(source++));
-      }
-      for (uint32_t j = 0; j < 6; ++j) {
-        *(dest++) = quad[quad_list_triangle_vertices_[j]];
-      }
+      // TODO(Triang3l): Find the correct order.
+      // v0, v1, v2.
+      Index common_index_0 = index_transform(*(source++));
+      *(dest++) = common_index_0;
+      *(dest++) = index_transform(*(source++));
+      Index common_index_2 = index_transform(*(source++));
+      *(dest++) = common_index_2;
+      // v0, v2, v3.
+      *(dest++) = common_index_0;
+      *(dest++) = common_index_2;
+      *(dest++) = index_transform(*(source++));
     }
   }
 
@@ -662,14 +603,6 @@ class PrimitiveProcessor {
           dest_write_ptr += range_it->host_index_count;
         }
         break;
-      case xenos::PrimitiveType::kTriangleStrip:
-        for (PrimitiveRangeIterator range_it = ranges_beginning; range_it != ranges_end;
-             ++range_it) {
-          TriangleStripToList(dest_write_ptr, source + range_it->guest_offset,
-                              range_it->guest_index_count, index_transform);
-          dest_write_ptr += range_it->host_index_count;
-        }
-        break;
       case xenos::PrimitiveType::kLineLoop:
         for (PrimitiveRangeIterator range_it = ranges_beginning; range_it != ranges_end;
              ++range_it) {
@@ -693,12 +626,17 @@ class PrimitiveProcessor {
 
   const RegisterFile& register_file_;
   memory::Memory& memory_;
-  TraceWriter& trace_writer_;
   SharedMemory& shared_memory_;
 
   bool full_32bit_vertex_indices_used_ = false;
   bool convert_triangle_fans_to_lists_ = false;
   bool convert_line_loops_to_strips_ = false;
+  // Metal always has primitive restart enabled and offers no way to turn it
+  // off, so a guest index equal to the restart value is cut even when the guest
+  // asked for no reset. When set, 16-bit index buffers containing 0xFFFF are
+  // widened to 32-bit so the restart value cannot collide.
+  bool host_primitive_restart_always_enabled_ = false;
+  std::vector<uint32_t> widened_guest_indices_;
   bool convert_quad_lists_to_triangle_lists_ = false;
   bool expand_point_sprites_in_vs_ = false;
   bool expand_rectangle_lists_in_vs_ = false;

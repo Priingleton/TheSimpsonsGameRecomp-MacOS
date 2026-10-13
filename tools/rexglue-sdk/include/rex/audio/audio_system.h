@@ -20,6 +20,7 @@
 #include <rex/system/function_dispatcher.h>
 #include <rex/system/xthread.h>
 #include <rex/thread.h>
+#include <rex/thread/background_gate.h>
 #include <rex/thread/mutex.h>
 
 namespace rex::stream {
@@ -54,6 +55,7 @@ class AudioSystem : public system::IAudioSystem {
   bool is_paused() const { return paused_; }
   void Pause();
   void Resume();
+  void SetBackgrounded(bool backgrounded);
 
  protected:
   explicit AudioSystem(runtime::FunctionDispatcher* function_dispatcher);
@@ -93,7 +95,8 @@ class AudioSystem : public system::IAudioSystem {
   std::unique_ptr<rex::thread::Event> shutdown_event_;
   rex::thread::WaitHandle* wait_handles_[kMaximumClientCount + 1];
 
-  bool paused_ = false;
+  thread::BackgroundGate background_gate_;
+  std::atomic<bool> paused_{false};
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
 };

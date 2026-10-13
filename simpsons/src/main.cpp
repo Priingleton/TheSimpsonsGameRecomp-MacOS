@@ -1,4 +1,4 @@
-// simpsons - ReXGlue Recompiled Project
+// The Simpsons Game — ReXGlue recompiled project (macOS)
 
 #include "generated/default/simpsons_init.h"
 

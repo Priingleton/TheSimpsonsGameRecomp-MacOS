@@ -9,14 +9,23 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
+#include <chrono>
+
+#include <algorithm>
+#include <thread>
 #include <rex/assert.h>
+#include <rex/platform.h>
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+#include <pthread/qos.h>
+#endif
 #include <rex/audio/audio_driver.h>
 #include <rex/audio/audio_system.h>
 #include <rex/audio/flags.h>
-#include <rex/audio/thread_priority.h>
 #include <rex/audio/xma/decoder.h>
 #include <rex/dbg.h>
 #include <rex/logging.h>
+#include <rex/development_stats.h>
 #include <rex/math.h>
 #include <rex/memory/ring_buffer.h>
 #include <rex/stream.h>
@@ -25,27 +34,9 @@
 #include <rex/thread.h>
 #include <rex/cvar.h>
 
-#include <algorithm>
-#include <chrono>
-#include <thread>
-
-#include <SDL3/SDL_error.h>
-#include <SDL3/SDL_thread.h>
-#include <SDL3/SDL_timer.h>
-#if REX_PLATFORM_LINUX
-#include <SDL3/SDL_system.h>
-#include <sys/syscall.h>
-#endif
-
 REXCVAR_DEFINE_INT32(
     audio_maxqframes, 8, "Audio",
     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
-
-REXCVAR_DECLARE(bool, audio_log_underruns);
-
-REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
-                    "Ask the game for audio frames at the hardware's steady rate instead of as "
-                    "fast as queue space frees up (bursts make the game submit silent frames)");
 
 // As with normal Microsoft, there are like twelve different ways to access
 // the audio APIs. Early games use XMA*() methods almost exclusively to touch
@@ -59,34 +50,14 @@ REXCVAR_DEFINE_BOOL(audio_callback_pacing, true, "Audio",
 // and let the normal AudioSystem handling take it, to prevent duplicate
 // implementations. They can be found in xboxkrnl_audio_xma.cc
 
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <pthread.h>
-#include <unistd.h>
-#include <cerrno>
-#endif
-
-extern "C" bool rex_audio_set_thread_priority() {
-#if defined(_WIN32)
-  return SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) != 0;
-#else
-  struct sched_param sp{};
-  sp.sched_priority = 10;
-  if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) == 0) {
-    return true;
-  }
-#if REX_PLATFORM_LINUX
-  if (SDL_SetLinuxThreadPriorityAndPolicy(syscall(SYS_gettid), SDL_THREAD_PRIORITY_TIME_CRITICAL,
-                                          SCHED_RR)) {
-    return true;
-  }
-#endif
-  return SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
-#endif
-}
-
 namespace rex::audio {
+
+// DEVSTATS (local only): guest audio callback cost, reported by the SDL driver.
+std::atomic<uint64_t> g_rex_audio_cb_ns{0}, g_rex_audio_cb_count{0}, g_rex_audio_cb_max_ns{0};
+
+namespace {
+constexpr std::chrono::milliseconds kWorkerShutdownTimeout{500};
+}  // namespace
 
 AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()),
@@ -94,8 +65,9 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
       worker_running_(false) {
   std::memset(clients_, 0, sizeof(clients_));
 
-  queued_frames_ =
-      uint32_t(std::clamp(REXCVAR_GET(audio_maxqframes), 4, int32_t(kMaximumQueuedFrames)));
+  queued_frames_ = std::min(
+      static_cast<uint32_t>(kMaximumQueuedFrames),
+      std::max(static_cast<uint32_t>(REXCVAR_GET(audio_maxqframes)), static_cast<uint32_t>(4)));
 
   for (size_t i = 0; i < kMaximumClientCount; ++i) {
     client_semaphores_[i] = rex::thread::Semaphore::Create(0, queued_frames_);
@@ -137,37 +109,37 @@ X_STATUS AudioSystem::Setup(system::KernelState* kernel_state) {
   return X_STATUS_SUCCESS;
 }
 
+REXCVAR_DEFINE_BOOL(audio_pace_callbacks, false, "Audio",
+                    "Call the title's audio callback once per 256-sample frame (5.33 ms), as "
+                    "the console does, even when the output device asks for several frames at "
+                    "once. iOS pulls 1024 samples per request; dispatched in one burst, a title "
+                    "that mixes ahead on an auto-reset event (NFS Most Wanted) wakes once for two "
+                    "finished buffers and leaves every other one silent.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 void AudioSystem::WorkerThreadMain() {
-  // HAND PATCH: raise the audio worker to realtime-ish priority so guest
-  // audio callbacks aren't starved by GPU/streaming threads (audible
-  // stutter under load). SCHED_FIFO needs privileges we may not have, so
-  // use SDL's native scheduling helper, including the desktop priority broker.
-  if (!rex_audio_set_thread_priority()) {
-    REXAPU_WARN("AudioWorker: cannot raise thread priority: {}", SDL_GetError());
-  }
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+  // This thread feeds the output device every few milliseconds and uses little
+  // CPU. At the default priority it queued behind the game's busy threads and
+  // missed frames, heard as gaps.
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
+
   // Initialize driver and ringbuffer.
   Initialize();
-
-  // The hardware asks for one frame (256 samples) every 5.33 ms of playback,
-  // and the game's mixer renders at that pace: called again right away, its
-  // callback submits a frame of silence. But the audio driver frees queue
-  // slots in bursts (a PipeWire period is four frames), so callbacks are
-  // spread out to just under the frame duration, which keeps the queue full.
-  constexpr auto kCallbackInterval = std::chrono::microseconds(5333 * 39 / 40);
-  std::chrono::steady_clock::time_point next_callback[kMaximumClientCount] = {};
-
-  // audio_log_underruns: callbacks per second, how long the game's callback
-  // runs and how late the paced wait wakes (a coarse timer shows here).
-  struct PacingDiag {
-    uint32_t callbacks = 0, waits = 0, unpaced = 0;
-    double callback_sum_us = 0, callback_max_us = 0, late_sum_us = 0, late_max_us = 0;
-    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-    std::chrono::steady_clock::time_point last_callback = {};
-  } pacing_diag;
 
   // Main run loop.
   uint32_t diag_pump_count = 0;
   while (worker_running_) {
+    background_gate_.Checkpoint([] {});
+    if (!worker_running_) break;
+    // Save-state pause must also take priority over continuously signaled
+    // client semaphores; the shutdown handle is the last WaitAny handle.
+    if (paused_) {
+      pause_fence_.Signal();
+      thread::Wait(resume_event_.get(), false);
+      continue;
+    }
     // These handles signify the number of submitted samples. Once we reach
     // 64 samples, we wait until our audio backend releases a semaphore
     // (signaling a sample has finished playing)
@@ -204,70 +176,42 @@ void AudioSystem::WorkerThreadMain() {
       uint32_t client_callback_arg = clients_[index].wrapped_callback_arg;
       global_lock.unlock();
 
-      if (client_callback) {
-        if (REXCVAR_GET(audio_callback_pacing)) {
-          auto now = std::chrono::steady_clock::now();
-          if (now < next_callback[index]) {
-            // SDL uses a high-resolution timer on Windows. Keep the existing
-            // schedule and measure the actual wake rather than the deadline.
-            SDL_DelayNS(uint64_t(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(next_callback[index] - now)
-                    .count()));
-            now = std::chrono::steady_clock::now();
-            if (REXCVAR_GET(audio_log_underruns)) {
-              const double late =
-                  std::chrono::duration<double, std::micro>(now - next_callback[index]).count();
-              pacing_diag.late_sum_us += std::max(0.0, late);
-              pacing_diag.late_max_us = std::max(pacing_diag.late_max_us, late);
-              ++pacing_diag.waits;
-            }
-          } else if (REXCVAR_GET(audio_log_underruns)) {
-            ++pacing_diag.unpaced;
-          }
-          // Keep the schedule, so waking late cannot lower the average rate
-          // below the hardware's, but never ask again within half a frame:
-          // called again right away, the game's mixer returns silence. After
-          // a stall, this restarts from now instead of catching up in a burst.
-          next_callback[index] =
-              std::max(next_callback[index] + kCallbackInterval, now + kCallbackInterval / 2);
+      if (client_callback && REXCVAR_GET(audio_pace_callbacks)) {
+        // One guest frame per 256 samples of real time. Up to two frames of
+        // catch-up after a late wakeup, never a whole device request at once.
+        using Clock = std::chrono::steady_clock;
+        constexpr auto kFrame = std::chrono::nanoseconds(256LL * 1000000000LL / 48000);
+        static thread_local Clock::time_point next_calls[kMaximumClientCount]{};
+        Clock::time_point& next_call = next_calls[index];
+        const auto now = Clock::now();
+        if (next_call > now) {
+          std::this_thread::sleep_until(next_call);
         }
+        next_call = std::max(next_call, now - 2 * kFrame) + kFrame;
+      }
+
+      if (client_callback) {
         if (diag_pump_count < 10) {
           REXAPU_DEBUG("AudioWorker: dispatching callback {:08X} with arg {:08X} for client {}",
                        client_callback, client_callback_arg, index);
         }
         SCOPE_profile_cpu_i("apu", "rex::audio::AudioSystem->client_callback");
         uint64_t args[] = {client_callback_arg};
-        const bool log_pacing = REXCVAR_GET(audio_log_underruns);
-        const auto callback_start =
-            log_pacing ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool stats_enabled = rex::AudioDevelopmentStatsEnabled();
+        const auto rex_cb_start = stats_enabled ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
         function_dispatcher_->Execute(worker_thread_->thread_state(), client_callback, args,
                                       rex::countof(args));
-        if (log_pacing) {
-          auto end = std::chrono::steady_clock::now();
-          // Do not average a pause, loading gap or disabled diagnostic period
-          // into the callback rate reported for active playback.
-          if (pacing_diag.last_callback == std::chrono::steady_clock::time_point{} ||
-              callback_start - pacing_diag.last_callback > std::chrono::milliseconds(250)) {
-            pacing_diag = {};
-            pacing_diag.start = callback_start;
-          }
-          pacing_diag.last_callback = end;
-          double took = std::chrono::duration<double, std::micro>(end - callback_start).count();
-          pacing_diag.callback_sum_us += took;
-          pacing_diag.callback_max_us = std::max(pacing_diag.callback_max_us, took);
-          ++pacing_diag.callbacks;
-          double elapsed = std::chrono::duration<double>(end - pacing_diag.start).count();
-          if (elapsed >= 5.0) {
-            REXAPU_INFO(
-                "[audio-pacing] {:.1f} callbacks/s (hardware: 187.5), callback avg {:.0f} us "
-                "max {:.0f} us; paced wait woke late avg {:.0f} us max {:.0f} us over {} waits, "
-                "{} callbacks already late",
-                pacing_diag.callbacks / elapsed,
-                pacing_diag.callback_sum_us / pacing_diag.callbacks, pacing_diag.callback_max_us,
-                pacing_diag.waits ? pacing_diag.late_sum_us / pacing_diag.waits : 0.0,
-                pacing_diag.late_max_us, pacing_diag.waits, pacing_diag.unpaced);
-            pacing_diag = {};
-            pacing_diag.start = pacing_diag.last_callback = end;
+        if (stats_enabled) {
+          // DEVSTATS (local only)
+          const uint64_t rex_cb_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                  std::chrono::steady_clock::now() - rex_cb_start)
+                                                  .count());
+          g_rex_audio_cb_ns.fetch_add(rex_cb_ns, std::memory_order_relaxed);
+          g_rex_audio_cb_count.fetch_add(1, std::memory_order_relaxed);
+          uint64_t rex_prev = g_rex_audio_cb_max_ns.load(std::memory_order_relaxed);
+          while (rex_cb_ns > rex_prev &&
+                 !g_rex_audio_cb_max_ns.compare_exchange_weak(rex_prev, rex_cb_ns)) {
           }
         }
         if (diag_pump_count < 10) {
@@ -319,12 +263,21 @@ void AudioSystem::Shutdown() {
   }
 
   worker_running_ = false;
+  background_gate_.Request(false);
   shutdown_event_->Set();
   if (worker_thread_) {
-    // The worker may be stuck inside a guest callback that is itself blocked
-    // on guest objects (e.g. KeWaitForMultipleObjects).
-    // Terminate the thread to break the deadlock.
-    worker_thread_->Terminate(0);
+    // The worker may be stuck inside a guest callback that is itself blocked on
+    // guest objects (e.g. KeWaitForMultipleObjects), so terminating is the last
+    // resort. Give it a chance to unwind first: TerminateThread abandons any
+    // lock the thread holds, including the CRT heap lock.
+    rex::thread::Thread* host_thread = worker_thread_->thread();
+    bool exited = host_thread && rex::thread::Wait(host_thread, false, kWorkerShutdownTimeout) ==
+                                     rex::thread::WaitResult::kSuccess;
+    if (!exited) {
+      REXAPU_WARN("Audio worker did not exit within {} ms; terminating",
+                  kWorkerShutdownTimeout.count());
+      worker_thread_->Terminate(0);
+    }
     worker_thread_.reset();
   }
 
@@ -479,6 +432,13 @@ bool AudioSystem::Restore(stream::ByteStream* stream) {
   }
 
   return true;
+}
+
+void AudioSystem::SetBackgrounded(bool backgrounded) {
+  background_gate_.Request(backgrounded);
+  // Wake an idle worker. Do not wait for an executing guest audio callback:
+  // it may itself need GPU or main-thread work to finish.
+  shutdown_event_->Set();
 }
 
 void AudioSystem::Pause() {

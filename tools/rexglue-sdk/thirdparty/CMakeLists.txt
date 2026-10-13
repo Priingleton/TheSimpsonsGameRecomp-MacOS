@@ -1,14 +1,25 @@
 # Third-party vendored dependencies for ReXGlue
+include(${PROJECT_SOURCE_DIR}/cmake/rexglue_vulkan_stack.cmake)
 
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
 #=============================================================================
 # Architecture detection
 #=============================================================================
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+    # On Apple, CMAKE_OSX_ARCHITECTURES is the target arch; CMAKE_SYSTEM_PROCESSOR
+    # reflects the host (e.g. arm64 on Apple Silicon even when cross-building x86_64).
+    if("arm64" IN_LIST CMAKE_OSX_ARCHITECTURES)
+        set(IS_ARM64 TRUE)
+        set(IS_X86_64 FALSE)
+    else()
+        set(IS_ARM64 FALSE)
+        set(IS_X86_64 TRUE)
+    endif()
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64)$")
     set(IS_ARM64 FALSE)
     set(IS_X86_64 TRUE)
-elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64)$")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|ARM64|arm64)$")
     set(IS_ARM64 TRUE)
     set(IS_X86_64 FALSE)
 else()
@@ -17,7 +28,7 @@ else()
 endif()
 
 #=============================================================================
-# Verify git submodules are initialized (only vendored ones)
+# Verify vendored dependency sources, including source archives without .git
 #=============================================================================
 set(REQUIRED_SUBMODULES
     cli11
@@ -28,7 +39,6 @@ set(REQUIRED_SUBMODULES
     xxHash
     spdlog
     fmt
-    snappy
     utfcpp
     imgui
     sdl3
@@ -36,9 +46,19 @@ set(REQUIRED_SUBMODULES
 
 if(REXGLUE_USE_VULKAN)
     list(APPEND REQUIRED_SUBMODULES
-        volk vulkan-headers vulkan-memory-allocator
+        vulkan-headers vulkan-memory-allocator
         spirv-headers spirv-tools glslang
     )
+    if(REXGLUE_MOBILE)
+        # iOS has no ICD/loader mechanism worth the weight: the runtime dlopens
+        # libMoltenVK.dylib out of the app bundle directly. Android ships its own
+        # loader in the system image.
+        if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            list(APPEND REQUIRED_SUBMODULES moltenvk)
+        endif()
+    elseif(APPLE)
+        list(APPEND REQUIRED_SUBMODULES vulkan-loader moltenvk)
+    endif()
 endif()
 
 
@@ -51,14 +71,22 @@ if(REXGLUE_BUILD_TESTS)
 endif()
 
 foreach(submodule ${REQUIRED_SUBMODULES})
-    # Accept either an initialized git submodule (.git present) or vendored
-    # sources committed directly into the tree (non-empty directory).
-    file(GLOB _sub_contents "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/*")
-    if(NOT _sub_contents)
+    set(source_marker "CMakeLists.txt")
+    if(submodule STREQUAL "FFmpeg")
+        set(source_marker "configure")
+    elseif(submodule STREQUAL "libmspack")
+        set(source_marker "libmspack/mspack/mspack.h")
+    elseif(submodule STREQUAL "simde")
+        set(source_marker "simde/simde-common.h")
+    elseif(submodule STREQUAL "xxHash")
+        set(source_marker "xxhash.h")
+    elseif(submodule STREQUAL "imgui")
+        set(source_marker "imgui.h")
+    endif()
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${submodule}/${source_marker}")
         message(FATAL_ERROR
-            "Dependency '${submodule}' is missing (empty directory).\n"
-            "If using submodules, run: git submodule update --init --recursive\n"
-            "from the repository root directory."
+            "Missing vendored dependency source: ${submodule}/${source_marker}.\n"
+            "Use a complete source checkout or release archive."
         )
     endif()
 endforeach()
@@ -116,10 +144,7 @@ target_compile_options(aes128 PRIVATE -w)
 
 # libmspack - LZX decompression (only lzxd.c needed for XEX decompression)
 # Uses cabextract version which has all needed headers in one place
-# Use the real libmspack sources rather than the cabextract/ tree, whose files
-# are git symlinks that check out as broken text stubs on Windows (no symlink
-# support) -- the real directory is portable across all platforms.
-set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/libmspack/mspack")
+set(MSPACK_DIR "${CMAKE_CURRENT_SOURCE_DIR}/libmspack/cabextract/mspack")
 add_library(mspack STATIC
     ${MSPACK_DIR}/lzxd.c
 )
@@ -174,15 +199,6 @@ add_subdirectory(spdlog)
 target_compile_options(spdlog PRIVATE -w)
 
 #=============================================================================
-# snappy - Fast compression/decompression (GPU traces)
-#=============================================================================
-set(SNAPPY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SNAPPY_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(SNAPPY_INSTALL ON CACHE BOOL "" FORCE)
-add_subdirectory(snappy)
-target_compile_options(snappy PRIVATE -w)
-
-#=============================================================================
 # utfcpp - UTF-8 string library (header-only)
 #=============================================================================
 add_subdirectory(utfcpp)
@@ -191,6 +207,8 @@ add_subdirectory(utfcpp)
 # Vulkan dependencies (only when Vulkan backend is enabled)
 #=============================================================================
 if(REXGLUE_USE_VULKAN)
+    message(STATUS "Vulkan stack: SDK ${REXGLUE_VULKAN_SDK_VERSION}")
+
     # Vulkan-Headers
     set(VULKAN_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
     set(VULKAN_HEADERS_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
@@ -201,13 +219,63 @@ if(REXGLUE_USE_VULKAN)
     set(VMA_ENABLE_INSTALL ON CACHE BOOL "" FORCE)
     add_subdirectory(vulkan-memory-allocator)
 
-    # volk
-    set(VOLK_INSTALL ON CACHE BOOL "" FORCE)
-    set(VOLK_PULL_IN_VULKAN OFF CACHE BOOL "" FORCE)
-    add_subdirectory(volk)
-    target_link_libraries(volk PUBLIC Vulkan::Headers)
-    target_link_libraries(volk_headers INTERFACE Vulkan::Headers)
-    target_compile_options(volk PRIVATE -w)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        # MoltenVK/Common/CMakeLists.txt does an unconditional
+        # find_library(APPKIT_LIBRARY AppKit REQUIRED). AppKit is the only one of
+        # its six frameworks that does not exist on iOS; UIKit is its counterpart.
+        # find_library is a no-op when its result variable is already cached, so
+        # seeding it here redirects the lookup without patching the submodule.
+        find_library(REX_UIKIT_LIBRARY UIKit REQUIRED)
+        set(APPKIT_LIBRARY "${REX_UIKIT_LIBRARY}" CACHE FILEPATH "UIKit in place of AppKit on iOS" FORCE)
+
+        # Device build: MoltenVK only, no loader. vulkan-loader's arm64 assembler
+        # probe reads an unset SYSTEM_PROCESSOR under the iOS toolchain and dies,
+        # and the loader would be dead weight anyway -- rex::ui::vulkan already
+        # dlopens libMoltenVK.dylib by name (vulkan_instance.cpp).
+        set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
+        set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
+        file(MAKE_DIRECTORY
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/include/MoltenVK")
+        file(GLOB _REX_MVK_API_HEADERS_IOS
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/MoltenVK/API/*.h")
+        file(COPY ${_REX_MVK_API_HEADERS_IOS}
+            DESTINATION
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/include/MoltenVK")
+        add_subdirectory(moltenvk)
+
+        # MVKSwapchain and CAMetalLayer+MoltenVK reference CGColorSpace*. On macOS
+        # those arrive transitively through AppKit; UIKit does not bring them, so
+        # link CoreGraphics explicitly. PUBLIC on Common because the undefined
+        # symbols are in the MoltenVK target that consumes it.
+        find_library(REX_COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
+        target_link_libraries(MoltenVK_Common PUBLIC "${REX_COREGRAPHICS_LIBRARY}")
+    elseif(ANDROID)
+        # Android's system Vulkan loader is part of the platform; nothing to build.
+    elseif(APPLE)
+        # Build the loader and MoltenVK revisions shipped by the pinned SDK.
+        # They remain runtime-loaded; no Vulkan implementation is linked into
+        # rexglue itself.
+        set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+        set(BUILD_WERROR OFF CACHE BOOL "" FORCE)
+        set(LOADER_CODEGEN OFF CACHE BOOL "" FORCE)
+        string(REGEX REPLACE "\\.[0-9]+$" "" VulkanHeaders_VERSION
+            "${REXGLUE_VULKAN_SDK_VERSION}")
+        add_subdirectory(vulkan-loader EXCLUDE_FROM_ALL)
+        set_target_properties(vulkan PROPERTIES EXCLUDE_FROM_ALL FALSE)
+
+        set(MVK_BUILD_SHADER_CONVERTER_TOOL OFF CACHE BOOL "" FORCE)
+        set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
+        # MoltenVK sources #include <MoltenVK/mvk_*.h>. Release packages put
+        # those under include/MoltenVK/; the git tree only has MoltenVK/API/.
+        file(MAKE_DIRECTORY
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/include/MoltenVK")
+        file(GLOB _REX_MVK_API_HEADERS
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/MoltenVK/API/*.h")
+        file(COPY ${_REX_MVK_API_HEADERS}
+            DESTINATION
+            "${CMAKE_CURRENT_SOURCE_DIR}/moltenvk/MoltenVK/include/MoltenVK")
+        add_subdirectory(moltenvk)
+    endif()
 endif()
 
 #=============================================================================
@@ -241,33 +309,49 @@ set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
-# Disable unused subsystems
-set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+# Video provides the windowing/event layer; presenters create their own
+# D3D12/Vulkan surfaces from native handles, so SDL_RENDER stays off.
+set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+if(APPLE)
+    # macOS uses SDL for windowing + Metal/Vulkan surface creation.
+    set(SDL_METAL ON CACHE BOOL "" FORCE)
+    set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_METAL OFF CACHE BOOL "" FORCE)
+    # Linux picks X11 or Wayland at runtime, so the surface has to come from
+    # whichever driver SDL chose. Windows presenters go straight from the HWND.
+    if(UNIX)
+        set(SDL_VULKAN ON CACHE BOOL "" FORCE)
+    else()
+        set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+    endif()
+endif()
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
 set(SDL_POWER OFF CACHE BOOL "" FORCE)
 set(SDL_FILESYSTEM OFF CACHE BOOL "" FORCE)
-set(SDL_LOCALE OFF CACHE BOOL "" FORCE)
+set(SDL_LOCALE ON CACHE BOOL "" FORCE)
 set(SDL_FILE OFF CACHE BOOL "" FORCE)
 set(SDL_MISC OFF CACHE BOOL "" FORCE)
-set(SDL_DIALOG OFF CACHE BOOL "" FORCE)
+set(SDL_DIALOG ON CACHE BOOL "" FORCE)
 set(SDL_TRAY OFF CACHE BOOL "" FORCE)
 set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 
-# Disable graphics APIs (unused without video)
+# Disable graphics APIs (unused without video) — only on non-Apple
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
 set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
-set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
-set(SDL_METAL OFF CACHE BOOL "" FORCE)
 
 # Disable dummy drivers
 set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
-# Linux audio backends
+# Linux video and audio backends. Both video drivers are always built so the
+# one in use stays a runtime choice.
 if(UNIX AND NOT APPLE)
+    set(SDL_X11               ON  CACHE BOOL "" FORCE)
+    set(SDL_WAYLAND           ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -297,13 +381,10 @@ if(REXGLUE_USE_VULKAN)
     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
     add_subdirectory(spirv-headers)
 
-    # SPIRV-Tools
-    set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
-    set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
-    set(SPIRV_WERROR OFF CACHE BOOL "" FORCE)
-    set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "" FORCE)
-    add_subdirectory(spirv-tools)
-    target_compile_options(SPIRV-Tools-static PRIVATE -w)
+    add_library(spirv-tools-headers INTERFACE)
+    target_include_directories(spirv-tools-headers SYSTEM INTERFACE
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/spirv-tools/include>
+        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 
     # glslang/SPIRV - SPIR-V code generation for shader translation
     set(ENABLE_GLSLANG_BINARIES OFF CACHE BOOL "" FORCE)
@@ -387,33 +468,6 @@ endif()
 #=============================================================================
 
 set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
-
-# Select the per-platform FFmpeg config header (generated by `configure` and
-# committed as config_<os>_<arch>.h) into a build dir as config.h, and emit the
-# small avconfig.h that `configure` would normally generate. Both are added to
-# the FFmpeg targets' include paths below (BEFORE the FFmpeg source dir).
-if(WIN32)
-    set(_ff_os windows)
-elseif(APPLE)
-    set(_ff_os macos)
-else()
-    set(_ff_os linux)
-endif()
-if(IS_ARM64)
-    set(_ff_arch aarch64)
-else()
-    set(_ff_arch x86_64)
-endif()
-set(FFMPEG_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-config")
-configure_file(
-    "${FFMPEG_DIR}/config_${_ff_os}_${_ff_arch}.h"
-    "${FFMPEG_CONFIG_DIR}/config.h"
-    COPYONLY
-)
-file(WRITE "${FFMPEG_CONFIG_DIR}/libavutil/avconfig.h"
-"#ifndef AVUTIL_AVCONFIG_H\n#define AVUTIL_AVCONFIG_H\n#define AV_HAVE_BIGENDIAN 0\n#define AV_HAVE_FAST_UNALIGNED 1\n#endif /* AVUTIL_AVCONFIG_H */\n")
-file(WRITE "${FFMPEG_CONFIG_DIR}/libavutil/ffversion.h"
-"#ifndef AVUTIL_FFVERSION_H\n#define AVUTIL_FFVERSION_H\n#define FFMPEG_VERSION \"4.4\"\n#endif /* AVUTIL_FFVERSION_H */\n")
 
 # Overlay generated FFmpeg list files
 set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
@@ -558,7 +612,6 @@ if(IS_ARM64)
     )
 endif()
 
-target_include_directories(libavutil BEFORE PUBLIC "$<BUILD_INTERFACE:${FFMPEG_CONFIG_DIR}>")
 target_include_directories(libavutil
     PUBLIC
         $<BUILD_INTERFACE:${FFMPEG_DIR}>
@@ -686,7 +739,7 @@ if(IS_ARM64)
     )
 endif()
 
-target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_CONFIG_DIR}" "${FFMPEG_OVERLAY_BUILD_DIR}")
+target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_OVERLAY_BUILD_DIR}")
 
 target_include_directories(libavcodec
     PUBLIC
@@ -701,5 +754,10 @@ if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)
 endif()
 
-# IDE folder organization
-set_target_properties(libavutil libavcodec PROPERTIES FOLDER "FFmpeg")
+# Hidden visibility is required on aarch64. The NEON .S files use ADRP/ADD
+# PC-relative addressing (movrel) for symbols like ff_cos_*, which the linker
+# only accepts against locally bound symbols when emitting a shared object.
+set_target_properties(libavutil libavcodec PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON
+    FOLDER "FFmpeg")

@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <unordered_map>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -19,6 +20,9 @@
 #include <rex/bit.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <mutex>
+#include <unordered_map>
+
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/graphics/flags.h>
@@ -27,28 +31,20 @@
 #include <rex/graphics/vulkan/command_processor.h>
 #include <rex/graphics/vulkan/deferred_command_buffer.h>
 #include <rex/graphics/vulkan/texture_cache.h>
+#include <rex/graphics/vulkan/development_stats.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/ui/vulkan/mem_alloc.h>
 #include <rex/ui/vulkan/ui_samplers.h>
 #include <rex/ui/vulkan/util.h>
 
-REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
-
-REXCVAR_DEFINE_BOOL(
-    native_texture_uploads, false, "GPU/Vulkan",
-    "Decode CPU-owned textures from native upload buffers instead of the memory mirror")
+REXCVAR_DEFINE_BOOL(vulkan_texture_bc_decompress, false, "GPU/Vulkan",
+                    "Decompress DXT/DXN textures on load even where the GPU samples BC "
+                    "formats directly (what devices without BC support, such as iPhones, "
+                    "always do); for testing that path on a Mac")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
-REXCVAR_DECLARE(std::string, native_rt_original_resolution_targets);
-REXCVAR_DECLARE(bool, native_resolve_unorm_views);
-REXCVAR_DECLARE(bool, native_resolve_copy_free);
-REXCVAR_DECLARE(bool, native_resolve_buffers);
-
-REXCVAR_DEFINE_BOOL(vulkan_sparse_scaled_resolve_buffer, true, "GPU/Vulkan",
-                    "With draw resolution scaling, allocate the scaled resolve buffer sparsely "
-                    "when supported (off: one allocation of the whole buffer, for drivers whose "
-                    "sparse buffers are unreliable, such as llvmpipe)");
+REXCVAR_DEFINE_BOOL(non_seamless_cube_map, false, "GPU", "Use non-seamless cube map sampling");
 
 namespace rex::graphics::vulkan {
 
@@ -92,12 +88,16 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/texture_load_r16_unorm_float_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r4g4b4a4_a4r4g4b4_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r4g4b4a4_a4r4g4b4_scaled_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_r4g4b4a4_rgba8_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_r4g4b4a4_rgba8_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g5b5a1_b5g5r5a1_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g5b5a1_b5g5r5a1_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g5b6_b5g6r5_swizzle_rbga_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g5b6_b5g6r5_swizzle_rbga_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g6b5_b5g6r5_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_r5g6b5_b5g6r5_scaled_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_r5g6b5_rgba8_cs.h"
+#include "../shaders/vulkan_spirv/texture_load_r5g6b5_rgba8_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_rg16_snorm_float_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_rg16_snorm_float_scaled_cs.h"
 #include "../shaders/vulkan_spirv/texture_load_rg16_unorm_float_cs.h"
@@ -496,10 +496,6 @@ VulkanTextureCache::~VulkanTextureCache() {
   // Textures memory is allocated using the Vulkan Memory Allocator, destroy all
   // textures before destroying VMA.
   DestroyAllTextures(true);
-  for (const auto& retired_view : retired_image_views_) {
-    dfn.vkDestroyImageView(device, retired_view.second, nullptr);
-  }
-  retired_image_views_.clear();
 
   if (vma_allocator_ != VK_NULL_HANDLE) {
     vmaDestroyAllocator(vma_allocator_);
@@ -508,17 +504,6 @@ VulkanTextureCache::~VulkanTextureCache() {
 
 void VulkanTextureCache::BeginSubmission(uint64_t new_submission_index) {
   TextureCache::BeginSubmission(new_submission_index);
-
-  if (!retired_image_views_.empty()) {
-    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-    uint64_t completed_submission = command_processor_.GetCompletedSubmission();
-    while (!retired_image_views_.empty() &&
-           retired_image_views_.front().first <= completed_submission) {
-      vulkan_device->functions().vkDestroyImageView(vulkan_device->device(),
-                                                    retired_image_views_.front().second, nullptr);
-      retired_image_views_.pop_front();
-    }
-  }
 
   if (!null_images_cleared_ && null_image_2d_array_cube_ != VK_NULL_HANDLE &&
       null_image_3d_ != VK_NULL_HANDLE) {
@@ -1034,13 +1019,11 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
         swizzle_component(host_swizzle, 1) == xenos::XE_GPU_TEXTURE_SWIZZLE_G &&
         swizzle_component(host_swizzle, 2) == xenos::XE_GPU_TEXTURE_SWIZZLE_R;
   }
-  // Reloading can change the image's channel order. Select the view after
-  // the reload so presentation cannot retain the old red/blue swizzle.
-  if (!LoadTextureData(*texture)) {
-    return VK_NULL_HANDLE;
-  }
   VkImageView texture_view = texture->GetView(false, host_swizzle, false);
   if (texture_view == VK_NULL_HANDLE) {
+    return VK_NULL_HANDLE;
+  }
+  if (!LoadTextureData(*texture)) {
     return VK_NULL_HANDLE;
   }
   texture->MarkAsUsed();
@@ -1202,81 +1185,19 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
   image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
   image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
   image_create_info.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-  // Possible resolve destinations can also be written directly from render
-  // targets. Resolves only write single-level tiled 2D surfaces. The data is
-  // written as raw bits through an integer view so it's exactly what loading
-  // the resolved memory would produce - float color output may go through a
-  // lower-precision export format and round differently.
-  VkFormat native_resolve_format = GetNativeResolveViewFormat(formats[0]);
-  // native_resolve_unorm_views: unorm textures are written through their own
-  // format, so no integer view format keeps them from being compressed.
-  bool native_resolve_own_format =
-      REXCVAR_GET(native_resolve_unorm_views) &&
-      (IsNativeResolveUnormFormat(formats[0]) ||
-       // Depth only (color float render targets need the integer view to keep
-       // NaNs).
-       (formats[0] == VK_FORMAT_R32_SFLOAT && (key.format == xenos::TextureFormat::k_24_8 ||
-                                               key.format == xenos::TextureFormat::k_24_8_FLOAT)));
-  if (native_resolve_own_format) {
-    native_resolve_format = formats[0];
-  }
-  bool native_resolve_destination =
-      native_resolve_textures_enabled_ && native_resolve_format != VK_FORMAT_UNDEFINED &&
-      key.tiled && key.dimension == xenos::DataDimension::k2DOrStacked &&
-      depth_or_array_size == 1 && !key.mip_max_level &&
-      // With draw resolution scaling, resolves write the scaled textures of
-      // resolved memory (at the scaled size, like the render targets), and
-      // original resolution render targets the unscaled ones.
-      (key.scaled_resolve == IsDrawResolutionScaled() ||
-       (!key.scaled_resolve && !REXCVAR_GET(native_rt_original_resolution_targets).empty())) &&
-      IsNativeResolveTextureFormat(key.format) &&
-      IsColorAttachmentFormatSupported(native_resolve_format) &&
-      IsColorAttachmentFormatSupported(formats[0]) &&
-      (formats[1] == VK_FORMAT_UNDEFINED || IsColorAttachmentFormatSupported(formats[1]));
-  VkFormat view_formats[3] = {formats[0], formats[1], VK_FORMAT_UNDEFINED};
-  uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 1;
-  if (native_resolve_destination) {
-    image_create_info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
-    if (!native_resolve_own_format) {
-      image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
-      view_formats[view_format_count++] = native_resolve_format;
-    }
-  }
-  // native_resolve_copy_free: scaled unorm resolve targets get their own memory
-  // and the usages of render target images (which also grow by copying), so a
-  // render target and the texture can exchange images.
-  bool copy_free_target = native_resolve_destination && native_resolve_own_format &&
-                          key.scaled_resolve && IsNativeResolveUnormFormat(formats[0]) &&
-                          formats[1] == VK_FORMAT_UNDEFINED &&
-                          REXCVAR_GET(native_resolve_copy_free);
-  if (copy_free_target) {
-    image_create_info.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-  }
   image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
   image_create_info.queueFamilyIndexCount = 0;
   image_create_info.pQueueFamilyIndices = nullptr;
   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   VkImageFormatListCreateInfo image_format_list_create_info;
-  if (view_format_count > 1 && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+  if (formats[1] != VK_FORMAT_UNDEFINED &&
+      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
     image_create_info_last->pNext = &image_format_list_create_info;
     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
     image_format_list_create_info.pNext = nullptr;
-    image_format_list_create_info.viewFormatCount = view_format_count;
-    image_format_list_create_info.pViewFormats = view_formats;
-  }
-
-  if (copy_free_target) {
-    VkImage image;
-    VkDeviceMemory memory;
-    VkDeviceSize memory_size;
-    if (ui::vulkan::util::CreateDedicatedAllocationImage(
-            vulkan_device, image_create_info, ui::vulkan::util::MemoryPurpose::kDeviceLocal, image,
-            memory, nullptr, &memory_size)) {
-      auto texture = std::make_unique<VulkanTexture>(*this, key, image, memory, memory_size);
-      texture->SetNativeResolveFormat(native_resolve_format);
-      return texture;
-    }
+    image_format_list_create_info.viewFormatCount = 2;
+    image_format_list_create_info.pViewFormats = formats;
   }
 
   VmaAllocationCreateInfo allocation_create_info = {};
@@ -1289,235 +1210,7 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
     return nullptr;
   }
 
-  auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
-  if (native_resolve_destination) {
-    texture->SetNativeResolveFormat(native_resolve_format);
-  }
-  return texture;
-}
-
-bool VulkanTextureCache::IsNativeResolveOwnFormatView(VkFormat view_format) {
-  // GetNativeResolveViewFormat only returns integer formats.
-  return IsNativeResolveUnormFormat(view_format) || view_format == VK_FORMAT_R32_SFLOAT;
-}
-
-bool VulkanTextureCache::IsNativeResolveUnormFormat(VkFormat host_format) {
-  return host_format == VK_FORMAT_R8G8B8A8_UNORM ||
-         host_format == VK_FORMAT_A2B10G10R10_UNORM_PACK32;
-}
-
-VkFormat VulkanTextureCache::GetNativeResolveViewFormat(VkFormat host_format) {
-  switch (host_format) {
-    case VK_FORMAT_R8G8B8A8_UNORM:
-    case VK_FORMAT_A2B10G10R10_UNORM_PACK32:
-    case VK_FORMAT_R16G16_SFLOAT:
-    case VK_FORMAT_R32_SFLOAT:
-      return VK_FORMAT_R32_UINT;
-    case VK_FORMAT_R16G16B16A16_SFLOAT:
-    case VK_FORMAT_R32G32_SFLOAT:
-      return VK_FORMAT_R32G32_UINT;
-    default:
-      return VK_FORMAT_UNDEFINED;
-  }
-}
-
-bool VulkanTextureCache::IsNativeResolveTextureFormat(xenos::TextureFormat format) {
-  switch (format) {
-    case xenos::TextureFormat::k_8_8_8_8:
-    case xenos::TextureFormat::k_2_10_10_10:
-    case xenos::TextureFormat::k_16_16_FLOAT:
-    case xenos::TextureFormat::k_16_16_16_16_FLOAT:
-    case xenos::TextureFormat::k_32_FLOAT:
-    case xenos::TextureFormat::k_32_32_FLOAT:
-    case xenos::TextureFormat::k_24_8:
-    case xenos::TextureFormat::k_24_8_FLOAT:
-      return true;
-    default:
-      return false;
-  }
-}
-
-bool VulkanTextureCache::IsColorAttachmentFormatSupported(VkFormat format) {
-  auto it = color_attachment_format_support_.find(format);
-  if (it != color_attachment_format_support_.end()) {
-    return it->second;
-  }
-  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
-  VkFormatProperties format_properties;
-  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceFormatProperties(
-      vulkan_device->physical_device(), format, &format_properties);
-  bool supported =
-      (format_properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
-  color_attachment_format_support_.emplace(format, supported);
-  return supported;
-}
-
-uint32_t VulkanTextureCache::FindNativeResolveTargets(uint32_t dest_base,
-                                                      uint32_t dest_pitch_texels,
-                                                      xenos::TextureFormat format,
-                                                      xenos::Endian endian, bool scaled,
-                                                      NativeResolveTarget* targets_out) {
-  if (!native_resolve_textures_enabled_) {
-    return 0;
-  }
-  dest_base &= 0x1FFFFFFF;
-  if (dest_base & 0xFFF) {
-    return 0;
-  }
-  uint32_t count = 0;
-  ForEachTextureWithBasePage(dest_base >> 12, [&](Texture& texture) {
-    if (count >= kMaxNativeResolveTargets) {
-      return;
-    }
-    const TextureKey& key = texture.key();
-    if (key.format != format || key.endianness != endian || !key.tiled ||
-        key.dimension != xenos::DataDimension::k2DOrStacked || key.depth_or_array_size_minus_1 ||
-        key.signed_separate || bool(key.scaled_resolve) != scaled ||
-        (uint32_t(key.pitch) << 5) != dest_pitch_texels ||
-        texture.GetGuestMipsSize() || texture.outdated_mask()) {
-      return;
-    }
-    auto& vulkan_texture = static_cast<VulkanTexture&>(texture);
-    if (vulkan_texture.native_resolve_format() == VK_FORMAT_UNDEFINED) {
-      return;
-    }
-    VkImageView view = vulkan_texture.GetNativeResolveView();
-    if (view == VK_NULL_HANDLE) {
-      return;
-    }
-    NativeResolveTarget& target = targets_out[count++];
-    target.texture = &vulkan_texture;
-    target.view = view;
-    target.format = vulkan_texture.native_resolve_format();
-    target.width = key.GetWidth();
-    target.height = key.GetHeight();
-  });
-  return count;
-}
-
-void VulkanTextureCache::BeginNativeResolveWrite(const NativeResolveTarget& target,
-                                                 bool image_copy) {
-  auto& texture = *static_cast<VulkanTexture*>(target.texture);
-  texture.MarkAsUsed();
-  VulkanTexture::Usage new_usage = image_copy ? VulkanTexture::Usage::kTransferDestination
-                                              : VulkanTexture::Usage::kNativeResolveWrite;
-  VulkanTexture::Usage old_usage = texture.SetUsage(new_usage);
-  VkPipelineStageFlags src_stage_mask, dst_stage_mask;
-  VkAccessFlags src_access_mask, dst_access_mask;
-  VkImageLayout old_layout, new_layout;
-  GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
-  GetTextureUsageMasks(new_usage, dst_stage_mask, dst_access_mask, new_layout);
-  // Consecutive writes still need a write -> write (or attachment load) dependency.
-  command_processor_.PushImageMemoryBarrier(
-      texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
-      dst_stage_mask, src_access_mask, dst_access_mask, old_layout, new_layout,
-      VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, old_usage != new_usage);
-}
-
-void VulkanTextureCache::EndNativeResolveWrite(const NativeResolveTarget& target) {
-  MarkTextureBaseWrittenByGpu(*static_cast<VulkanTexture*>(target.texture));
-}
-
-void VulkanTextureCache::AddScaledMemoryPending(void* texture, int32_t delta) {
-  static_cast<VulkanTexture*>(texture)->AddScaledMemoryPending(delta);
-}
-
-VkImageView VulkanTextureCache::BeginScaledMemoryWriteback(void* texture_ptr) {
-  auto& texture = *static_cast<VulkanTexture*>(texture_ptr);
-  texture.MarkAsUsed();
-  VulkanTexture::Usage old_usage = texture.SetUsage(VulkanTexture::Usage::kScaledMemoryWriteback);
-  if (old_usage != VulkanTexture::Usage::kScaledMemoryWriteback) {
-    VkPipelineStageFlags src_stage_mask, dst_stage_mask;
-    VkAccessFlags src_access_mask, dst_access_mask;
-    VkImageLayout old_layout, new_layout;
-    GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
-    GetTextureUsageMasks(VulkanTexture::Usage::kScaledMemoryWriteback, dst_stage_mask,
-                         dst_access_mask, new_layout);
-    command_processor_.PushImageMemoryBarrier(
-        texture.image(), ui::vulkan::util::InitializeSubresourceRange(), src_stage_mask,
-        dst_stage_mask, src_access_mask, dst_access_mask, old_layout, new_layout);
-  }
-  return texture.GetNativeResolveView();
-}
-
-bool VulkanTextureCache::GetCopyFreeResolveTargetExtent(void* texture_ptr, uint32_t& width_out,
-                                                        uint32_t& height_out) const {
-  auto& texture = *static_cast<VulkanTexture*>(texture_ptr);
-  if (texture.memory() == VK_NULL_HANDLE ||
-      !command_processor_.GetVulkanDevice()->properties().imageViewFormatSwizzle) {
-    return false;
-  }
-  const TextureKey& key = texture.key();
-  width_out = key.GetWidth();
-  height_out = key.GetHeight();
-  if (key.scaled_resolve) {
-    width_out *= draw_resolution_scale_x();
-    height_out *= draw_resolution_scale_y();
-  }
-  return true;
-}
-
-void VulkanTextureCache::ExchangeCopyFreeResolveTargetImage(
-    void* texture_ptr, VkImage& image, VkDeviceMemory& memory, VkPipelineStageFlags& stage_mask,
-    VkAccessFlags& access_mask, VkImageLayout& layout, bool content_red_blue_swapped) {
-  auto& texture = *static_cast<VulkanTexture*>(texture_ptr);
-  texture.MarkAsUsed();
-  // The given image becomes the texture's in the native resolve write usage -
-  // usually already its state (a render target last drawn to), otherwise it's
-  // transitioned from its actual state.
-  VulkanTexture::Usage new_usage = VulkanTexture::Usage::kNativeResolveWrite;
-  VkPipelineStageFlags new_stage_mask;
-  VkAccessFlags new_access_mask;
-  VkImageLayout new_layout;
-  GetTextureUsageMasks(new_usage, new_stage_mask, new_access_mask, new_layout);
-  if (layout != new_layout || (stage_mask & ~new_stage_mask) || (access_mask & ~new_access_mask)) {
-    command_processor_.PushImageMemoryBarrier(
-        image, ui::vulkan::util::InitializeSubresourceRange(),
-        stage_mask ? stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, new_stage_mask, access_mask,
-        new_access_mask, layout, new_layout);
-  }
-  VulkanTexture::Usage old_usage = texture.SetUsage(new_usage);
-  GetTextureUsageMasks(old_usage, stage_mask, access_mask, layout);
-  if (!stage_mask) {
-    stage_mask = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
-  }
-  std::vector<VkImageView> retired_views;
-  texture.ExchangeImage(image, memory, retired_views);
-  uint64_t submission = command_processor_.GetCurrentSubmission();
-  for (VkImageView view : retired_views) {
-    retired_image_views_.emplace_back(submission, view);
-  }
-  texture.SetContentRedBlueSwapped(content_red_blue_swapped);
-  RefreshBindingsOfTexture(&texture);
-}
-
-void VulkanTextureCache::ClearTextureContentRedBlueSwapped(void* texture_ptr) {
-  SetTextureContentRedBlueSwapped(texture_ptr, false);
-}
-
-void VulkanTextureCache::SetTextureContentRedBlueSwapped(void* texture_ptr, bool swapped) {
-  auto& texture = *static_cast<VulkanTexture*>(texture_ptr);
-  if (texture.content_red_blue_swapped() != swapped) {
-    texture.SetContentRedBlueSwapped(swapped);
-    RefreshBindingsOfTexture(&texture);
-  }
-}
-
-bool VulkanTextureCache::IsTextureContentRedBlueSwapped(void* texture_ptr) const {
-  return static_cast<const VulkanTexture*>(texture_ptr)->content_red_blue_swapped();
-}
-
-void VulkanTextureCache::RefreshBindingsOfTexture(const Texture* texture) {
-  uint32_t binding_mask = 0;
-  for (uint32_t i = 0; i < 32; ++i) {
-    const TextureBinding* binding = GetValidTextureBinding(i);
-    if (binding && (binding->texture == texture || binding->texture_signed == texture)) {
-      binding_mask |= uint32_t(1) << i;
-    }
-  }
-  if (binding_mask) {
-    UpdateTextureBindingsImpl(binding_mask);
-  }
+  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
 }
 
 bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
@@ -1531,130 +1224,47 @@ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unsca
   return EnsureScaledResolveBufferAllocated(start_scaled, length_scaled);
 }
 
-bool RtDebugLogActive();
-
-bool VulkanTextureCache::CanLoadTextureDataFromCpu(const Texture& texture, bool load_base,
-                                                   bool load_mips) const {
-  const TextureKey& key = texture.key();
-  if (!REXCVAR_GET(native_texture_uploads) || key.scaled_resolve) {
-    return false;
-  }
-  auto range_is_cpu_owned = [&](uint32_t page, uint32_t size) {
-    uint64_t address = uint64_t(page) << 12;
-    uint64_t length = rex::align(uint64_t(size), uint64_t(16));
-    return length &&
-           length <= command_processor_.GetVulkanDevice()->properties().maxStorageBufferRange &&
-           address + length <= SharedMemory::kBufferSize &&
-           !shared_memory().IsRangeGpuWritten(uint32_t(address), uint32_t(length));
-  };
-  return (!load_base || range_is_cpu_owned(key.base_page, texture.GetGuestBaseSize())) &&
-         (!load_mips || range_is_cpu_owned(key.mip_page, texture.GetGuestMipsSize()));
-}
-
-bool VulkanTextureCache::LoadTextureDataFromCpuImpl(Texture& texture, bool load_base,
-                                                    bool load_mips) {
-  if (!CanLoadTextureDataFromCpu(texture, load_base, load_mips)) {
-    return false;
-  }
-  bool loaded = LoadTextureDataImpl(texture, load_base, load_mips, true);
-  if (loaded) {
-    command_processor_.native_gpu_diagnostics().RecordOperation(
-        NativeGpuDiagnostics::Operation::kCpuTextureUpload);
-  }
-  return loaded;
-}
-
-bool VulkanTextureCache::CanLoadTextureDataFromNativeGpu(const Texture& texture, bool load_base,
-                                                         bool load_mips) const {
-  const TextureKey& key = texture.key();
-  auto has_native_range = [&](uint32_t page, uint32_t size) {
-    return command_processor_.CanUseNativeResolveBufferRange(
-               page << 12, rex::align(size, uint32_t(16)), key.scaled_resolve) ||
-           command_processor_.CanComposeNativeResolveRange(
-               page << 12, rex::align(size, uint32_t(16)), key.scaled_resolve);
-  };
-  return (!load_base || has_native_range(key.base_page, texture.GetGuestBaseSize())) &&
-         (!load_mips || has_native_range(key.mip_page, texture.GetGuestMipsSize()));
-}
-
-bool VulkanTextureCache::LoadTextureDataFromNativeGpuImpl(Texture& texture, bool load_base,
-                                                          bool load_mips) {
-  bool loaded = LoadTextureDataImpl(texture, load_base, load_mips, false, true);
-  if (loaded) {
-    command_processor_.native_gpu_diagnostics().RecordOperation(
-        NativeGpuDiagnostics::Operation::kGpuTextureUpload);
-  }
-  return loaded;
-}
+// DEVSTATS census: texture loads by base address / size / format, logged with PERF.
+std::mutex g_rex_texload_mutex;
+std::unordered_map<uint64_t, uint32_t> g_rex_texload_counts;
 
 bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture, bool load_base,
                                                                bool load_mips) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kTextureFallback,
-      (load_base ? texture.GetGuestBaseSize() : 0) + (load_mips ? texture.GetGuestMipsSize() : 0),
-      fmt::format("base {:08X}, {}x{}, format {}, scaled {}", texture.key().base_page << 12,
-                  texture.key().GetWidth(), texture.key().GetHeight(),
-                  uint32_t(texture.key().format), bool(texture.key().scaled_resolve)));
-  if (SharedMemory::CensusEnabled()) {
-    // Diagnostics: what native data there is where a texture uses the mirror.
-    static uint32_t logged = 0;
-    if (logged < 32) {
-      ++logged;
-      const TextureKey& key = texture.key();
-      REXGPU_INFO("[mirror-texture] {:08X}+{:X} scaled={}: native buffers{}",
-                  uint32_t(key.base_page) << 12, texture.GetGuestBaseSize(),
-                  uint32_t(key.scaled_resolve),
-                  command_processor_.DescribeNativeResolveBuffers(
-                      uint32_t(key.base_page) << 12, texture.GetGuestBaseSize(),
-                      key.scaled_resolve != 0));
-    }
-  }
-  return LoadTextureDataImpl(texture, load_base, load_mips, false);
-}
-
-bool VulkanTextureCache::LoadTextureDataImpl(Texture& texture, bool load_base, bool load_mips,
-                                             bool from_cpu, bool from_native_gpu) {
-  if (RtDebugLogActive()) {
-    const TextureKey& k = texture.key();
-    REXGPU_INFO(
-        "[rt-debug] texture load base={:08X} fmt={} {}x{} dim={} tiled={} pitch={} mips={} "
-        "endian={} base={} mips_load={} scaled={}",
-        uint32_t(k.base_page) << 12, uint32_t(k.format), uint32_t(k.width_minus_1) + 1,
-        uint32_t(k.height_minus_1) + 1, uint32_t(k.dimension), uint32_t(k.tiled),
-        uint32_t(k.pitch) * 32, uint32_t(k.mip_max_level), uint32_t(k.endianness), int(load_base),
-        int(load_mips), uint32_t(k.scaled_resolve));
-  }
-  // HAND PATCH DIAGNOSTIC: see CreateTexture note.
-  {
-    TextureKey hp_key = texture.key();
-    if (hp_key.format == xenos::TextureFormat::k_Cr_Y1_Cb_Y0_REP ||
-        hp_key.format == xenos::TextureFormat::k_Y1_Cr_Y0_Cb_REP) {
-      REXGPU_WARN("[VIDEO-TEX] Load fmt={} base=0x{:08X} load_base={}",
-                  uint32_t(hp_key.format), hp_key.base_page << 12, load_base);
-    }
-  }
   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
   TextureKey texture_key = vulkan_texture.key();
-
-  // Resolved data the scaled resolve memory doesn't have yet (only in other
-  // textures written by native resolves) must be written back before loading
-  // from it - before anything here is bound, the write-back is a dispatch too.
-  if (texture_key.scaled_resolve && scaled_resolve_memory_flusher_) {
-    const texture_util::TextureGuestLayout& guest_layout = vulkan_texture.guest_layout();
-    if (load_base && guest_layout.base.level_data_extent_bytes) {
-      scaled_resolve_memory_flusher_(uint32_t(texture_key.base_page) << 12,
-                                     guest_layout.base.level_data_extent_bytes);
-    }
-    if (load_mips && guest_layout.mips_total_extent_bytes) {
-      scaled_resolve_memory_flusher_(uint32_t(texture_key.mip_page) << 12,
-                                     guest_layout.mips_total_extent_bytes);
-    }
+  if (DevelopmentStatsEnabled()) {  // DEVSTATS census
+    const uint64_t rex_key = (uint64_t(texture_key.base_page) << 40) |
+                             (uint64_t(texture_key.width_minus_1 + 1) << 26) |
+                             (uint64_t(texture_key.height_minus_1 + 1) << 12) |
+                             (uint64_t(uint32_t(texture_key.format)) << 4) |
+                             (uint64_t(texture_key.tiled) << 3) | uint64_t(load_base) << 2 |
+                             uint64_t(load_mips) << 1;
+    std::lock_guard<std::mutex> rex_lock(g_rex_texload_mutex);
+    ++g_rex_texload_counts[rex_key];
   }
-
-  // A pending write-back must read the old image in its actual channel order.
-  // The upload that follows replaces it with data in the texture's own order.
-  if (load_base) {
-    ClearTextureContentRedBlueSwapped(&texture);
+  if (DevelopmentStatsEnabled()) {
+    // DEVSTATS: reloads per texture over a while.
+    static std::unordered_map<uint32_t, uint32_t> rex_loads;
+    static uint32_t rex_total = 0;
+    ++rex_loads[(texture_key.base_page << 12) ^ uint32_t(texture_key.format)];
+    if (++rex_total % 3000 == 0) {
+      std::vector<std::pair<uint32_t, uint32_t>> v(rex_loads.begin(), rex_loads.end());
+      std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+      std::string line;
+      uint32_t once = 0;
+      for (auto& [k, n] : v) once += n == 1;
+      for (size_t i = 0; i < v.size() && i < 12; ++i) line += fmt::format(" {:08X}x{}", v[i].first, v[i].second);
+      REXGPU_INFO("TEXLOADS last 3000: {} textures, {} loaded once; top:{}", v.size(), once, line);
+      rex_loads.clear();
+    }
+    extern int g_rex_fd_state;  // DEVSTATS frame dump
+    if (g_rex_fd_state == 2) {
+      REXGPU_INFO("FD texload {:08X} {}x{}x{} fmt {} tiled {} mips {} base {} size {}",
+                  texture_key.base_page << 12, texture_key.GetWidth(), texture_key.GetHeight(),
+                  texture_key.GetDepthOrArraySize(), uint32_t(texture_key.format),
+                  uint32_t(texture_key.tiled), uint32_t(texture_key.mip_max_level), load_base,
+                  texture.GetGuestBaseSize());
+    }
   }
 
   // Get the pipeline.
@@ -1853,7 +1463,6 @@ bool VulkanTextureCache::LoadTextureDataImpl(Texture& texture, bool load_base, b
   VkDescriptorSet descriptor_set_source_mips = VK_NULL_HANDLE;
   VkDescriptorBufferInfo write_descriptor_set_source_base_buffer_info;
   VkDescriptorBufferInfo write_descriptor_set_source_mips_buffer_info;
-  bool reads_base_mirror = false, reads_mips_mirror = false;
   if (level_first == 0) {
     descriptor_set_source_base = command_processor_.AllocateSingleTransientDescriptor(
         VulkanCommandProcessor::SingleTransientDescriptorLayout ::kStorageBufferCompute);
@@ -1877,42 +1486,10 @@ bool VulkanTextureCache::LoadTextureDataImpl(Texture& texture, bool load_base, b
       if (source_base_range > uint64_t(SharedMemory::kBufferSize) - source_base_start) {
         return false;
       }
-      // Replaced by the native source, or the mirror if there's none.
-      write_descriptor_set_source_base_buffer_info.buffer = VK_NULL_HANDLE;
+      write_descriptor_set_source_base_buffer_info.buffer = vulkan_shared_memory.buffer();
     }
     write_descriptor_set_source_base_buffer_info.offset = source_base_start;
     write_descriptor_set_source_base_buffer_info.range = source_base_range;
-    if (from_cpu && !command_processor_.UploadNativeTextureData(
-                        source_base_start_unscaled, uint32_t(source_base_range),
-                        write_descriptor_set_source_base_buffer_info)) {
-      return false;
-    }
-    if (!from_cpu &&
-        !command_processor_.UseNativeResolveBufferRange(
-            source_base_start_unscaled,
-            uint32_t(rex::align(vulkan_texture.GetGuestBaseSize(), source_length_alignment)),
-            write_descriptor_set_source_base_buffer_info, texture_key.scaled_resolve) &&
-        !(from_native_gpu &&
-          command_processor_.ComposeNativeResolveRange(
-              source_base_start_unscaled,
-              uint32_t(rex::align(vulkan_texture.GetGuestBaseSize(), source_length_alignment)),
-              texture_key.scaled_resolve != 0, write_descriptor_set_source_base_buffer_info))) {
-      reads_base_mirror = true;
-      // The prepared native range can be invalidated by a guest write before
-      // this load. Populate the fallback source rather than reading stale data.
-      if (from_native_gpu &&
-          !(texture_key.scaled_resolve
-                ? CommitScaledResolveRange(source_base_start_unscaled,
-                                           vulkan_texture.GetGuestBaseSize(),
-                                           load_shader_info.source_bpe_log2)
-                : vulkan_shared_memory.RequestRange(source_base_start_unscaled,
-                                                    uint32_t(source_base_range)))) {
-        return false;
-      }
-      // Possibly only created by the commit or the request.
-      write_descriptor_set_source_base_buffer_info.buffer =
-          texture_key.scaled_resolve ? scaled_resolve_buffer_ : vulkan_shared_memory.buffer();
-    }
     VkWriteDescriptorSet& write_descriptor_set_source_base =
         write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_source_base.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -1949,40 +1526,10 @@ bool VulkanTextureCache::LoadTextureDataImpl(Texture& texture, bool load_base, b
       if (source_mips_range > uint64_t(SharedMemory::kBufferSize) - source_mips_start) {
         return false;
       }
-      // Replaced by the native source, or the mirror if there's none.
-      write_descriptor_set_source_mips_buffer_info.buffer = VK_NULL_HANDLE;
+      write_descriptor_set_source_mips_buffer_info.buffer = vulkan_shared_memory.buffer();
     }
     write_descriptor_set_source_mips_buffer_info.offset = source_mips_start;
     write_descriptor_set_source_mips_buffer_info.range = source_mips_range;
-    if (from_cpu && !command_processor_.UploadNativeTextureData(
-                        source_mips_start_unscaled, uint32_t(source_mips_range),
-                        write_descriptor_set_source_mips_buffer_info)) {
-      return false;
-    }
-    if (!from_cpu &&
-        !command_processor_.UseNativeResolveBufferRange(
-            source_mips_start_unscaled,
-            uint32_t(rex::align(vulkan_texture.GetGuestMipsSize(), source_length_alignment)),
-            write_descriptor_set_source_mips_buffer_info, texture_key.scaled_resolve) &&
-        !(from_native_gpu &&
-          command_processor_.ComposeNativeResolveRange(
-              source_mips_start_unscaled,
-              uint32_t(rex::align(vulkan_texture.GetGuestMipsSize(), source_length_alignment)),
-              texture_key.scaled_resolve != 0, write_descriptor_set_source_mips_buffer_info))) {
-      reads_mips_mirror = true;
-      if (from_native_gpu &&
-          !(texture_key.scaled_resolve
-                ? CommitScaledResolveRange(source_mips_start_unscaled,
-                                           vulkan_texture.GetGuestMipsSize(),
-                                           load_shader_info.source_bpe_log2)
-                : vulkan_shared_memory.RequestRange(source_mips_start_unscaled,
-                                                    uint32_t(source_mips_range)))) {
-        return false;
-      }
-      // Possibly only created by the commit or the request.
-      write_descriptor_set_source_mips_buffer_info.buffer =
-          texture_key.scaled_resolve ? scaled_resolve_buffer_ : vulkan_shared_memory.buffer();
-    }
     VkWriteDescriptorSet& write_descriptor_set_source_mips =
         write_descriptor_sets[write_descriptor_set_count++];
     write_descriptor_set_source_mips.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -2000,45 +1547,15 @@ bool VulkanTextureCache::LoadTextureDataImpl(Texture& texture, bool load_base, b
     dfn.vkUpdateDescriptorSets(device, write_descriptor_set_count, write_descriptor_sets.data(), 0,
                                nullptr);
   }
-  auto use_mirror = [&](uint32_t page, uint32_t length) {
-    auto range = std::make_pair(page << 12, length);
-    if (texture_key.scaled_resolve) {
-      UseScaledResolveBufferForRead(range);
-    } else {
-      vulkan_shared_memory.Use(VulkanSharedMemory::Usage::kRead, {}, range);
-    }
-  };
-  if (reads_base_mirror) {
-    use_mirror(texture_key.base_page, vulkan_texture.GetGuestBaseSize());
-  }
-  if (reads_mips_mirror) {
-    use_mirror(texture_key.mip_page, vulkan_texture.GetGuestMipsSize());
-  }
-  if (from_cpu) {
-    static thread_local uint64_t uploads = 0, bytes = 0;
-    bytes += (load_base ? write_descriptor_set_source_base_buffer_info.range : 0) +
-             (load_mips ? write_descriptor_set_source_mips_buffer_info.range : 0);
-    if (++uploads <= 8 || !(uploads & 255)) {
-      REXGPU_INFO("[native-texture] {} loads, {} KiB, format={}, {}x{}", uploads, bytes >> 10,
-                  uint32_t(texture_key.format), width, height);
-    }
+  if (texture_key.scaled_resolve) {
+    UseScaledResolveBufferForRead();
+  } else {
+    vulkan_shared_memory.Use(VulkanSharedMemory::Usage::kRead);
   }
 
   // Submit the copy buffer population commands.
 
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
-  // GPU time attribution for the texture load dispatches below.
-  struct TextureLoadProfileScope {
-    VulkanCommandProcessor& cp;
-    explicit TextureLoadProfileScope(VulkanCommandProcessor& command_processor)
-        : cp(command_processor) {
-      cp.gpu_profiler().Mark(cp.deferred_command_buffer(),
-                             VulkanGpuProfiler::Category::kTextureLoad);
-    }
-    ~TextureLoadProfileScope() {
-      cp.gpu_profiler().Mark(cp.deferred_command_buffer(), VulkanGpuProfiler::Category::kDraw);
-    }
-  } texture_load_profile_scope(command_processor_);
 
   command_processor_.BindExternalComputePipeline(pipeline);
 
@@ -2373,31 +1890,6 @@ VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cac
   SetHostMemoryUsage(uint64_t(allocation_info.size));
 }
 
-VulkanTextureCache::VulkanTexture::VulkanTexture(VulkanTextureCache& texture_cache,
-                                                 const TextureKey& key, VkImage image,
-                                                 VkDeviceMemory memory, VkDeviceSize memory_size)
-    : Texture(texture_cache, key, true),
-      image_(image),
-      allocation_(VK_NULL_HANDLE),
-      memory_(memory) {
-  SetHostMemoryUsage(uint64_t(memory_size));
-}
-
-void VulkanTextureCache::VulkanTexture::ExchangeImage(VkImage& image, VkDeviceMemory& memory,
-                                                      std::vector<VkImageView>& retired_views_out) {
-  assert_true(memory_ != VK_NULL_HANDLE);
-  for (const auto& view_pair : views_) {
-    retired_views_out.push_back(view_pair.second);
-  }
-  views_.clear();
-  if (native_resolve_view_ != VK_NULL_HANDLE) {
-    retired_views_out.push_back(native_resolve_view_);
-    native_resolve_view_ = VK_NULL_HANDLE;
-  }
-  std::swap(image_, image);
-  std::swap(memory_, memory);
-}
-
 VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   const VulkanTextureCache& vulkan_texture_cache =
       static_cast<const VulkanTextureCache&>(texture_cache());
@@ -2414,45 +1906,7 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
   }
-  if (native_resolve_view_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyImageView(device, native_resolve_view_, nullptr);
-  }
-  if (memory_ != VK_NULL_HANDLE) {
-    dfn.vkDestroyImage(device, image_, nullptr);
-    dfn.vkFreeMemory(device, memory_, nullptr);
-  } else {
-    vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
-  }
-}
-
-VkImageView VulkanTextureCache::VulkanTexture::GetNativeResolveView() {
-  if (native_resolve_view_ != VK_NULL_HANDLE || native_resolve_format_ == VK_FORMAT_UNDEFINED) {
-    return native_resolve_view_;
-  }
-  const VulkanTextureCache& vulkan_texture_cache =
-      static_cast<const VulkanTextureCache&>(texture_cache());
-  const ui::vulkan::VulkanDevice* const vulkan_device =
-      vulkan_texture_cache.command_processor_.GetVulkanDevice();
-  VkImageViewCreateInfo view_create_info;
-  view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  view_create_info.pNext = nullptr;
-  view_create_info.flags = 0;
-  view_create_info.image = image_;
-  view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view_create_info.format = native_resolve_format_;
-  view_create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
-  view_create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
-  view_create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
-  view_create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
-  view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange(
-      VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1);
-  if (vulkan_device->functions().vkCreateImageView(vulkan_device->device(), &view_create_info,
-                                                   nullptr, &native_resolve_view_) != VK_SUCCESS) {
-    native_resolve_view_ = VK_NULL_HANDLE;
-    // Don't retry.
-    native_resolve_format_ = VK_FORMAT_UNDEFINED;
-  }
-  return native_resolve_view_;
+  vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
 }
 
 VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
@@ -2486,20 +1940,6 @@ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t 
 
   if (!vulkan_device->properties().imageViewFormatSwizzle) {
     host_swizzle = xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
-  } else if (content_red_blue_swapped_) {
-    // The image has red and blue in the other order (taken over from a render
-    // target by a resolve that swaps them).
-    uint32_t swapped_swizzle = 0;
-    for (uint32_t i = 0; i < 4; ++i) {
-      uint32_t component = (host_swizzle >> (3 * i)) & 0b111;
-      if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_R) {
-        component = xenos::XE_GPU_TEXTURE_SWIZZLE_B;
-      } else if (component == xenos::XE_GPU_TEXTURE_SWIZZLE_B) {
-        component = xenos::XE_GPU_TEXTURE_SWIZZLE_R;
-      }
-      swapped_swizzle |= component << (3 * i);
-    }
-    host_swizzle = swapped_swizzle;
   }
   view_key.host_swizzle = host_swizzle;
 
@@ -2678,26 +2118,11 @@ VulkanTextureCache::VulkanTextureCache(const RegisterFile& register_file,
       command_processor_(command_processor),
       guest_shader_pipeline_stages_(guest_shader_pipeline_stages) {}
 
-bool VulkanTextureCache::InitializeScaledResolveBuffer(bool defer) {
+bool VulkanTextureCache::InitializeScaledResolveBuffer() {
   assert_true(IsDrawResolutionScaled());
 
   uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * uint64_t(draw_resolution_scale_y());
   scaled_resolve_buffer_size_ = uint64_t(SharedMemory::kBufferSize) * scale_area;
-
-  if (defer) {
-    // Native resources don't need this address space, even when the driver
-    // supports sparse buffers. Create it only for an actual legacy consumer.
-    scaled_resolve_buffer_deferred_ = true;
-    scaled_resolve_buffer_sparse_ = false;
-    scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
-    scaled_resolve_last_usage_write_ = false;
-    scaled_resolve_last_written_range_ = {0, 0};
-    return true;
-  }
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, 0,
-      "allocate the scaled resolve mirror");
-  scaled_resolve_buffer_deferred_ = false;
 
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -2716,8 +2141,7 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer(bool defer) {
   buffer_create_info.queueFamilyIndexCount = 0;
   buffer_create_info.pQueueFamilyIndices = nullptr;
 
-  if (REXCVAR_GET(vulkan_sparse_scaled_resolve_buffer) &&
-      vulkan_device->properties().sparseResidencyBuffer &&
+  if (vulkan_device->properties().sparseResidencyBuffer &&
       dfn.vkCreateBuffer(device, &buffer_create_info, nullptr, &scaled_resolve_buffer_) ==
           VK_SUCCESS) {
     VkMemoryRequirements memory_requirements;
@@ -2738,8 +2162,6 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer(bool defer) {
           std::max(uint32_t(6), size_log2 - scaled_resolve_sparse_granularity_log2_);
       scaled_resolve_sparse_allocated_.resize(size_t(1) << (allocation_count_log2 - uint32_t(6)));
       scaled_resolve_buffer_sparse_ = true;
-      command_processor_.native_gpu_diagnostics().RecordAllocation(
-          NativeGpuDiagnostics::Allocation::kScaledMirror, scaled_resolve_buffer_size_, 0);
     } else {
       dfn.vkDestroyBuffer(device, scaled_resolve_buffer_, nullptr);
       scaled_resolve_buffer_ = VK_NULL_HANDLE;
@@ -2747,11 +2169,18 @@ bool VulkanTextureCache::InitializeScaledResolveBuffer(bool defer) {
   }
 
   if (scaled_resolve_buffer_ == VK_NULL_HANDLE) {
-    // Without sparse binding the buffer needs all of its memory at once, so
-    // it's created when something first needs it - native resolves and
-    // textures don't (EnsureScaledResolveBufferAllocated).
+    buffer_create_info.flags = 0;
+    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+            vulkan_device, scaled_resolve_buffer_size_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            ui::vulkan::util::MemoryPurpose::kDeviceLocal, scaled_resolve_buffer_,
+            scaled_resolve_buffer_memory_.emplace_back(), &scaled_resolve_buffer_memory_type_)) {
+      REXGPU_ERROR(
+          "VulkanTextureCache: Failed to create a scaled resolve buffer with "
+          "{} MB address space",
+          scaled_resolve_buffer_size_ >> 20);
+      return false;
+    }
     scaled_resolve_buffer_sparse_ = false;
-    scaled_resolve_buffer_deferred_ = true;
     scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
     scaled_resolve_sparse_allocated_.clear();
   }
@@ -2774,7 +2203,6 @@ void VulkanTextureCache::ShutdownScaledResolveBuffer() {
   scaled_resolve_sparse_allocated_.clear();
   scaled_resolve_buffer_size_ = 0;
   scaled_resolve_buffer_sparse_ = false;
-  scaled_resolve_buffer_deferred_ = false;
   scaled_resolve_buffer_memory_type_ = UINT32_MAX;
   scaled_resolve_sparse_granularity_log2_ = UINT32_MAX;
   scaled_resolve_last_usage_write_ = false;
@@ -2816,33 +2244,6 @@ bool VulkanTextureCache::GetScaledResolveRange(uint32_t start_unscaled, uint32_t
 
 bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scaled,
                                                             uint64_t length_scaled) {
-  if (scaled_resolve_buffer_deferred_ && !scaled_resolve_buffer_ &&
-      !InitializeScaledResolveBuffer(false)) {
-    return false;
-  }
-  if (scaled_resolve_buffer_deferred_) {
-    scaled_resolve_buffer_deferred_ = false;
-    VkDeviceSize resident_size = 0;
-    if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
-            command_processor_.GetVulkanDevice(), scaled_resolve_buffer_size_,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-            scaled_resolve_buffer_, scaled_resolve_buffer_memory_.emplace_back(),
-            &scaled_resolve_buffer_memory_type_, &resident_size)) {
-      scaled_resolve_buffer_memory_.pop_back();
-      REXGPU_ERROR(
-          "VulkanTextureCache: Failed to create a scaled resolve buffer with "
-          "{} MB address space",
-          scaled_resolve_buffer_size_ >> 20);
-      return false;
-    }
-    REXGPU_INFO("VulkanTextureCache: created the {} MB scaled resolve buffer when first needed",
-                scaled_resolve_buffer_size_ >> 20);
-    command_processor_.native_gpu_diagnostics().RecordAllocation(
-        NativeGpuDiagnostics::Allocation::kScaledMirror, scaled_resolve_buffer_size_, resident_size);
-  }
-  if (scaled_resolve_buffer_ == VK_NULL_HANDLE) {
-    return false;
-  }
   if (!length_scaled || !scaled_resolve_buffer_sparse_) {
     return true;
   }
@@ -2875,8 +2276,6 @@ bool VulkanTextureCache::EnsureScaledResolveBufferAllocated(uint64_t start_scale
           "scaled resolve buffer");
       return false;
     }
-    command_processor_.native_gpu_diagnostics().RecordAllocation(
-        NativeGpuDiagnostics::Allocation::kScaledMirror, 0, memory_allocate_info.allocationSize);
     scaled_resolve_buffer_memory_.push_back(allocation_memory);
 
     VkSparseMemoryBind bind;
@@ -2903,39 +2302,11 @@ void VulkanTextureCache::GetScaledResolveUsageMasks(VkPipelineStageFlags& stage_
   stage_mask_out = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
   access_mask_out = VK_ACCESS_SHADER_READ_BIT;
   if (write) {
-    // Resolves write it from compute shaders, native resolves from fragment
-    // shaders.
-    stage_mask_out |= VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
     access_mask_out |= VK_ACCESS_SHADER_WRITE_BIT;
-  }
-  if (REXCVAR_GET(native_resolve_buffers)) {
-    // Compact native resolves preserve and copy back tiled padding, too.
-    stage_mask_out |= VK_PIPELINE_STAGE_TRANSFER_BIT;
-    access_mask_out |= VK_ACCESS_TRANSFER_READ_BIT;
-    if (write) {
-      access_mask_out |= VK_ACCESS_TRANSFER_WRITE_BIT;
-    }
   }
 }
 
-void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint32_t> read_range) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kScaledMirrorRead, read_range.second,
-      fmt::format("{:08X}+{} at {}", read_range.first, read_range.second,
-                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
-  const void* census_trigger_previous = SharedMemory::CensusTrigger();
-  if (SharedMemory::CensusEnabled()) {
-    SharedMemory::CensusRecord(__builtin_return_address(0), SharedMemory::kCensusKindScaledRead,
-                               read_range.second);
-    SharedMemory::CensusTrigger() = __builtin_return_address(0);
-  }
-  bool flushed = !native_resolve_memory_flusher_ ||
-                 native_resolve_memory_flusher_(read_range.first, read_range.second);
-  SharedMemory::CensusTrigger() = census_trigger_previous;
-  if (!flushed) {
-    REXGPU_ERROR("Texture cache: failed to preserve native scaled resolve data before reading");
-    return;
-  }
+void VulkanTextureCache::UseScaledResolveBufferForRead() {
   if (!scaled_resolve_buffer_) {
     return;
   }
@@ -2965,26 +2336,6 @@ void VulkanTextureCache::UseScaledResolveBufferForRead(std::pair<uint32_t, uint3
 
 void VulkanTextureCache::UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
                                                         uint64_t written_length_scaled) {
-  command_processor_.native_gpu_diagnostics().RecordDependency(
-      NativeGpuDiagnostics::Dependency::kScaledMirrorWrite, written_length_scaled,
-      fmt::format("{:X}+{} at {}", written_start_scaled, written_length_scaled,
-                  SharedMemory::DescribeCodeAddress(__builtin_return_address(0))));
-  uint64_t scale_area = uint64_t(draw_resolution_scale_x()) * draw_resolution_scale_y();
-  const void* census_trigger_previous = SharedMemory::CensusTrigger();
-  if (SharedMemory::CensusEnabled()) {
-    SharedMemory::CensusRecord(__builtin_return_address(0), SharedMemory::kCensusKindScaledWrite,
-                               written_length_scaled);
-    SharedMemory::CensusTrigger() = __builtin_return_address(0);
-  }
-  bool flushed = !native_resolve_memory_flusher_ || !scale_area ||
-                 native_resolve_memory_flusher_(
-                     uint32_t(written_start_scaled / scale_area),
-                     uint32_t((written_length_scaled + scale_area - 1) / scale_area));
-  SharedMemory::CensusTrigger() = census_trigger_previous;
-  if (!flushed) {
-    REXGPU_ERROR("Texture cache: failed to preserve native scaled resolve data before writing");
-    return;
-  }
   if (!scaled_resolve_buffer_) {
     return;
   }
@@ -3092,6 +2443,30 @@ bool VulkanTextureCache::Initialize() {
     host_format_bgrg.format_unsigned.block_compressed = false;
     host_format_bgrg.unsigned_signed_compatible = false;
   }
+  // Expand R5G6B5 while loading if the native packed format can't be sampled.
+  HostFormatPair& host_format_r5g6b5 = host_formats_[uint32_t(xenos::TextureFormat::k_5_6_5)];
+  assert_true(host_format_r5g6b5.format_unsigned.format == VK_FORMAT_R5G6B5_UNORM_PACK16);
+  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_R5G6B5_UNORM_PACK16,
+                                          &format_properties);
+  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+    host_format_r5g6b5.format_unsigned.load_shader = kLoadShaderIndexR5G6B5ToRGBA8;
+    host_format_r5g6b5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+    host_format_r5g6b5.format_unsigned.block_compressed = false;
+    host_format_r5g6b5.unsigned_signed_compatible = false;
+  }
+  // MoltenVK doesn't expose B4G4R4A4 sampling on all Metal devices. Expand
+  // guest RGBA4444 texels to the universally supported RGBA8 format while
+  // loading them instead of dropping the texture binding entirely.
+  HostFormatPair& host_format_rgba4 = host_formats_[uint32_t(xenos::TextureFormat::k_4_4_4_4)];
+  assert_true(host_format_rgba4.format_unsigned.format == VK_FORMAT_B4G4R4A4_UNORM_PACK16);
+  ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_B4G4R4A4_UNORM_PACK16,
+                                          &format_properties);
+  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+    host_format_rgba4.format_unsigned.load_shader = kLoadShaderIndexRGBA4ToRGBA8;
+    host_format_rgba4.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
+    host_format_rgba4.format_unsigned.block_compressed = false;
+    host_format_rgba4.unsigned_signed_compatible = false;
+  }
   // k_10_11_11, k_11_11_10 (+ _AS_16_16_16_16 variants) - if normalized
   // R16G16B16A16 is not linearly filterable, decode to normalized 16-bit in a
   // scratch buffer first, then convert it to float16 in-place in a second pass
@@ -3136,11 +2511,15 @@ bool VulkanTextureCache::Initialize() {
   // decompressed.
   // TODO(Triang3l): S3TC -> 5551 or 4444 as an option.
   // TODO(Triang3l): S3TC -> ETC2 / EAC (a huge research topic).
+  // vulkan_texture_bc_decompress takes the decompression path even where BC is
+  // supported, so a Mac can test what an iPhone (no BC) runs.
+  const bool bc_decompress = REXCVAR_GET(vulkan_texture_bc_decompress);
   HostFormatPair& host_format_dxt1 = host_formats_[uint32_t(xenos::TextureFormat::k_DXT1)];
   assert_true(host_format_dxt1.format_unsigned.format == VK_FORMAT_BC1_RGBA_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC1_RGBA_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (bc_decompress ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt1.format_unsigned.load_shader = kLoadShaderIndexDXT1ToRGBA8;
     host_format_dxt1.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt1.format_unsigned.block_compressed = false;
@@ -3150,7 +2529,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt2_3.format_unsigned.format == VK_FORMAT_BC2_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC2_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (bc_decompress ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt2_3.format_unsigned.load_shader = kLoadShaderIndexDXT3ToRGBA8;
     host_format_dxt2_3.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt2_3.format_unsigned.block_compressed = false;
@@ -3160,7 +2540,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt4_5.format_unsigned.format == VK_FORMAT_BC3_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC3_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (bc_decompress ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt4_5.format_unsigned.load_shader = kLoadShaderIndexDXT5ToRGBA8;
     host_format_dxt4_5.format_unsigned.format = VK_FORMAT_R8G8B8A8_UNORM;
     host_format_dxt4_5.format_unsigned.block_compressed = false;
@@ -3170,7 +2551,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxn.format_unsigned.format == VK_FORMAT_BC5_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC5_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (bc_decompress ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxn.format_unsigned.load_shader = kLoadShaderIndexDXNToRG8;
     host_format_dxn.format_unsigned.format = VK_FORMAT_R8G8_UNORM;
     host_format_dxn.format_unsigned.block_compressed = false;
@@ -3179,7 +2561,8 @@ bool VulkanTextureCache::Initialize() {
   assert_true(host_format_dxt5a.format_unsigned.format == VK_FORMAT_BC4_UNORM_BLOCK);
   ifn.vkGetPhysicalDeviceFormatProperties(physical_device, VK_FORMAT_BC4_UNORM_BLOCK,
                                           &format_properties);
-  if ((format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
+  if (bc_decompress ||
+      (format_properties.optimalTilingFeatures & kLinearFilterFeatures) != kLinearFilterFeatures) {
     host_format_dxt5a.format_unsigned.load_shader = kLoadShaderIndexDXT5AToR8;
     host_format_dxt5a.format_unsigned.format = VK_FORMAT_R8_UNORM;
     host_format_dxt5a.format_unsigned.block_compressed = false;
@@ -3468,12 +2851,16 @@ bool VulkanTextureCache::Initialize() {
                      sizeof(shaders::texture_load_r5g5b5a1_b5g5r5a1_cs));
   load_shader_code[kLoadShaderIndexR5G6B5ToB5G6R5] = std::make_pair(
       shaders::texture_load_r5g6b5_b5g6r5_cs, sizeof(shaders::texture_load_r5g6b5_b5g6r5_cs));
+  load_shader_code[kLoadShaderIndexR5G6B5ToRGBA8] = std::make_pair(
+      shaders::texture_load_r5g6b5_rgba8_cs, sizeof(shaders::texture_load_r5g6b5_rgba8_cs));
   load_shader_code[kLoadShaderIndexR5G5B6ToB5G6R5WithRBGASwizzle] =
       std::make_pair(shaders::texture_load_r5g5b6_b5g6r5_swizzle_rbga_cs,
                      sizeof(shaders::texture_load_r5g5b6_b5g6r5_swizzle_rbga_cs));
   load_shader_code[kLoadShaderIndexRGBA4ToARGB4] =
       std::make_pair(shaders::texture_load_r4g4b4a4_a4r4g4b4_cs,
                      sizeof(shaders::texture_load_r4g4b4a4_a4r4g4b4_cs));
+  load_shader_code[kLoadShaderIndexRGBA4ToRGBA8] = std::make_pair(
+      shaders::texture_load_r4g4b4a4_rgba8_cs, sizeof(shaders::texture_load_r4g4b4a4_rgba8_cs));
   load_shader_code[kLoadShaderIndexGBGR8ToRGB8] = std::make_pair(
       shaders::texture_load_gbgr8_rgb8_cs, sizeof(shaders::texture_load_gbgr8_rgb8_cs));
   load_shader_code[kLoadShaderIndexBGRG8ToRGB8] = std::make_pair(
@@ -3541,12 +2928,18 @@ bool VulkanTextureCache::Initialize() {
     load_shader_code_scaled[kLoadShaderIndexR5G6B5ToB5G6R5] =
         std::make_pair(shaders::texture_load_r5g6b5_b5g6r5_scaled_cs,
                        sizeof(shaders::texture_load_r5g6b5_b5g6r5_scaled_cs));
+    load_shader_code_scaled[kLoadShaderIndexR5G6B5ToRGBA8] =
+        std::make_pair(shaders::texture_load_r5g6b5_rgba8_scaled_cs,
+                       sizeof(shaders::texture_load_r5g6b5_rgba8_scaled_cs));
     load_shader_code_scaled[kLoadShaderIndexR5G5B6ToB5G6R5WithRBGASwizzle] =
         std::make_pair(shaders::texture_load_r5g5b6_b5g6r5_swizzle_rbga_scaled_cs,
                        sizeof(shaders::texture_load_r5g5b6_b5g6r5_swizzle_rbga_scaled_cs));
     load_shader_code_scaled[kLoadShaderIndexRGBA4ToARGB4] =
         std::make_pair(shaders::texture_load_r4g4b4a4_a4r4g4b4_scaled_cs,
                        sizeof(shaders::texture_load_r4g4b4a4_a4r4g4b4_scaled_cs));
+    load_shader_code_scaled[kLoadShaderIndexRGBA4ToRGBA8] =
+        std::make_pair(shaders::texture_load_r4g4b4a4_rgba8_scaled_cs,
+                       sizeof(shaders::texture_load_r4g4b4a4_rgba8_scaled_cs));
     load_shader_code_scaled[kLoadShaderIndexR10G11B11ToRGBA16] =
         std::make_pair(shaders::texture_load_r10g11b11_rgba16_scaled_cs,
                        sizeof(shaders::texture_load_r10g11b11_rgba16_scaled_cs));
@@ -3898,17 +3291,6 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
       // post-processing passes, and not during emulation where it'd be used in
       // other stages.
       stage_mask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-      access_mask = VK_ACCESS_SHADER_READ_BIT;
-      layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-      break;
-    case VulkanTexture::Usage::kNativeResolveWrite:
-      // Loaded, as a resolve may cover only a part of the texture.
-      stage_mask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-      access_mask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-      layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-      break;
-    case VulkanTexture::Usage::kScaledMemoryWriteback:
-      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
       access_mask = VK_ACCESS_SHADER_READ_BIT;
       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
       break;

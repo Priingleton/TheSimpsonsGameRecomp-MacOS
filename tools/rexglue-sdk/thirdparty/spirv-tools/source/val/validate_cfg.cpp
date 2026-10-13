@@ -345,6 +345,9 @@ spv_result_t ValidateLoopMerge(ValidationState_t& _, const Instruction* inst) {
   if ((loop_control >> spv::LoopControlShift::PartialCount) & 0x1) {
     ++operand;
   }
+  if ((loop_control >> spv::LoopControlShift::MultipleWaitQueuesQCOM) & 0x1) {
+    ++operand;
+  }
 
   // That the right number of operands is present is checked by the parser. The
   // above code tracks operands for expanded validation checking in the future.
@@ -1205,6 +1208,7 @@ spv_result_t CfgPass(ValidationState_t& _, const Instruction* inst) {
     case spv::Op::OpIgnoreIntersectionKHR:
     case spv::Op::OpTerminateRayKHR:
     case spv::Op::OpEmitMeshTasksEXT:
+    case spv::Op::OpAbortKHR:
       _.current_function().RegisterBlockEnd(std::vector<uint32_t>());
       // Ops with dedicated passes check for the Execution Model there
       if (opcode == spv::Op::OpKill) {

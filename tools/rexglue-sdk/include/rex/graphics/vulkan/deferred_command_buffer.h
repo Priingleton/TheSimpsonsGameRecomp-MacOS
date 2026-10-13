@@ -29,6 +29,14 @@ class DeferredCommandBuffer {
                         size_t initial_size_bytes = 1024 * 1024);
 
   void Reset();
+
+  // Shrinks every render pass in the recorded stream to the region its draws
+  // and clears can write: the union of the scissors in effect at its draws and
+  // of its clear rectangles. Render target cache passes otherwise cover the
+  // whole host render target, which reaches down to the end of EDRAM (2048 rows
+  // for a 1280-wide one), and a tile-based GPU loads and stores every tile of
+  // the render area per pass.
+  void TightenRenderAreas();
   void Execute(VkCommandBuffer command_buffer);
 
   // render_pass_begin->pNext of all barriers must be null.
@@ -181,16 +189,6 @@ class DeferredCommandBuffer {
                 sizeof(VkBufferCopy) * region_count);
   }
 
-  // HAND PATCH: see ArgsVkFillBuffer.
-  void CmdVkFillBuffer(VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, uint32_t data) {
-    auto& args = *reinterpret_cast<ArgsVkFillBuffer*>(
-        WriteCommand(Command::kVkFillBuffer, sizeof(ArgsVkFillBuffer)));
-    args.buffer = buffer;
-    args.offset = offset;
-    args.size = size;
-    args.data = data;
-  }
-
   void CmdVkBeginQuery(VkQueryPool query_pool, uint32_t query, VkQueryControlFlags flags) {
     auto& args = *reinterpret_cast<ArgsVkBeginQuery*>(
         WriteCommand(Command::kVkBeginQuery, sizeof(ArgsVkBeginQuery)));
@@ -218,36 +216,6 @@ class DeferredCommandBuffer {
                               const VkBufferImageCopy* regions) {
     std::memcpy(CmdCopyBufferToImageEmplace(src_buffer, dst_image, dst_image_layout, region_count),
                 regions, sizeof(VkBufferImageCopy) * region_count);
-  }
-
-  void CmdVkCopyImage(VkImage src_image, VkImageLayout src_image_layout, VkImage dst_image,
-                      VkImageLayout dst_image_layout, uint32_t region_count,
-                      const VkImageCopy* regions) {
-    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
-    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
-        WriteCommand(Command::kVkCopyImage, header_size + sizeof(VkImageCopy) * region_count));
-    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
-    args.src_image = src_image;
-    args.src_image_layout = src_image_layout;
-    args.dst_image = dst_image;
-    args.dst_image_layout = dst_image_layout;
-    args.region_count = region_count;
-    std::memcpy(args_ptr + header_size, regions, sizeof(VkImageCopy) * region_count);
-  }
-
-  void CmdVkCopyImageToBuffer(VkImage src_image, VkImageLayout src_image_layout,
-                              VkBuffer dst_buffer, uint32_t region_count,
-                              const VkBufferImageCopy* regions) {
-    const size_t header_size =
-        rex::align(sizeof(ArgsVkCopyImageToBuffer), alignof(VkBufferImageCopy));
-    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(WriteCommand(
-        Command::kVkCopyImageToBuffer, header_size + sizeof(VkBufferImageCopy) * region_count));
-    auto& args = *reinterpret_cast<ArgsVkCopyImageToBuffer*>(args_ptr);
-    args.src_image = src_image;
-    args.src_image_layout = src_image_layout;
-    args.dst_buffer = dst_buffer;
-    args.region_count = region_count;
-    std::memcpy(args_ptr + header_size, regions, sizeof(VkBufferImageCopy) * region_count);
   }
 
   void CmdVkCopyQueryPoolResults(VkQueryPool query_pool, uint32_t first_query, uint32_t query_count,
@@ -380,18 +348,6 @@ class DeferredCommandBuffer {
     args.mask_reference = write_mask;
   }
 
-  // vkCmdWriteTimestamp is not in the device function table; the GPU profiler
-  // loads it and sets this before recording any timestamp.
-  static inline PFN_vkCmdWriteTimestamp cmd_write_timestamp_ = nullptr;
-  void CmdVkWriteTimestamp(VkPipelineStageFlagBits pipeline_stage, VkQueryPool query_pool,
-                           uint32_t query) {
-    auto& args = *reinterpret_cast<ArgsVkWriteTimestamp*>(
-        WriteCommand(Command::kVkWriteTimestamp, sizeof(ArgsVkWriteTimestamp)));
-    args.pipeline_stage = pipeline_stage;
-    args.query_pool = query_pool;
-    args.query = query;
-  }
-
   void CmdVkSetViewport(uint32_t first_viewport, uint32_t viewport_count,
                         const VkViewport* viewports) {
     const size_t header_size = rex::align(sizeof(ArgsVkSetViewport), alignof(VkViewport));
@@ -414,9 +370,7 @@ class DeferredCommandBuffer {
     kVkClearAttachments,
     kVkClearColorImage,
     kVkCopyBuffer,
-    kVkFillBuffer,  // HAND PATCH
     kVkCopyBufferToImage,
-    kVkCopyImageToBuffer,
     kVkCopyQueryPoolResults,
     kVkDispatch,
     kVkDraw,
@@ -435,8 +389,6 @@ class DeferredCommandBuffer {
     kVkSetStencilReference,
     kVkSetStencilWriteMask,
     kVkSetViewport,
-    kVkWriteTimestamp,
-    kVkCopyImage,
   };
 
   struct CommandHeader {
@@ -523,14 +475,6 @@ class DeferredCommandBuffer {
     static_assert(alignof(VkImageSubresourceRange) <= alignof(uintmax_t));
   };
 
-  // HAND PATCH: for EDRAM zero-initialization (see render_target_cache).
-  struct ArgsVkFillBuffer {
-    VkBuffer buffer;
-    VkDeviceSize offset;
-    VkDeviceSize size;
-    uint32_t data;
-  };
-
   struct ArgsVkCopyBuffer {
     VkBuffer src_buffer;
     VkBuffer dst_buffer;
@@ -543,25 +487,6 @@ class DeferredCommandBuffer {
     VkBuffer src_buffer;
     VkImage dst_image;
     VkImageLayout dst_image_layout;
-    uint32_t region_count;
-    // Followed by aligned VkBufferImageCopy[].
-    static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
-  };
-
-  struct ArgsVkCopyImage {
-    VkImage src_image;
-    VkImageLayout src_image_layout;
-    VkImage dst_image;
-    VkImageLayout dst_image_layout;
-    uint32_t region_count;
-    // Followed by aligned VkImageCopy[].
-    static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
-  };
-
-  struct ArgsVkCopyImageToBuffer {
-    VkImage src_image;
-    VkImageLayout src_image_layout;
-    VkBuffer dst_buffer;
     uint32_t region_count;
     // Followed by aligned VkBufferImageCopy[].
     static_assert(alignof(VkBufferImageCopy) <= alignof(uintmax_t));
@@ -607,12 +532,6 @@ class DeferredCommandBuffer {
     VkQueryPool query_pool;
     uint32_t first_query;
     uint32_t query_count;
-  };
-
-  struct ArgsVkWriteTimestamp {
-    VkPipelineStageFlagBits pipeline_stage;
-    VkQueryPool query_pool;
-    uint32_t query;
   };
 
   struct ArgsVkPipelineBarrier {

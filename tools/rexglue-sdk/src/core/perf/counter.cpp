@@ -9,9 +9,9 @@
  *              See LICENSE file in the project root for full license text.
  */
 #include <rex/perf/counter.h>
-#include <rex/perf/frame_index.h>
 
 #include <rex/cvar.h>
+#include <rex/filesystem.h>
 #include <rex/logging.h>
 
 #include <array>
@@ -28,11 +28,7 @@ namespace {
 
 constexpr size_t kNumCounters = static_cast<size_t>(CounterId::kCount);
 
-// Each counter on its own cache line: different threads (the GPU command
-// processor, audio, guest threads) increment different counters, and packed
-// together every increment bounced the shared lines between cores.
-struct alignas(64) PaddedCounter : std::atomic<int64_t> {};
-std::array<PaddedCounter, kNumCounters> g_counters{};
+std::array<std::atomic<int64_t>, kNumCounters> g_counters{};
 std::array<std::atomic<int64_t>, kNumCounters> g_snapshot{};
 
 constexpr const char* kCounterNames[] = {
@@ -53,27 +49,6 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
-    "watch_faults",
-    "watch_fault_us",
-    "watch_protects",
-    "command_processor_cpu_us",
-    "cp_draw_us",
-    "cp_texture_request_us",
-    "cp_upload_us",
-    "cp_copy_us",
-    "cp_swap_us",
-    "upload_bytes",
-    "upload_lock_wait_us",
-    "upload_scan_us",
-    "upload_valid_us",
-    "upload_copy_us",
-    "upload_pool_us",
-    "watch_protect_us",
-    "cp_ring_idle_us",
-    "cp_wait_reg_mem_us",
-    "cp_gpu_fence_us",
-    "guest_swap_cpu_us",
-    "guest_swap_interval_us",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -97,27 +72,6 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
-    false,  // kWatchFaults
-    false,  // kWatchFaultUs
-    false,  // kWatchProtects
-    false,  // kCommandProcessorCpuUs (set each frame)
-    false,  // kCpDrawUs
-    false,  // kCpTextureRequestUs
-    false,  // kCpUploadUs
-    false,  // kCpCopyUs
-    false,  // kCpSwapUs
-    false,  // kUploadBytes
-    false,  // kUploadLockWaitUs
-    false,  // kUploadScanUs
-    false,  // kUploadValidUs
-    false,  // kUploadCopyUs
-    false,  // kUploadPoolUs
-    false,  // kWatchProtectUs
-    false,  // kCpRingIdleUs
-    false,  // kCpWaitRegMemUs
-    false,  // kCpGpuFenceUs
-    false,  // kGuestSwapCpuUs
-    false,  // kGuestSwapIntervalUs
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
@@ -183,22 +137,17 @@ void SetCsvLogPath(const std::string& path) {
   if (path.empty())
     return;
 
-  g_csv_file = std::fopen(path.c_str(), "w");
+  g_csv_file = rex::filesystem::OpenFile(rex::to_path(path), "w");
   if (!g_csv_file) {
     REXLOG_WARN("perf: failed to open CSV log: {}", path);
     g_csv_path.clear();
     return;
   }
 
-  // Write header. The two frame-identity columns come first so a row can be
-  // joined against anything else recorded during the session -- guest-side
-  // draw telemetry stamps the same guest_frame, and logging the command
-  // processor's own frame index alongside it makes the guest/CP skew visible
-  // rather than assumed. Without these the CSV is a pile of anonymous rows
-  // that cannot be attributed to a scene.
-  std::fputs("guest_frame,cp_frame", g_csv_file);
+  // Write header
   for (size_t i = 0; i < kNumCounters; ++i) {
-    std::fputc(',', g_csv_file);
+    if (i > 0)
+      std::fputc(',', g_csv_file);
     std::fputs(kCounterNames[i], g_csv_file);
   }
   std::fputc('\n', g_csv_file);
@@ -208,10 +157,9 @@ void WriteCsvFrame() {
   if (!g_csv_file)
     return;
 
-  std::fprintf(g_csv_file, "%llu,%llu", static_cast<unsigned long long>(GuestFrameIndex()),
-               static_cast<unsigned long long>(g_csv_frame_count));
   for (size_t i = 0; i < kNumCounters; ++i) {
-    std::fputc(',', g_csv_file);
+    if (i > 0)
+      std::fputc(',', g_csv_file);
     std::fprintf(g_csv_file, "%lld",
                  static_cast<long long>(g_snapshot[i].load(std::memory_order_relaxed)));
   }

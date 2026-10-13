@@ -9,37 +9,32 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
-#include <atomic>
 #include <algorithm>
-#include <chrono>
-#include <ctime>
-#include <condition_variable>
-#include <mutex>
-#include <bitset>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
-#include <string>
 #include <string_view>
-#include <unordered_map>
-#include <vector>
 
 #include <fmt/format.h>
 
+#include <chrono>
+
+#include <rex/platform.h>
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+#include <pthread/qos.h>
+#endif
 #include <rex/cvar.h>
 #include <rex/dbg.h>
 #include <rex/perf/counter.h>
-#include <rex/perf/event_trace.h>
 #include <rex/chrono/clock.h>
+#include <rex/graphics/ring_progress.h>
 #include <rex/graphics/command_processor.h>
 #include <rex/graphics/flags.h>
+#include <rex/graphics/guest_frame_stats.h>
 #include <rex/graphics/graphics_system.h>
-#include <rex/graphics/native_records.h>
-#include <rex/graphics/ring_progress.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/sampler_info.h>
 #include <rex/graphics/xenos.h>
-#include <rex/hash.h>
 #include <rex/logging.h>
 #include <rex/math.h>
 #include <rex/memory.h>
@@ -48,82 +43,19 @@
 #include <rex/system/kernel_state.h>
 #include <rex/system/user_module.h>
 
-#if REX_PLATFORM_LINUX
-#include <sys/resource.h>
-#elif REX_PLATFORM_WIN32
-// clang-format off
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-// clang-format on
-#endif
-#if REX_HAS_D3D11
-#include <rex/graphics/d3d11/profile.h>
-#endif
-
-namespace rex::memory {
-// Defined in xmemory.cpp, for the gpu_wait_stats log.
-extern std::atomic<uint64_t> g_watch_protect_calls;
-extern std::atomic<uint64_t> g_watch_protect_ticks;
-extern std::atomic<uint64_t> g_watch_fault_count;
-extern std::atomic<uint64_t> g_watch_fault_ticks;
-extern std::atomic<uint32_t> g_watch_region_protects[512];
-extern std::atomic<uint32_t> g_watch_region_protect_pages[512];
-extern std::atomic<uint32_t> g_watch_region_faults[512];
-extern std::atomic<uint32_t> g_watch_view_protects[3];
-}  // namespace rex::memory
-
-namespace rex::graphics {
-// Defined in shared_memory.cpp, for the gpu_wait_stats log.
-extern std::atomic<uint64_t> g_watch_arms_vertex;
-extern std::atomic<uint64_t> g_watch_arms_other;
-extern std::atomic<uint64_t> g_streamed_page_uploads;
-extern std::atomic<uint64_t> g_streamed_page_max_uploads;
-extern std::atomic<uint64_t> g_streamed_pages_over[4];
-}  // namespace rex::graphics
-
-namespace rex::ui {
-// Defined in presenter.cpp, for the gpu_wait_stats log.
-extern std::atomic<uint64_t> g_host_presents;
-extern std::atomic<uint64_t> g_present_max_ticks[10];
-extern std::atomic<uint64_t> g_present_total_ticks[10];
-}  // namespace rex::ui
-
-#if REX_HAS_VULKAN
-namespace rex::graphics::vulkan {
-// Defined in vulkan/command_processor.cpp and vulkan/render_target_cache.cpp,
-// for the gpu_wait_stats log.
-extern std::atomic<uint64_t> g_submission_build_ticks;
-extern std::atomic<uint64_t> g_submission_submit_ticks;
-extern std::atomic<uint64_t> g_submission_count;
-extern std::atomic<uint64_t> g_memexport_readback_ticks;
-extern std::atomic<uint64_t> g_stencil_enabled_draws;
-extern std::atomic<uint64_t> g_stencil_write_draws;
-extern std::atomic<uint64_t> g_stencil_nonzero_clears;
-}  // namespace rex::graphics::vulkan
-#endif  // REX_HAS_VULKAN
-
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-REXCVAR_DEFINE_BOOL(gpu_incremental_read_pointer, false, "GPU",
-                    "Write the ring buffer read pointer back after every primary packet instead "
-                    "of once per batch, so the game can reuse command memory sooner");
+REXCVAR_DEFINE_INT32(framerate_limit, 0, "GPU",
+                     "Most guest frames presented per second; 0 = unlimited. Paces the swap "
+                     "itself, so it holds on any display refresh rate (a 120 Hz panel would "
+                     "otherwise let a title that does not wait for vblank run at 120) without "
+                     "touching the guest's vblank timing.")
+    .range(0, 1000)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_INT32(gpu_wait_stats, 0, "GPU",
-                     "Log where the command processor thread spends its time (waiting for the "
-                     "game, WAIT_REG_MEM, host GPU fences, swaps) every N frames "
-                     "(0 = off; diagnostic)");
-
-REXCVAR_DEFINE_BOOL(clear_memory_page_state, false, "GPU",
-                    "At every frame end, forget which guest memory pages the GPU has an "
-                    "up-to-date copy of (except GPU-written ones), so the next frame uploads "
-                    "every vertex and index buffer it uses again. Write watches already catch "
-                    "CPU writes; this costs about 4 ms of GPU time per frame in Springfield at 2x "
-                    "(hundreds of uploads that each wait for the GPU to go idle).")
+REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                    "Refresh page-valid state from GPU-written memory at frame end. "
+                    "Disable for minor CPU overhead reduction, but may break memory coherency.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(occlusion_query_enable, true, "GPU", "Enable host occlusion query handling")
@@ -136,6 +68,22 @@ REXCVAR_DEFINE_STRING(readback_resolve, "none", "GPU",
                       " some: Read previous frame (delayed, copy on cache miss)\n"
                       " full: Immediate sync readback (accurate but stalls)")
     .allowed({"none", "fast", "some", "full"})
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(readback_resolve_max_kb, 0, "GPU",
+                     "With readback_resolve fast or some, read back only resolves of up to this "
+                     "many KB (0 = no limit). Some titles read a tiny render target on the CPU "
+                     "every frame, such as a luminance average for auto-exposure, while their "
+                     "full-screen resolves only ever feed the GPU; copying those back too costs "
+                     "a GPU-to-CPU copy and a re-upload of the pages every frame.")
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_INT32(readback_resolve_small_kb, 0, "GPU",
+                     "Read resolves of up to this many KB back to CPU memory immediately, "
+                     "whatever readback_resolve is set to (0 = off). Games copy small render "
+                     "targets for the CPU to read, such as save thumbnails, while their "
+                     "per-frame full-screen resolves are far larger.")
+    .range(0, 16384)
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(readback_resolve_half_pixel_offset, false, "GPU",
@@ -164,407 +112,18 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(gpu_disable_msaa, false, "GPU",
+                    "Render every guest surface single-sampled. Drawing and resolving both read "
+                    "the sample count from RB_SURFACE_INFO, so dropping it there keeps the EDRAM "
+                    "layout consistent; the picture loses its anti-aliasing. A 4x MSAA title "
+                    "costs a tile-based GPU four times the samples to shade, store and resolve.")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
 namespace {
-// Ring progress written back to guest memory (read pointer and scratch
-// register writebacks), for guest code waiting for the ring to be consumed (see
-// ring_progress.h). The mutex and condition variable are only touched when
-// someone waits.
-std::atomic<uint32_t> g_read_pointer_writebacks{0};
-std::atomic<uint32_t> g_read_pointer_waiters{0};
-std::atomic<uint32_t> g_read_pointer_writeback_address{0};
-std::mutex g_read_pointer_mutex;
-std::condition_variable g_read_pointer_condition;
-
-void NotifyRingProgress() {
-  g_read_pointer_writebacks.fetch_add(1, std::memory_order_seq_cst);
-  if (g_read_pointer_waiters.load(std::memory_order_seq_cst)) {
-    std::lock_guard<std::mutex> lock(g_read_pointer_mutex);
-    g_read_pointer_condition.notify_all();
-  }
-}
-}  // namespace
-
-uint32_t GetRingProgressCount() {
-  return g_read_pointer_writebacks.load(std::memory_order_seq_cst);
-}
-
-void WaitForRingProgress(uint32_t seen_count, uint32_t timeout_us) {
-  // Registered before checking the count, and the notifier increments the
-  // count before checking for waiters, so a writeback can't be missed.
-  g_read_pointer_waiters.fetch_add(1, std::memory_order_seq_cst);
-  {
-    std::unique_lock<std::mutex> lock(g_read_pointer_mutex);
-    g_read_pointer_condition.wait_for(lock, std::chrono::microseconds(timeout_us), [&] {
-      return g_read_pointer_writebacks.load(std::memory_order_seq_cst) != seen_count;
-    });
-  }
-  g_read_pointer_waiters.fetch_sub(1, std::memory_order_seq_cst);
-}
-
-uint32_t GetReadPointerWritebackAddress() {
-  return g_read_pointer_writeback_address.load(std::memory_order_relaxed);
-}
-
-namespace {
-
-// gpu_wait_stats: where the command processor thread's time goes, in host
-// ticks, accumulated between logs. Only the command processor thread writes
-// these, except the fence counters, which the backend may report from
-// elsewhere.
-struct GpuWaitSite {
-  uint32_t address = 0;
-  uint32_t wait_info = 0;
-  uint32_t mask = 0;
-  uint32_t ref = 0;
-  uint32_t interval = 0;
-  uint32_t unmet_value = 0;
-  uint64_t packets = 0;
-  uint64_t unmet = 0;
-  uint64_t in_indirect = 0;
-  uint64_t ticks = 0;
-  uint64_t max_ticks = 0;
-};
-struct GpuWaitStats {
-  uint64_t ring_idle_waits = 0;
-  uint64_t ring_idle_ticks = 0;
-  uint64_t wait_packets = 0;
-  uint64_t wait_unmet = 0;
-  uint64_t wait_sleeps = 0;
-  uint64_t wait_ticks = 0;
-  uint64_t swap_ticks = 0;
-  uint64_t max_swap_ticks = 0;
-  static constexpr uint32_t kMaxSites = 24;
-  GpuWaitSite sites[kMaxSites];
-  uint32_t site_count = 0;
-  uint64_t untracked_site_packets = 0;
-};
-GpuWaitStats g_gpu_wait_stats;
-std::atomic<uint64_t> g_gpu_fence_waits{0}, g_gpu_fence_ticks{0};
-std::atomic<uint64_t> g_gpu_full_sync_waits{0}, g_gpu_full_sync_ticks{0};
-uint32_t g_gpu_wait_stats_frames = 0;
-uint64_t g_gpu_wait_stats_start_tick = 0;
-// CPU time of the command processor thread at the start of the window, ms.
-double g_gpu_wait_stats_user_ms = 0.0;
-double g_gpu_wait_stats_system_ms = 0.0;
-
-void GetCommandProcessorThreadTimes(double& user_ms, double& system_ms) {
-  user_ms = system_ms = 0.0;
-#if REX_PLATFORM_LINUX
-  struct rusage usage;
-  if (getrusage(RUSAGE_THREAD, &usage) == 0) {
-    user_ms = double(usage.ru_utime.tv_sec) * 1000.0 + double(usage.ru_utime.tv_usec) / 1000.0;
-    system_ms = double(usage.ru_stime.tv_sec) * 1000.0 + double(usage.ru_stime.tv_usec) / 1000.0;
-  }
-#elif REX_PLATFORM_WIN32
-  FILETIME creation, exited, kernel, user;
-  if (GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) {
-    // FILETIME counts 100-nanosecond intervals.
-    auto to_ms = [](const FILETIME& time) {
-      return double((uint64_t(time.dwHighDateTime) << 32) | time.dwLowDateTime) / 10000.0;
-    };
-    user_ms = to_ms(user);
-    system_ms = to_ms(kernel);
-  }
-#endif
-}
-
-void RecordGpuWait(uint32_t address, uint32_t wait_info, uint32_t mask, uint32_t ref,
-                   uint32_t interval, bool in_indirect, bool unmet, uint32_t unmet_value,
-                   uint64_t unmet_ticks) {
-  GpuWaitStats& s = g_gpu_wait_stats;
-  ++s.wait_packets;
-  if (unmet) {
-    ++s.wait_unmet;
-    s.wait_ticks += unmet_ticks;
-  }
-  GpuWaitSite* site = nullptr;
-  for (uint32_t i = 0; i < s.site_count; ++i) {
-    GpuWaitSite& candidate = s.sites[i];
-    if (candidate.address == address && candidate.wait_info == wait_info &&
-        candidate.mask == mask) {
-      site = &candidate;
-      break;
-    }
-  }
-  if (!site) {
-    if (s.site_count >= GpuWaitStats::kMaxSites) {
-      ++s.untracked_site_packets;
-      return;
-    }
-    site = &s.sites[s.site_count++];
-    site->address = address;
-    site->wait_info = wait_info;
-    site->mask = mask;
-  }
-  ++site->packets;
-  site->ref = ref;
-  site->interval = interval;
-  site->in_indirect += in_indirect ? 1 : 0;
-  if (unmet) {
-    ++site->unmet;
-    site->unmet_value = unmet_value;
-    site->ticks += unmet_ticks;
-    site->max_ticks = std::max(site->max_ticks, unmet_ticks);
-  }
-}
-
-void LogGpuWaitStats(uint32_t interval) {
-  uint64_t now = rex::chrono::Clock::QueryHostTickCount();
-  if (!g_gpu_wait_stats_start_tick) {
-    // Start the first window at a swap.
-    g_gpu_wait_stats = GpuWaitStats();
-    g_gpu_fence_waits = g_gpu_fence_ticks = 0;
-    g_gpu_full_sync_waits = g_gpu_full_sync_ticks = 0;
-    g_gpu_wait_stats_frames = 0;
-    g_gpu_wait_stats_start_tick = now;
-    rex::memory::g_watch_protect_calls = rex::memory::g_watch_protect_ticks = 0;
-    rex::memory::g_watch_fault_count = rex::memory::g_watch_fault_ticks = 0;
-    g_streamed_page_uploads = 0;
-    rex::ui::g_host_presents = 0;
-    GetCommandProcessorThreadTimes(g_gpu_wait_stats_user_ms, g_gpu_wait_stats_system_ms);
-    return;
-  }
-  if (++g_gpu_wait_stats_frames < interval) {
-    return;
-  }
-  const GpuWaitStats& s = g_gpu_wait_stats;
-  const double ms_per_tick = 1000.0 / double(rex::chrono::Clock::QueryHostTickFrequency());
-  const double frames = double(g_gpu_wait_stats_frames);
-  auto per_frame_ms = [&](uint64_t ticks) { return double(ticks) * ms_per_tick / frames; };
-  uint64_t fence_waits = g_gpu_fence_waits.exchange(0);
-  uint64_t fence_ticks = g_gpu_fence_ticks.exchange(0);
-  uint64_t full_sync_waits = g_gpu_full_sync_waits.exchange(0);
-  uint64_t full_sync_ticks = g_gpu_full_sync_ticks.exchange(0);
-  uint64_t host_presents = rex::ui::g_host_presents.exchange(0);
-  REXGPU_INFO(
-      "[gpu-wait] last {} frames, {:.2f} ms/frame: waiting for the game {:.2f} ms ({:.1f} "
-      "waits), WAIT_REG_MEM {:.2f} ms ({:.1f} packets, {:.1f} unmet, {:.1f} sleeps), host GPU "
-      "fences {:.2f} ms ({:.1f} waits), full syncs {:.2f} ms ({:.1f}), swap {:.2f} ms (max "
-      "{:.2f}), {:.2f} host presents per frame",
-      g_gpu_wait_stats_frames, per_frame_ms(now - g_gpu_wait_stats_start_tick),
-      per_frame_ms(s.ring_idle_ticks), double(s.ring_idle_waits) / frames,
-      per_frame_ms(s.wait_ticks), double(s.wait_packets) / frames,
-      double(s.wait_unmet) / frames, double(s.wait_sleeps) / frames, per_frame_ms(fence_ticks),
-      double(fence_waits) / frames, per_frame_ms(full_sync_ticks),
-      double(full_sync_waits) / frames, per_frame_ms(s.swap_ticks),
-      double(s.max_swap_ticks) * ms_per_tick, double(host_presents) / frames);
-  // The sites that cost the most time, then the most frequent.
-  std::vector<const GpuWaitSite*> sites;
-  for (uint32_t i = 0; i < s.site_count; ++i) {
-    sites.push_back(&s.sites[i]);
-  }
-  std::sort(sites.begin(), sites.end(), [](const GpuWaitSite* a, const GpuWaitSite* b) {
-    return a->ticks != b->ticks ? a->ticks > b->ticks : a->packets > b->packets;
-  });
-  static const char* const kFunctions[] = {"never", "<", "<=", "==", "!=", ">=", ">", "always"};
-  for (size_t i = 0; i < std::min(sites.size(), size_t(8)); ++i) {
-    const GpuWaitSite& site = *sites[i];
-    REXGPU_INFO(
-        "[gpu-wait]   {} {:08X} & {:08X} {} {:08X} (interval {:X}): {:.1f}/frame, {:.1f} unmet "
-        "({:.3f} ms/frame, max {:.3f} ms, last unmet value {:08X}), {:.0f}% in indirect buffers",
-        (site.wait_info & 0x10) ? "mem" : "reg", site.address, site.mask,
-        kFunctions[site.wait_info & 7], site.ref, site.interval, double(site.packets) / frames,
-        double(site.unmet) / frames, per_frame_ms(site.ticks),
-        double(site.max_ticks) * ms_per_tick, site.unmet_value,
-        100.0 * double(site.in_indirect) / double(site.packets));
-  }
-  if (s.untracked_site_packets) {
-    REXGPU_INFO("[gpu-wait]   {} packets at untracked sites", s.untracked_site_packets);
-  }
-  // Write watches on guest memory the GPU has read: protection changes to arm
-  // them (made by the command processor thread) and the guest write faults
-  // that fire them (on the writing threads). Plus the command processor
-  // thread's own CPU time split into user and kernel.
-  uint64_t protect_calls = rex::memory::g_watch_protect_calls.exchange(0);
-  uint64_t protect_ticks = rex::memory::g_watch_protect_ticks.exchange(0);
-  uint64_t fault_count = rex::memory::g_watch_fault_count.exchange(0);
-  uint64_t fault_ticks = rex::memory::g_watch_fault_ticks.exchange(0);
-  double user_ms, system_ms;
-  GetCommandProcessorThreadTimes(user_ms, system_ms);
-  uint64_t streamed_page_uploads = g_streamed_page_uploads.exchange(0);
-  uint64_t watch_arms_vertex = g_watch_arms_vertex.exchange(0);
-  uint64_t watch_arms_other = g_watch_arms_other.exchange(0);
-  REXGPU_INFO(
-      "[gpu-wait]   watch arming: {:.1f} for vertex / index data, {:.1f} for textures and "
-      "the rest per frame",
-      double(watch_arms_vertex) / frames, double(watch_arms_other) / frames);
-  REXGPU_INFO(
-      "[gpu-wait]   write watches: {:.1f} protects ({:.3f} ms), {:.1f} guest write faults "
-      "({:.3f} ms in handlers), {:.1f} streamed pages uploaded unwatched | command processor "
-      "thread CPU: user {:.2f} ms, kernel {:.2f} ms",
-      double(protect_calls) / frames, per_frame_ms(protect_ticks), double(fault_count) / frames,
-      per_frame_ms(fault_ticks), double(streamed_page_uploads) / frames,
-      (user_ms - g_gpu_wait_stats_user_ms) / frames,
-      (system_ms - g_gpu_wait_stats_system_ms) / frames);
-  // The 1 MB physical memory regions with the most watch protect calls.
-  std::vector<std::pair<uint32_t, uint32_t>> regions;
-  uint32_t region_protects[512], region_pages[512], region_faults[512];
-  for (uint32_t i = 0; i < 512; ++i) {
-    region_protects[i] = rex::memory::g_watch_region_protects[i].exchange(0);
-    region_pages[i] = rex::memory::g_watch_region_protect_pages[i].exchange(0);
-    region_faults[i] = rex::memory::g_watch_region_faults[i].exchange(0);
-    if (region_protects[i] || region_faults[i]) {
-      regions.emplace_back(region_protects[i] + region_faults[i], i);
-    }
-  }
-  std::sort(regions.rbegin(), regions.rend());
-  std::string region_text;
-  for (size_t i = 0; i < std::min(regions.size(), size_t(8)); ++i) {
-    uint32_t r = regions[i].second;
-    region_text += fmt::format(" {:03X}xxxxx: {:.1f} protects ({:.1f} pages), {:.1f} faults |", r,
-                               double(region_protects[r]) / frames,
-                               double(region_pages[r]) / frames,
-                               double(region_faults[r]) / frames);
-  }
-  uint32_t view_protects[3];
-  for (uint32_t i = 0; i < 3; ++i) {
-    view_protects[i] = rex::memory::g_watch_view_protects[i].exchange(0);
-  }
-  REXGPU_INFO("[gpu-wait]   watch protects by view A/C/E: {:.1f}/{:.1f}/{:.1f}, by region:{}",
-              double(view_protects[0]) / frames, double(view_protects[1]) / frames,
-              double(view_protects[2]) / frames, region_text);
-  uint64_t present_max[10];
-  for (uint32_t i = 0; i < 10; ++i) {
-    present_max[i] = rex::ui::g_present_max_ticks[i].exchange(0);
-  }
-  REXGPU_INFO(
-      "[gpu-wait]   presenter longest: guest output refresh {:.2f} ms, paint {:.2f} ms (old "
-      "paint submission {:.2f}, acquire {:.2f}, recording {:.2f}, fence {:.2f}, queue lock "
-      "{:.2f}, submit {:.2f}, present {:.2f}, other waits {:.2f})",
-      double(present_max[4]) * ms_per_tick, double(present_max[5]) * ms_per_tick,
-      double(present_max[0]) * ms_per_tick, double(present_max[1]) * ms_per_tick,
-      double(present_max[9]) * ms_per_tick, double(present_max[6]) * ms_per_tick,
-      double(present_max[7]) * ms_per_tick, double(present_max[8]) * ms_per_tick,
-      double(present_max[2]) * ms_per_tick, double(present_max[3]) * ms_per_tick);
-#if REX_HAS_VULKAN
-  {
-    uint64_t present_total[10];
-    for (uint32_t i = 0; i < 10; ++i) {
-      present_total[i] = rex::ui::g_present_total_ticks[i].exchange(0);
-    }
-    uint64_t build_ticks = vulkan::g_submission_build_ticks.exchange(0);
-    uint64_t submit_ticks = vulkan::g_submission_submit_ticks.exchange(0);
-    uint64_t submission_count = vulkan::g_submission_count.exchange(0);
-    uint64_t readback_ticks = vulkan::g_memexport_readback_ticks.exchange(0);
-    REXGPU_INFO(
-        "[gpu-wait]   swap parts per frame: memexport readback {:.2f} ms, submission build "
-        "{:.2f} ms ({:.1f} submissions), vkQueueSubmit {:.2f} ms, presenter: guest output "
-        "refresh {:.2f} ms, paint {:.2f} ms (acquire {:.2f}, recording {:.2f}, submit {:.2f}, "
-        "present {:.2f})",
-        per_frame_ms(readback_ticks), per_frame_ms(build_ticks),
-        double(submission_count) / frames, per_frame_ms(submit_ticks),
-        per_frame_ms(present_total[4]), per_frame_ms(present_total[5]),
-        per_frame_ms(present_total[1]), per_frame_ms(present_total[9]),
-        per_frame_ms(present_total[8]), per_frame_ms(present_total[2]));
-    REXGPU_INFO(
-        "[gpu-wait]   stencil: {:.1f} draws per frame with the stencil test, {:.1f} of them can "
-        "write it, {:.1f} resolve clears with a non-zero stencil value",
-        double(vulkan::g_stencil_enabled_draws.exchange(0)) / frames,
-        double(vulkan::g_stencil_write_draws.exchange(0)) / frames,
-        double(vulkan::g_stencil_nonzero_clears.exchange(0)) / frames);
-  }
-#endif  // REX_HAS_VULKAN
-#if REX_HAS_D3D11
-  {
-    auto& profile = d3d11::g_profile;
-    auto take = [](std::atomic<uint64_t>& value) { return value.exchange(0); };
-    uint64_t ns[size_t(d3d11::ProfilePhase::kCount)];
-    for (size_t i = 0; i < std::size(ns); ++i) {
-      ns[i] = take(profile.ns[i]);
-    }
-    auto ns_ms = [&](uint64_t value) { return double(value) / 1e6 / frames; };
-    auto phase_ms = [&](d3d11::ProfilePhase phase) { return ns_ms(ns[size_t(phase)]); };
-    uint64_t draw_ns = 0;
-    for (size_t i = 0; i <= size_t(d3d11::ProfilePhase::kDrawReadback); ++i) {
-      draw_ns += ns[i];
-    }
-    uint64_t draws = take(profile.draws), resolves = take(profile.resolves);
-    uint64_t uploads = take(profile.memory_uploads);
-    uint64_t upload_bytes = take(profile.memory_upload_bytes);
-    uint64_t invalidations = take(profile.context_invalidations);
-    uint64_t buffer_hits = take(profile.buffer_hits);
-    uint64_t buffer_creations = take(profile.buffer_creations);
-    uint64_t buffer_bytes = take(profile.buffer_creation_bytes);
-    uint64_t output_changes = take(profile.output_changes);
-    uint64_t transfers = take(profile.transfers), transfer_draws = take(profile.transfer_draws);
-    uint64_t transfer_pixels = take(profile.transfer_pixels);
-    uint64_t transfer_same_format = take(profile.transfer_same_format);
-    uint64_t snapshots = take(profile.snapshots), snapshot_bytes = take(profile.snapshot_bytes);
-    uint64_t gpu_ns[size_t(d3d11::GpuCategory::kCount)];
-    uint64_t gpu_total_ns = 0;
-    for (size_t i = 0; i < std::size(gpu_ns); ++i) {
-      gpu_ns[i] = take(profile.gpu_ns[i]);
-      gpu_total_ns += gpu_ns[i];
-    }
-    uint64_t gpu_frames = take(profile.gpu_frames);
-    uint64_t gpu_disjoint = take(profile.gpu_disjoint_frames);
-    if (draws || resolves) {
-      using Phase = d3d11::ProfilePhase;
-      REXGPU_INFO(
-          "[gpu-wait]   DX11 per frame: {:.1f} draws in {:.2f} ms (context {:.2f}, setup {:.2f}, "
-          "primitives {:.2f}, render targets {:.2f}, shaders {:.2f}, textures {:.2f}, streams "
-          "{:.2f}, bindings {:.2f}, pipelines {:.2f}, submit {:.2f}, readback {:.2f}), {:.1f} "
-          "resolves in {:.2f} ms, swap {:.2f} ms",
-          double(draws) / frames, ns_ms(draw_ns), phase_ms(Phase::kDrawContext),
-          phase_ms(Phase::kDrawSetup), phase_ms(Phase::kDrawPrimitives),
-          phase_ms(Phase::kDrawRenderTargets), phase_ms(Phase::kDrawShaders),
-          phase_ms(Phase::kDrawTextures), phase_ms(Phase::kDrawStreams),
-          phase_ms(Phase::kDrawBindings), phase_ms(Phase::kDrawPipelines),
-          phase_ms(Phase::kDrawSubmit), phase_ms(Phase::kDrawReadback), double(resolves) / frames,
-          phase_ms(Phase::kResolve), phase_ms(Phase::kSwap));
-      REXGPU_INFO(
-          "[gpu-wait]   DX11 resources per frame: {:.1f} buffers created or rewritten ({:.1f} "
-          "KiB), {:.1f} reused, {:.1f} guest memory uploads ({:.1f} KiB), {:.1f} context resets, "
-          "{:.1f} output changes",
-          double(buffer_creations) / frames, double(buffer_bytes) / 1024.0 / frames,
-          double(buffer_hits) / frames, double(uploads) / frames,
-          double(upload_bytes) / 1024.0 / frames, double(invalidations) / frames,
-          double(output_changes) / frames);
-      REXGPU_INFO(
-          "[gpu-wait]   DX11 render target transfers per frame: {:.1f} ({:.1f} with the same "
-          "format and pitch) in {:.1f} draws over {:.2f} Mpixels, {:.1f} snapshots ({:.1f} MiB)",
-          double(transfers) / frames, double(transfer_same_format) / frames,
-          double(transfer_draws) / frames, double(transfer_pixels) / 1e6 / frames,
-          double(snapshots) / frames, double(snapshot_bytes) / 1048576.0 / frames);
-      if (gpu_frames) {
-        using Category = d3d11::GpuCategory;
-        auto gpu_ms = [&](Category category) {
-          return double(gpu_ns[size_t(category)]) / 1e6 / double(gpu_frames);
-        };
-        REXGPU_INFO(
-            "[gpu-wait]   DX11 GPU per frame over {} frames ({} disjoint): {:.2f} ms (draws "
-            "{:.2f}, render target transfers {:.2f}, textures {:.2f}, resolves: encoding {:.2f}, "
-            "copies {:.2f}, original-resolution copies {:.2f}, clears {:.2f}, swap {:.2f})",
-            gpu_frames, gpu_disjoint, double(gpu_total_ns) / 1e6 / double(gpu_frames),
-            gpu_ms(Category::kDraws), gpu_ms(Category::kRenderTargets), gpu_ms(Category::kTextures),
-            gpu_ms(Category::kResolves), gpu_ms(Category::kResolveCopies),
-            gpu_ms(Category::kResolveMirrors), gpu_ms(Category::kResolveClears),
-            gpu_ms(Category::kSwap));
-      }
-    }
-  }
-#endif  // REX_HAS_D3D11
-  uint64_t streamed_max = g_streamed_page_max_uploads.exchange(0);
-  uint64_t streamed_over[4];
-  for (uint32_t i = 0; i < 4; ++i) {
-    streamed_over[i] = g_streamed_pages_over[i].exchange(0);
-  }
-  REXGPU_INFO(
-      "[gpu-wait]   streamed page uploads per frame: most for one page {:.1f}, pages over 8 "
-      "{:.1f}, over 16 {:.1f}, over 32 {:.1f}, at the cap {:.1f}",
-      double(streamed_max) / frames, double(streamed_over[0]) / frames,
-      double(streamed_over[1]) / frames, double(streamed_over[2]) / frames,
-      double(streamed_over[3]) / frames);
-  g_gpu_wait_stats_user_ms = user_ms;
-  g_gpu_wait_stats_system_ms = system_ms;
-  g_gpu_wait_stats = GpuWaitStats();
-  g_gpu_wait_stats_frames = 0;
-  g_gpu_wait_stats_start_tick = now;
-}
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -579,19 +138,6 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   return ReadbackResolveMode::kDisabled;
 }
 
-// Documented registers, for the unknown-register diagnostic in WriteRegister.
-// A table instead of RegisterFile::GetRegisterInfo's switch because that check
-// runs on every register write.
-std::bitset<RegisterFile::kRegisterCount> BuildKnownRegisterSet() {
-  std::bitset<RegisterFile::kRegisterCount> known;
-#define XE_GPU_REGISTER(index, type, name) known.set(index);
-#include <rex/graphics/register_table.inc>
-#undef XE_GPU_REGISTER
-  return known;
-}
-
-const std::bitset<RegisterFile::kRegisterCount> kKnownRegisters = BuildKnownRegisterSet();
-
 }  // namespace
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
@@ -600,7 +146,6 @@ CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
       kernel_state_(kernel_state),
       graphics_system_(graphics_system),
       register_file_(graphics_system_->register_file()),
-      trace_writer_(graphics_system->memory()->physical_membase()),
       worker_running_(true),
       write_ptr_index_event_(rex::thread::Event::CreateAutoResetEvent(false)),
       write_ptr_index_(0) {
@@ -638,18 +183,13 @@ bool CommandProcessor::Initialize() {
   worker_thread_->set_name("GPU Commands");
   worker_thread_->Create();
 
-  // Direct3D hooks may replace packets with native records from now on.
-  native_records::Clear();
-  native_records::SetEnabled(true);
-
   return true;
 }
 
 void CommandProcessor::Shutdown() {
-  native_records::SetEnabled(false);
-  EndTracing();
-
   worker_running_ = false;
+  background_gate_.Request(false);
+  resume_event_->Set();
   write_ptr_index_event_->Set();
   worker_thread_->Wait(0, 0, 0, nullptr);
   worker_thread_.reset();
@@ -657,77 +197,6 @@ void CommandProcessor::Shutdown() {
 
 void CommandProcessor::InitializeShaderStorage(const std::filesystem::path& cache_root,
                                                uint32_t title_id, bool blocking) {}
-
-void CommandProcessor::RequestFrameTrace(const std::filesystem::path& root_path) {
-  if (trace_state_ == TraceState::kStreaming) {
-    REXGPU_ERROR("Streaming trace; cannot also trace frame.");
-    return;
-  }
-  if (trace_state_ == TraceState::kSingleFrame) {
-    REXGPU_ERROR("Frame trace already pending; ignoring.");
-    return;
-  }
-  trace_state_ = TraceState::kSingleFrame;
-  trace_frame_path_ = root_path;
-}
-
-void CommandProcessor::BeginTracing(const std::filesystem::path& root_path) {
-  if (trace_state_ == TraceState::kStreaming) {
-    REXGPU_ERROR("Streaming already active; ignoring request.");
-    return;
-  }
-  if (trace_state_ == TraceState::kSingleFrame) {
-    REXGPU_ERROR("Frame trace pending; ignoring streaming request.");
-    return;
-  }
-  // Streaming starts on the next primary buffer execute.
-  trace_state_ = TraceState::kStreaming;
-  trace_stream_path_ = root_path;
-}
-
-void CommandProcessor::EndTracing() {
-  if (!trace_writer_.is_open()) {
-    return;
-  }
-  assert_true(trace_state_ == TraceState::kStreaming);
-  trace_state_ = TraceState::kDisabled;
-  trace_writer_.Close();
-}
-
-void CommandProcessor::RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
-                                        uint32_t register_count, bool execute_callbacks) {
-  if (first_register > RegisterFile::kRegisterCount ||
-      RegisterFile::kRegisterCount - first_register < register_count) {
-    REXGPU_WARN(
-        "CommandProcessor::RestoreRegisters out of bounds (0x{:X} registers "
-        "starting with 0x{:X}, while a total of 0x{:X} registers are stored)",
-        register_count, first_register, RegisterFile::kRegisterCount);
-    if (first_register > RegisterFile::kRegisterCount) {
-      return;
-    }
-    register_count =
-        std::min(uint32_t(RegisterFile::kRegisterCount) - first_register, register_count);
-  }
-  if (execute_callbacks) {
-    for (uint32_t i = 0; i < register_count; ++i) {
-      WriteRegister(first_register + i, register_values[i]);
-    }
-  } else {
-    std::memcpy(register_file_->values + first_register, register_values,
-                sizeof(uint32_t) * register_count);
-  }
-}
-
-void CommandProcessor::RestoreGammaRamp(const reg::DC_LUT_30_COLOR* new_gamma_ramp_256_entry_table,
-                                        const reg::DC_LUT_PWL_DATA* new_gamma_ramp_pwl_rgb,
-                                        uint32_t new_gamma_ramp_rw_component) {
-  std::memcpy(gamma_ramp_256_entry_table_, new_gamma_ramp_256_entry_table,
-              sizeof(reg::DC_LUT_30_COLOR) * 256);
-  std::memcpy(gamma_ramp_pwl_rgb_, new_gamma_ramp_pwl_rgb, sizeof(reg::DC_LUT_PWL_DATA) * 3 * 128);
-  gamma_ramp_rw_component_ = new_gamma_ramp_rw_component;
-  OnGammaRamp256EntryTableValueWritten();
-  OnGammaRampPWLValueWritten();
-}
 
 void CommandProcessor::CallInThread(std::function<void()> fn) {
   if (pending_fns_.empty() && system::XThread::IsInThread(worker_thread_.get())) {
@@ -754,14 +223,8 @@ ReadbackResolveMode CommandProcessor::GetReadbackResolveMode(
 }
 
 bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) const {
-  if (legacy_readback_memexport_overridden_ < 0) {
-    legacy_readback_memexport_overridden_ =
-        (legacy_readback_memexport_cvar_name_ &&
-         rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_))
-            ? 1
-            : 0;
-  }
-  if (legacy_readback_memexport_overridden_) {
+  if (legacy_readback_memexport_cvar_name_ &&
+      rex::cvar::HasNonDefaultValue(legacy_readback_memexport_cvar_name_)) {
     return legacy_backend_flag;
   }
   return REXCVAR_GET(readback_memexport);
@@ -776,12 +239,18 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
 }
 
 void CommandProcessor::WorkerThreadMain() {
+#if REX_PLATFORM_MAC || REX_PLATFORM_IOS
+  // Every frame passes through this thread; keep it off the efficiency cores
+  // when the game's background threads are busy (see XThread::Execute).
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+#endif
   if (!SetupContext()) {
     rex::FatalError("Unable to setup command processor internal state");
     return;
   }
 
   while (worker_running_) {
+    CheckBackgroundPause();
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());
       pending_fns_.pop();
@@ -792,42 +261,25 @@ void CommandProcessor::WorkerThreadMain() {
     if (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index) {
       SCOPE_profile_cpu_i("gpu", "rex::graphics::CommandProcessor::Stall");
       // We've run out of commands to execute.
-      // HAND PATCH: the old policy here was 500 sched-yield spins before ever
-      // touching the event, then a 5 ms timed wait. That made sense for an
-      // emulator whose GPU thread had a core to itself; in this recomp the
-      // same cores also run the recompiled game code, and a yield storm on
-      // every ring drain steals cycles from the thread that is about to feed
-      // us more commands. UpdateWritePointer signals the event, so a real
-      // wait wakes in microseconds; keep only a short yield burst to catch
-      // back-to-back submissions, then sleep on the event. The 1 ms timeout
-      // (down from 5) bounds how long a CallInThread posted from another
-      // thread can sit unnoticed, since those don't signal the event.
+      // We spin here waiting for new ones, as the overhead of waiting on our
+      // event is too high.
       PrepareForWait();
-      const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
-      uint64_t idle_start_tick = wait_stats ? rex::chrono::Clock::QueryHostTickCount() : 0;
-      rex::perf::ScopedCounterTimer idle_timer(rex::perf::CounterId::kCpRingIdleUs);
-      rex::perf::TraceEvent("idle");
       uint32_t loop_count = 0;
       do {
-        if (loop_count < 32) {
-          rex::thread::MaybeYield();
-          loop_count++;
-        } else {
+        // If we spin around too much, revert to a "low-power" state.
+        if (loop_count > 500) {
+          const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
-                            std::chrono::milliseconds(1));
+                            std::chrono::milliseconds(wait_time_ms));
         }
+
+        rex::thread::MaybeYield();
+        loop_count++;
         write_ptr_index = write_ptr_index_.load();
-      } while (worker_running_ && pending_fns_.empty() &&
+      } while (worker_running_ && !background_gate_.requested() && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
-      idle_timer.Stop();
-      rex::perf::TraceEvent("idle_done");
-      if (wait_stats) {
-        ++g_gpu_wait_stats.ring_idle_waits;
-        g_gpu_wait_stats.ring_idle_ticks +=
-            rex::chrono::Clock::QueryHostTickCount() - idle_start_tick;
-      }
       ReturnFromWait();
-      if (!worker_running_ || !pending_fns_.empty()) {
+      if (!worker_running_ || background_gate_.requested() || !pending_fns_.empty()) {
         continue;
       }
     }
@@ -851,6 +303,21 @@ void CommandProcessor::WorkerThreadMain() {
   ShutdownContext();
 }
 
+void CommandProcessor::SetBackgrounded(bool backgrounded) {
+  background_gate_.Request(backgrounded);
+  write_ptr_index_event_->Set();
+  NotifyGuestProgress();
+  if (backgrounded && !background_gate_.WaitForQuiescence(std::chrono::milliseconds(250))) {
+    REXGPU_WARN("Background GPU drain is still pending; returning control to UIKit");
+  }
+}
+
+void CommandProcessor::CheckBackgroundPause() {
+  if (background_gate_.Checkpoint([this] { PrepareForSuspend(); })) {
+    last_swap_host_ticks_ = 0;
+  }
+}
+
 void CommandProcessor::Pause() {
   if (paused_) {
     return;
@@ -858,9 +325,10 @@ void CommandProcessor::Pause() {
   paused_ = true;
 
   thread::Fence fence;
-  CallInThread([&fence]() {
+  CallInThread([this, &fence]() {
+    PrepareForSuspend();
     fence.Signal();
-    thread::Thread::GetCurrentThread()->Suspend();
+    thread::Wait(resume_event_.get(), false);
   });
 
   fence.Wait();
@@ -872,7 +340,7 @@ void CommandProcessor::Resume() {
   }
   paused_ = false;
 
-  worker_thread_->thread()->Resume();
+  resume_event_->Set();
 }
 
 bool CommandProcessor::Save(::rex::stream::ByteStream* stream) {
@@ -917,7 +385,7 @@ void CommandProcessor::EnableReadPointerWriteBack(uint32_t ptr, uint32_t block_s
   // CP_RB_RPTR_ADDR Ring Buffer Read Pointer Address 0x70C
   // ptr = RB_RPTR_ADDR, pointer to write back the address to.
   read_ptr_writeback_ptr_ = ptr;
-  g_read_pointer_writeback_address.store(ptr, std::memory_order_relaxed);
+  SetReadPointerWritebackAddress(ptr);
   // CP_RB_CNTL Ring Buffer Control 0x704
   // block_size = RB_BLKSZ, log2 of number of quadwords read between updates of
   //              the read pointer.
@@ -937,6 +405,7 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
   return it != extended_register_values_.end() ? it->second : 0;
 }
 
+
 void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
   RegisterFile& regs = *register_file_;
   if (index >= RegisterFile::kRegisterCount) {
@@ -950,9 +419,19 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
     return;
   }
 
+  if (index == XE_GPU_REG_RB_SURFACE_INFO && REXCVAR_GET(gpu_disable_msaa)) {
+    value &= ~(uint32_t(3) << 16);  // msaa_samples
+  }
   // Volatile for the WAIT_REG_MEM loop.
   const_cast<volatile uint32_t&>(regs.values[index]) = value;
-  if (!kKnownRegisters[index]) {
+  // GetRegisterInfo is a switch over the whole register table - only run it
+  // when the message would be logged, not on each of the thousands of writes
+  // in a frame.
+  static const bool gpu_debug_log = [] {
+    auto* gpu_log = ::rex::GetLoggerRaw(::rex::log::gpu());
+    return gpu_log && gpu_log->should_log(spdlog::level::debug);
+  }();
+  if (gpu_debug_log && !regs.GetRegisterInfo(index)) {
     REXGPU_DEBUG("GPU: Write to unknown register ({:04X} = {:08X})", index, value);
   }
 
@@ -1207,54 +686,17 @@ void CommandProcessor::MakeCoherent() {
   regs_volatile[XE_GPU_REG_COHER_STATUS_HOST] = 0;
 }
 
-void CommandProcessor::PrepareForWait() {
-  trace_writer_.Flush();
-}
+void CommandProcessor::PrepareForWait() {}
 
 void CommandProcessor::ReturnFromWait() {}
 
-void CommandProcessor::RecordHostGpuFenceWait(uint64_t host_ticks, bool full_sync) {
-  PERF_counter_add(kCpGpuFenceUs,
-                   int64_t(host_ticks * 1000000 / rex::chrono::Clock::QueryHostTickFrequency()));
-  if (REXCVAR_GET(gpu_wait_stats) <= 0) {
-    return;
-  }
-  if (full_sync) {
-    g_gpu_full_sync_waits.fetch_add(1, std::memory_order_relaxed);
-    g_gpu_full_sync_ticks.fetch_add(host_ticks, std::memory_order_relaxed);
-  } else {
-    g_gpu_fence_waits.fetch_add(1, std::memory_order_relaxed);
-    g_gpu_fence_ticks.fetch_add(host_ticks, std::memory_order_relaxed);
-  }
-}
-
 uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
   SCOPE_profile_cpu_f("gpu");
-
-  // If we have a pending trace stream open it now. That way we ensure we get
-  // all commands.
-  if (!trace_writer_.is_open() && trace_state_ == TraceState::kStreaming) {
-    uint32_t title_id =
-        kernel_state_->GetExecutableModule() ? kernel_state_->GetExecutableModule()->title_id() : 0;
-    auto file_name = fmt::format("{:08X}_stream.xtr", title_id);
-    auto path = trace_stream_path_ / file_name;
-    trace_writer_.Open(path, title_id);
-    InitializeTrace();
-  }
-
-  // Adjust pointer base.
-  uint32_t start_ptr = primary_buffer_ptr_ + read_index * sizeof(uint32_t);
-  start_ptr = (primary_buffer_ptr_ & ~0x1FFFFFFF) | (start_ptr & 0x1FFFFFFF);
-  uint32_t end_ptr = primary_buffer_ptr_ + write_index * sizeof(uint32_t);
-  end_ptr = (primary_buffer_ptr_ & ~0x1FFFFFFF) | (end_ptr & 0x1FFFFFFF);
-
-  trace_writer_.WritePrimaryBufferStart(start_ptr, write_index - read_index);
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
   reader.set_read_offset(read_index * sizeof(uint32_t));
   reader.set_write_offset(write_index * sizeof(uint32_t));
-  const bool incremental_read_ptr = REXCVAR_GET(gpu_incremental_read_pointer);
   do {
     if (!ExecutePacket(&reader)) {
       // This probably should be fatal - but we're going to continue anyways.
@@ -1262,145 +704,15 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
       assert_always();
       break;
     }
-    // Report the progress through the ring after every packet, like the
-    // hardware's periodic read pointer writeback, rather than only once the
-    // whole batch is done: an indirect buffer's commands have all been parsed
-    // when its packet returns, and the game waits for the read pointer before
-    // reusing command buffer memory, so it can keep recording instead of
-    // spinning until the command processor catches up with everything queued.
-    if (incremental_read_ptr && read_ptr_writeback_ptr_) {
-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
-                                       uint32_t(reader.read_offset() / sizeof(uint32_t)));
-      NotifyRingProgress();
-    }
   } while (reader.read_count());
 
   OnPrimaryBufferEnd();
 
-  trace_writer_.WritePrimaryBufferEnd();
-
   return write_index;
 }
 
-
-// PM4 census (diagnostic): what the command stream this game produces is made
-// of, as input for replacing it with native rendering calls.
-REXCVAR_DEFINE_BOOL(pm4_bulk_float_constants, true, "GPU",
-                    "Apply type-0 packets of shader float constants as one range instead of "
-                    "register by register");
-
-REXCVAR_DEFINE_BOOL(pm4_bulk_state_registers, false, "GPU",
-                    "Apply type-0 packets of context and fetch/bool/loop constants as ranges");
-
-REXCVAR_DEFINE_INT32(pm4_census, 0, "GPU",
-                     "Log a per-frame census of the PM4 command stream every N frames "
-                     "(0 = off; diagnostic)");
-
-namespace {
-struct Pm4Census {
-  uint64_t packets = 0;
-  uint64_t dwords = 0;
-  uint64_t type_packets[4] = {};
-  uint64_t register_writes = 0;
-  // Register writes by range: config (< 0x2000), state (0x2000-0x3FFF), vertex
-  // float constants, pixel float constants, fetch constants, bool/loop
-  // constants, other.
-  uint64_t register_range_writes[7] = {};
-  uint64_t type3_opcodes[128] = {};
-  uint64_t type3_opcode_dwords[128] = {};
-  uint64_t indirect_buffers = 0;
-  uint64_t indirect_buffer_dwords = 0;
-  uint64_t nested_indirect_buffers = 0;
-  uint64_t repeated_indirect_buffers = 0;
-  // Indirect buffer dwords per 16 MB guest physical region.
-  uint64_t region_dwords[32] = {};
-  // Indirect buffers with the address and length of one in the previous
-  // frame: with the same contents (replays of command buffers recorded once),
-  // with different contents (patched in place); and the rest.
-  uint64_t patched_indirect_buffers = 0;
-  uint64_t new_indirect_buffers = 0;
-  uint64_t replay_dwords = 0;
-  // Executed inside unchanged replays (including buffers they call).
-  uint64_t replay_packets = 0;
-  uint64_t replay_register_writes = 0;
-  uint64_t replay_draws = 0;
-  uint64_t replay_ticks = 0;
-  // Of replay_ticks, the time in IssueDraw (turning the draws into host
-  // commands) rather than decoding packets.
-  uint64_t replay_draw_ticks = 0;
-  uint64_t draws = 0;
-};
-Pm4Census g_pm4_census;
-uint32_t g_pm4_census_frames = 0;
-uint32_t g_pm4_indirect_depth = 0;
-// Indirect buffers of the previous frame: address, length and a hash of their
-// first dwords, to spot command buffers replayed unchanged across frames.
-std::vector<uint64_t> g_pm4_previous_buffers, g_pm4_current_buffers;
-// Indirect buffers by address and length, with a hash of their whole
-// contents, this frame and the previous one.
-std::unordered_map<uint64_t, uint64_t> g_pm4_previous_ib_contents, g_pm4_current_ib_contents;
-// How many unchanged replays the command processor is inside.
-uint32_t g_pm4_replay_depth = 0;
-
-uint64_t Pm4BufferKey(const uint32_t* dwords, uint32_t ptr, uint32_t count) {
-  uint64_t hash = 1469598103934665603ull;
-  for (uint32_t i = 0; i < std::min(count, uint32_t(16)); ++i) {
-    hash = (hash ^ dwords[i]) * 1099511628211ull;
-  }
-  return hash ^ (uint64_t(ptr) << 20) ^ count;
-}
-}  // namespace
-
-namespace {
-// Verify-mode statistics, logged at swaps.
-uint64_t g_native_verify_records = 0;
-uint64_t g_native_verify_registers = 0;
-uint64_t g_native_verify_mismatches = 0;
-uint64_t g_native_applied_records = 0;
-uint64_t g_native_applied_registers = 0;
-uint64_t g_native_missing_records = 0;
-uint64_t g_native_fallbacks = 0;
-uint32_t g_native_stats_frames = 0;
-}  // namespace
-
 void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
   SCOPE_profile_cpu_f("gpu");
-
-  trace_writer_.WriteIndirectBufferStart(ptr, count * sizeof(uint32_t));
-
-  bool census_replay = false;
-  uint64_t census_replay_start_tick = 0;
-
-  if (REXCVAR_GET(pm4_census) > 0) {
-    ++g_pm4_census.indirect_buffers;
-    g_pm4_census.indirect_buffer_dwords += count;
-    g_pm4_census.nested_indirect_buffers += g_pm4_indirect_depth ? 1 : 0;
-    g_pm4_census.region_dwords[(ptr >> 24) & 31] += count;
-    const uint32_t* ib_dwords = memory_->TranslatePhysical<const uint32_t*>(ptr);
-    uint64_t key = Pm4BufferKey(ib_dwords, ptr, count);
-    g_pm4_current_buffers.push_back(key);
-    if (std::find(g_pm4_previous_buffers.begin(), g_pm4_previous_buffers.end(), key) !=
-        g_pm4_previous_buffers.end()) {
-      ++g_pm4_census.repeated_indirect_buffers;
-    }
-    uint64_t location = (uint64_t(ptr) << 20) | count;
-    uint64_t contents = XXH3_64bits(ib_dwords, size_t(count) * sizeof(uint32_t));
-    auto previous = g_pm4_previous_ib_contents.find(location);
-    if (previous == g_pm4_previous_ib_contents.end()) {
-      ++g_pm4_census.new_indirect_buffers;
-    } else if (previous->second != contents) {
-      ++g_pm4_census.patched_indirect_buffers;
-    } else {
-      census_replay = true;
-      g_pm4_census.replay_dwords += count;
-      if (!g_pm4_replay_depth) {
-        census_replay_start_tick = rex::chrono::Clock::QueryHostTickCount();
-      }
-      ++g_pm4_replay_depth;
-    }
-    g_pm4_current_ib_contents[location] = contents;
-  }
-  ++g_pm4_indirect_depth;
 
   // Execute commands!
   memory::RingBuffer reader(memory_->TranslatePhysical(ptr), count * sizeof(uint32_t));
@@ -1413,13 +725,6 @@ void CommandProcessor::ExecuteIndirectBuffer(uint32_t ptr, uint32_t count) {
       break;
     }
   } while (reader.read_count());
-  --g_pm4_indirect_depth;
-  if (census_replay && !--g_pm4_replay_depth) {
-    g_pm4_census.replay_ticks +=
-        rex::chrono::Clock::QueryHostTickCount() - census_replay_start_tick;
-  }
-
-  trace_writer_.WriteIndirectBufferEnd();
 }
 
 void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
@@ -1436,56 +741,10 @@ void CommandProcessor::ExecutePacket(uint32_t ptr, uint32_t count) {
 }
 
 bool CommandProcessor::ExecutePacket(memory::RingBuffer* reader) {
+  CheckBackgroundPause();
   const uint32_t packet = reader->ReadAndSwap<uint32_t>();
   const uint32_t packet_type = packet >> 30;
-  if (REXCVAR_GET(pm4_census) > 0) {
-    ++g_pm4_census.packets;
-    ++g_pm4_census.type_packets[packet_type];
-    uint32_t packet_dwords = 1;
-    if (packet_type == 0 || packet_type == 3) {
-      packet_dwords += ((packet >> 16) & 0x3FFF) + 1;
-    } else if (packet_type == 1) {
-      packet_dwords += 2;
-    }
-    g_pm4_census.dwords += packet_dwords;
-    if (g_pm4_replay_depth) {
-      ++g_pm4_census.replay_packets;
-    }
-    if (packet_type == 0) {
-      uint32_t count = ((packet >> 16) & 0x3FFF) + 1;
-      g_pm4_census.register_writes += count;
-      if (g_pm4_replay_depth) {
-        g_pm4_census.replay_register_writes += count;
-      }
-      uint32_t base = packet & 0x7FFF;
-      uint32_t range = base < 0x2000   ? 0
-                       : base < 0x4000 ? 1
-                       : base < 0x4400 ? 2
-                       : base < 0x4800 ? 3
-                       : base < 0x4900 ? 4
-                       : base < 0x4A00 ? 5
-                                       : 6;
-      g_pm4_census.register_range_writes[range] += count;
-    } else if (packet_type == 1) {
-      g_pm4_census.register_writes += 2;
-      if (g_pm4_replay_depth) {
-        g_pm4_census.replay_register_writes += 2;
-      }
-    } else if (packet_type == 3) {
-      uint32_t opcode = (packet >> 8) & 0x7F;
-      ++g_pm4_census.type3_opcodes[opcode];
-      g_pm4_census.type3_opcode_dwords[opcode] += packet_dwords;
-      if (opcode == PM4_DRAW_INDX || opcode == PM4_DRAW_INDX_2) {
-        ++g_pm4_census.draws;
-        if (g_pm4_replay_depth) {
-          ++g_pm4_census.replay_draws;
-        }
-      }
-    }
-  }
   if (packet == 0) {
-    trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
-    trace_writer_.WritePacketEnd();
     return true;
   }
 
@@ -1520,58 +779,32 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
     return false;
   }
 
-  trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1 + count);
-
   uint32_t base_index = (packet & 0x7FFF);
   uint32_t write_one_reg = (packet >> 15) & 0x1;
-  uint32_t end_index = base_index + count - 1;
-  bool bulk_float = REXCVAR_GET(pm4_bulk_float_constants) &&
-                    base_index >= XE_GPU_REG_SHADER_CONSTANT_000_X &&
-                    end_index <= XE_GPU_REG_SHADER_CONSTANT_511_W;
-  bool bulk_state = REXCVAR_GET(pm4_bulk_state_registers) &&
-                    ((base_index >= 0x2000 && end_index < XE_GPU_REG_SHADER_CONSTANT_000_X) ||
-                     (base_index >= XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 &&
-                      end_index <= XE_GPU_REG_SHADER_CONSTANT_FETCH_31_5) ||
-                     (base_index >= XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031 &&
-                      end_index <= XE_GPU_REG_SHADER_CONSTANT_LOOP_31));
-  if (!write_one_reg && (bulk_float || bulk_state)) {
-    // These ranges have no sequential register side effects. The backend's
-    // range writer still invalidates every affected constant buffer and fetch
-    // binding. Scratch, gamma, status and single-register packets keep their
-    // ordered writes below.
-    WriteRegisterRangeFromRing(reader, base_index, count);
-    trace_writer_.WritePacketEnd();
-    return true;
-  }
   for (uint32_t m = 0; m < count; m++) {
     uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
     uint32_t target_index = write_one_reg ? base_index : base_index + m;
     WriteRegister(target_index, reg_data);
   }
 
-  trace_writer_.WritePacketEnd();
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType1(memory::RingBuffer* reader, uint32_t packet) {
   // Type-1 packet.
   // Contains two registers of data. Type-0 should be more common.
-  trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 3);
   uint32_t reg_index_1 = packet & 0x7FF;
   uint32_t reg_index_2 = (packet >> 11) & 0x7FF;
   uint32_t reg_data_1 = reader->ReadAndSwap<uint32_t>();
   uint32_t reg_data_2 = reader->ReadAndSwap<uint32_t>();
   WriteRegister(reg_index_1, reg_data_1);
   WriteRegister(reg_index_2, reg_data_2);
-  trace_writer_.WritePacketEnd();
   return true;
 }
 
 bool CommandProcessor::ExecutePacketType2(memory::RingBuffer* reader, uint32_t packet) {
   // Type-2 packet.
   // No-op. Do nothing.
-  trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1);
-  trace_writer_.WritePacketEnd();
   return true;
 }
 
@@ -1587,13 +820,6 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     return false;
   }
 
-  // To handle nesting behavior when tracing we special case indirect buffers.
-  if (opcode == PM4_INDIRECT_BUFFER) {
-    trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 2);
-  } else {
-    trace_writer_.WritePacketStart(uint32_t(reader->read_ptr() - 4), 1 + count);
-  }
-
   // & 1 == predicate - when set, we do bin check to see if we should execute
   // the packet. Only type 3 packets are affected.
   // We also skip predicated swaps, as they are never valid (probably?).
@@ -1601,7 +827,6 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
     bool any_pass = (bin_select_ & bin_mask_) != 0;
     if (!any_pass || opcode == PM4_XE_SWAP) {
       reader->AdvanceRead(count * sizeof(uint32_t));
-      trace_writer_.WritePacketEnd();
       return true;
     }
   }
@@ -1619,9 +844,6 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
     case PM4_XE_SWAP:
       result = ExecutePacketType3_XE_SWAP(reader, packet, count);
-      break;
-    case native_records::kMarkerOpcode:
-      result = ExecutePacketType3_NATIVE_RECORD(reader, packet, count);
       break;
     case PM4_INDIRECT_BUFFER:
     case PM4_INDIRECT_BUFFER_PFD:
@@ -1743,26 +965,6 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
       break;
   }
 
-  trace_writer_.WritePacketEnd();
-  if (opcode == PM4_XE_SWAP) {
-    // End the trace writer frame.
-    if (trace_writer_.is_open()) {
-      trace_writer_.WriteEvent(EventCommand::Type::kSwap);
-      trace_writer_.Flush();
-      if (trace_state_ == TraceState::kSingleFrame) {
-        trace_state_ = TraceState::kDisabled;
-        trace_writer_.Close();
-      }
-    } else if (trace_state_ == TraceState::kSingleFrame) {
-      // New trace request - we only start tracing at the beginning of a frame.
-      uint32_t title_id = kernel_state_->GetExecutableModule()->title_id();
-      auto file_name = fmt::format("{:08X}_{}.xtr", title_id, counter_ - 1);
-      auto path = trace_frame_path_ / file_name;
-      trace_writer_.Open(path, title_id);
-      InitializeTrace();
-    }
-  }
-
   assert_true(reader->read_offset() ==
               (data_start_offset + (count * sizeof(uint32_t))) % reader->capacity());
   return result;
@@ -1796,7 +998,6 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader, 
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       if (graphics_system_) {
-        rex::perf::TraceEvent("swap_irq", n);
         graphics_system_->DispatchInterruptCallback(1, n);
       }
     }
@@ -1822,7 +1023,6 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   }
 #endif
   rex::perf::Profiler::Flip();
-  rex::perf::TraceEvent("cpswap");
 
   // Xenia-specific VdSwap hook.
   // VdSwap will post this to tell us we need to swap the screen/fire an
@@ -1837,193 +1037,48 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
 
-  // Pick up changes of the legacy memexport readback cvar once per frame.
-  legacy_readback_memexport_overridden_ = -1;
-
-  // The command processor thread's CPU time since the previous swap.
-  {
-#if REX_PLATFORM_LINUX
-    timespec thread_cpu_time;
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &thread_cpu_time) == 0) {
-      static int64_t last_thread_cpu_us = -1;
-      int64_t thread_cpu_us =
-          int64_t(thread_cpu_time.tv_sec) * 1000000 + thread_cpu_time.tv_nsec / 1000;
-      if (last_thread_cpu_us >= 0) {
-        PERF_counter_set(kCommandProcessorCpuUs, thread_cpu_us - last_thread_cpu_us);
-      }
-      last_thread_cpu_us = thread_cpu_us;
-    }
-#endif
-  }
-  int32_t wait_stats_interval = REXCVAR_GET(gpu_wait_stats);
-  uint64_t swap_start_tick =
-      wait_stats_interval > 0 ? rex::chrono::Clock::QueryHostTickCount() : 0;
+  ThrottlePresentation();
+  NoteGuestSwap();
   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
-  if (wait_stats_interval > 0) {
-    uint64_t swap_ticks = rex::chrono::Clock::QueryHostTickCount() - swap_start_tick;
-    g_gpu_wait_stats.swap_ticks += swap_ticks;
-    g_gpu_wait_stats.max_swap_ticks = std::max(g_gpu_wait_stats.max_swap_ticks, swap_ticks);
-    LogGpuWaitStats(uint32_t(wait_stats_interval));
-  }
-
-  if ((g_native_verify_records || g_native_applied_records || g_native_missing_records ||
-       g_native_fallbacks) &&
-      ++g_native_stats_frames >= 300) {
-    g_native_stats_frames = 0;
-    REXGPU_INFO(
-        "[native-records] last 300 frames: applied {} records ({} registers), verified {} "
-        "records ({} registers, {} mismatches), {} replays through packets, {} markers "
-        "without a record",
-        g_native_applied_records, g_native_applied_registers, g_native_verify_records,
-        g_native_verify_registers, g_native_verify_mismatches, g_native_fallbacks,
-        g_native_missing_records);
-    g_native_verify_records = g_native_verify_registers = g_native_verify_mismatches = 0;
-    g_native_applied_records = g_native_applied_registers = g_native_missing_records = 0;
-    g_native_fallbacks = 0;
-  }
-
-  int32_t census_interval = REXCVAR_GET(pm4_census);
-  if (census_interval > 0) {
-    if (++g_pm4_census_frames >= uint32_t(census_interval)) {
-      g_pm4_census_frames = 0;
-      const Pm4Census& c = g_pm4_census;
-      std::string opcodes;
-      std::vector<std::pair<uint64_t, uint32_t>> sorted;
-      for (uint32_t i = 0; i < 128; ++i) {
-        if (c.type3_opcodes[i]) {
-          sorted.emplace_back(c.type3_opcodes[i], i);
-        }
-      }
-      std::sort(sorted.rbegin(), sorted.rend());
-      for (const auto& [n, op] : sorted) {
-        opcodes += fmt::format(" 0x{:02X}:{}/{}dw", op, n, c.type3_opcode_dwords[op]);
-      }
-      std::string regions;
-      for (uint32_t i = 0; i < 32; ++i) {
-        if (c.region_dwords[i]) {
-          regions += fmt::format(" {:02X}xxxxxx:{}dw", i, c.region_dwords[i]);
-        }
-      }
-      REXGPU_INFO(
-          "[pm4-census] packets {} dwords {} | type0 {} type1 {} type2 {} type3 {} | register "
-          "writes {} (config {} state {} vs-float {} ps-float {} fetch {} bool/loop {} other {}) | "
-          "indirect buffers {} ({} dw, {} nested, {} same as previous frame) regions{} "
-          "| type3 opcodes (count/dwords):{}",
-          c.packets, c.dwords, c.type_packets[0], c.type_packets[1], c.type_packets[2],
-          c.type_packets[3], c.register_writes, c.register_range_writes[0],
-          c.register_range_writes[1], c.register_range_writes[2], c.register_range_writes[3],
-          c.register_range_writes[4], c.register_range_writes[5], c.register_range_writes[6],
-          c.indirect_buffers, c.indirect_buffer_dwords,
-          c.nested_indirect_buffers, c.repeated_indirect_buffers, regions, opcodes);
-      // The census covers the one frame it's logged at.
-      REXGPU_INFO(
-          "[pm4-census] indirect buffers replayed unchanged {} ({} dw), patched {}, new {} | "
-          "inside unchanged replays: {} packets, {} register writes, {} of {} draws, {:.2f} ms ({:.2f} "
-          "ms of it issuing the draws)",
-          c.indirect_buffers - c.patched_indirect_buffers - c.new_indirect_buffers,
-          c.replay_dwords, c.patched_indirect_buffers, c.new_indirect_buffers, c.replay_packets,
-          c.replay_register_writes, c.replay_draws, c.draws,
-          double(c.replay_ticks) * 1000.0 /
-              double(rex::chrono::Clock::QueryHostTickFrequency()),
-          double(c.replay_draw_ticks) * 1000.0 /
-              double(rex::chrono::Clock::QueryHostTickFrequency()));
-    }
-    g_pm4_census = Pm4Census();
-    g_pm4_previous_buffers.swap(g_pm4_current_buffers);
-    g_pm4_current_buffers.clear();
-    g_pm4_previous_ib_contents.swap(g_pm4_current_ib_contents);
-    g_pm4_current_ib_contents.clear();
-  }
 
   ++counter_;
   return true;
 }
 
+// DEVSTATS (local only): WAIT_REG_MEM waits, reported with the PERF line.
+std::atomic<uint64_t> g_rex_wrm_waits{0}, g_rex_wrm_ns{0}, g_rex_wrm_max_ns{0};
+std::atomic<uint32_t> g_rex_wrm_addr{0}, g_rex_wrm_info{0}, g_rex_wrm_ref{0};
 
-bool CommandProcessor::ExecutePacketType3_NATIVE_RECORD(memory::RingBuffer* reader,
-                                                        uint32_t packet, uint32_t count) {
-  uint32_t sequence = reader->ReadAndSwap<uint32_t>();
-  uint32_t replaced_dwords = count > 1 ? reader->ReadAndSwap<uint32_t>() : 0;
-  if (count > 2) {
-    reader->AdvanceRead((count - 2) * sizeof(uint32_t));
+void CommandProcessor::NotifyGuestProgress() {
+  {
+    std::lock_guard<std::mutex> lock(guest_progress_mutex_);
+    ++guest_progress_seq_;
   }
-  native_records::Record record;
-  if (replaced_dwords && reader->read_count() < replaced_dwords * sizeof(uint32_t)) {
-    // The packets are not all in this buffer; execute what is there.
-    ++g_native_fallbacks;
-    return true;
+  guest_progress_cv_.notify_all();
+}
+
+void CommandProcessor::ThrottlePresentation() {
+  const int32_t limit = REXCVAR_GET(framerate_limit);
+  if (limit <= 0) {
+    last_swap_host_ticks_ = 0;
+    return;
   }
-  if (!native_records::Pop(sequence, record)) {
-    if (replaced_dwords) {
-      // Replayed recorded command buffer: its packets follow and execute.
-      ++g_native_fallbacks;
-      return true;
-    }
-    // In a trace replay the record's registers arrive as a register command
-    // instead. Live, this would be a lost record.
-    if (g_native_missing_records < 12) {
-      REXGPU_WARN(
-          "[native-records] marker {} without its record (oldest queued {}), at guest {:08X}, "
-          "indirect buffer depth {}",
-          sequence, native_records::OldestSequence(),
-          uint32_t(reader->read_ptr() - reinterpret_cast<uintptr_t>(memory_->TranslatePhysical(0))) - 8,
-          g_pm4_indirect_depth);
-    }
-    ++g_native_missing_records;
-    return true;
+  const uint64_t frequency = rex::chrono::Clock::QueryHostTickFrequency();
+  const uint64_t interval = std::max(uint64_t(1), frequency / uint64_t(limit));
+  const uint64_t now = rex::chrono::Clock::QueryHostTickCount();
+  // Paced against a fixed schedule rather than a fixed sleep after each swap,
+  // so Sleep overshooting a little does not lower the average rate. Falling
+  // more than two frames behind (a load, a slow frame) restarts the schedule
+  // instead of letting a burst of frames through to catch up.
+  if (!last_swap_host_ticks_ || now - last_swap_host_ticks_ > interval * 2) {
+    last_swap_host_ticks_ = now;
+    return;
   }
-  switch (record.type) {
-    case native_records::RecordType::kRegisterRuns: {
-      bool verify = (record.flags & native_records::kRecordFlagVerify) != 0;
-      const uint32_t* run = record.payload.data();
-      const uint32_t* end = run + record.payload.size();
-      while (end - run >= 2) {
-        uint32_t first_register = run[0];
-        uint32_t register_count = run[1];
-        run += 2;
-        if (uint32_t(end - run) < register_count ||
-            first_register + register_count > RegisterFile::kRegisterCount) {
-          break;
-        }
-        if (verify) {
-          for (uint32_t i = 0; i < register_count; ++i) {
-            uint32_t expected = rex::byte_swap(run[i]);
-            if (register_file_->values[first_register + i] != expected) {
-              if (g_native_verify_mismatches < 8) {
-                REXGPU_WARN(
-                    "[native-records] verify mismatch: register {:04X} record {:08X} packets "
-                    "{:08X}",
-                    first_register + i, expected, register_file_->values[first_register + i]);
-              }
-              ++g_native_verify_mismatches;
-            }
-          }
-          g_native_verify_registers += register_count;
-        } else {
-          WriteRegistersFromMem(first_register, const_cast<uint32_t*>(run), register_count);
-          if (trace_writer_.is_open()) {
-            trace_writer_.WriteRegisters(first_register, register_file_->values + first_register,
-                                         register_count, false);
-          }
-          g_native_applied_registers += register_count;
-        }
-        run += register_count;
-      }
-      if (verify) {
-        ++g_native_verify_records;
-      } else {
-        ++g_native_applied_records;
-      }
-      if (replaced_dwords) {
-        reader->AdvanceRead(replaced_dwords * sizeof(uint32_t));
-      }
-      break;
-    }
-    default:
-      REXGPU_ERROR("[native-records] unknown record type {}", uint32_t(record.type));
-      break;
+  const uint64_t deadline = last_swap_host_ticks_ + interval;
+  if (now < deadline) {
+    rex::thread::Sleep(std::chrono::microseconds((deadline - now) * 1000000 / frequency));
   }
-  return true;
+  last_swap_host_ticks_ = deadline;
 }
 
 bool CommandProcessor::ExecutePacketType3_INDIRECT_BUFFER(memory::RingBuffer* reader,
@@ -2051,18 +1106,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
 
   bool is_memory = (wait_info & 0x10) != 0;
 
-  const bool wait_stats = REXCVAR_GET(gpu_wait_stats) > 0;
-  uint64_t unmet_start_tick = 0;
-  uint32_t unmet_value = 0;
+  const auto rex_wrm_start = std::chrono::steady_clock::now();  // DEVSTATS
+  bool rex_wrm_waited = false;                                  // DEVSTATS
   bool matched = false;
-  bool unmet_timed = false;
-  std::chrono::steady_clock::time_point unmet_start_time;
   do {
+    // WAIT_REG_MEM may depend on frozen guest work. Park here without
+    // discarding the packet, rather than waiting for the whole ring to finish.
+    CheckBackgroundPause();
+    // Read before the condition, so a vblank between the check and the wait
+    // below still ends the wait.
+    uint64_t progress_seen;
+    {
+      std::lock_guard<std::mutex> lock(guest_progress_mutex_);
+      progress_seen = guest_progress_seq_;
+    }
     uint32_t value = 0;
     if (is_memory) {
       value =
           *reinterpret_cast<uint32_t*>(memory_->TranslatePhysical(poll_reg_addr & ~uint32_t(0x3)));
-      trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr & ~uint32_t(0x3)), sizeof(uint32_t));
       value = xenos::GpuSwap(value, static_cast<xenos::Endian>(poll_reg_addr & 0x3));
     } else {
       value = ReadRegisterValue(poll_reg_addr);
@@ -2098,41 +1159,23 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
-      if (!unmet_timed) {
-        unmet_timed = true;
-        unmet_start_time = std::chrono::steady_clock::now();
-        rex::perf::TraceEvent("wrm_wait", poll_reg_addr);
-      }
-      if (wait_stats && !unmet_start_tick) {
-        unmet_start_tick = rex::chrono::Clock::QueryHostTickCount();
-        unmet_value = value;
-      }
-      // A vblank may be what this waits for (the game's swaps are released by
-      // its vblank interrupt): raise it here if it's due and the vblank
-      // thread hasn't gotten to it.
-      if (graphics_system_) {
-        graphics_system_->DeliverDueVblanks();
-      }
       // Wait.
       if (wait >= 0x100) {
-        if (wait_stats) {
-          ++g_gpu_wait_stats.wait_sleeps;
-        }
         PrepareForWait();
         if (!REXCVAR_GET(vsync)) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
-          // HAND PATCH: `wait` is the guest's suggested poll interval, not a
-          // required duration (real hardware just re-polls). Sleeping the full
-          // interval (e.g. 4 ms at the common 0x400) meant the condition was
-          // noticed up to that long after it became true, serializing the ring
-          // behind a stall that had already ended. Poll at least every 500 us
-          // instead; still >95% idle, but the wake-up lag stops being a
-          // per-frame tax.
-          uint64_t wait_us = uint64_t(wait) * 1000 / 0x100;
-          rex::thread::Sleep(std::chrono::microseconds(std::min<uint64_t>(wait_us, 500)));
+          // Re-check at the next vblank or after 200 us, rather than sleeping
+          // the requested whole milliseconds (wait / 0x100) per check. What
+          // this waits for - usually the vblank, or the CPU finishing a write -
+          // lands within a fraction of that, and the oversleep delayed frames
+          // enough to miss the display's refresh.
+          std::unique_lock<std::mutex> lock(guest_progress_mutex_);
+          guest_progress_cv_.wait_for(lock, std::chrono::microseconds(200),
+                                      [&] { return guest_progress_seq_ != progress_seen; });
         }
+        rex_wrm_waited = true;  // DEVSTATS
         rex::thread::SyncMemory();
         ReturnFromWait();
 
@@ -2146,17 +1189,19 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
     }
   } while (!matched);
 
-  if (unmet_timed) {
-    rex::perf::TraceEvent("wrm_done", poll_reg_addr);
-    PERF_counter_add(kCpWaitRegMemUs, std::chrono::duration_cast<std::chrono::microseconds>(
-                                          std::chrono::steady_clock::now() - unmet_start_time)
-                                          .count());
-  }
-  if (wait_stats) {
-    RecordGpuWait(poll_reg_addr, wait_info, mask, ref, wait, g_pm4_indirect_depth != 0,
-                  unmet_start_tick != 0, unmet_value,
-                  unmet_start_tick ? rex::chrono::Clock::QueryHostTickCount() - unmet_start_tick
-                                   : 0);
+  if (rex_wrm_waited) {
+    // DEVSTATS (local only)
+    const uint64_t ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - rex_wrm_start)
+                                     .count());
+    g_rex_wrm_waits.fetch_add(1, std::memory_order_relaxed);
+    g_rex_wrm_ns.fetch_add(ns, std::memory_order_relaxed);
+    uint64_t prev = g_rex_wrm_max_ns.load(std::memory_order_relaxed);
+    while (ns > prev && !g_rex_wrm_max_ns.compare_exchange_weak(prev, ns)) {
+    }
+    g_rex_wrm_addr = poll_reg_addr;
+    g_rex_wrm_info = wait_info | (wait << 8);
+    g_rex_wrm_ref = ref;
   }
 
   return true;
@@ -2202,7 +1247,6 @@ bool CommandProcessor::ExecutePacketType3_REG_TO_MEM(memory::RingBuffer* reader,
   mem_addr &= ~0x3;
   reg_val = GpuSwap(reg_val, endianness);
   memory::store(memory_->TranslatePhysical(mem_addr), reg_val);
-  trace_writer_.WriteMemoryWrite(CpuToGpu(mem_addr), 4);
 
   return true;
 }
@@ -2217,7 +1261,6 @@ bool CommandProcessor::ExecutePacketType3_MEM_WRITE(memory::RingBuffer* reader, 
     auto addr = write_addr & ~0x3;
     write_data = GpuSwap(write_data, endianness);
     memory::store(memory_->TranslatePhysical(addr), write_data);
-    trace_writer_.WriteMemoryWrite(CpuToGpu(addr), 4);
     write_addr += 4;
   }
 
@@ -2238,7 +1281,6 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
     // Memory.
     auto endianness = static_cast<xenos::Endian>(poll_reg_addr & 0x3);
     poll_reg_addr &= ~0x3;
-    trace_writer_.WriteMemoryRead(CpuToGpu(poll_reg_addr), 4);
     value = memory::load<uint32_t>(memory_->TranslatePhysical(poll_reg_addr));
     value = GpuSwap(value, endianness);
   } else {
@@ -2280,7 +1322,6 @@ bool CommandProcessor::ExecutePacketType3_COND_WRITE(memory::RingBuffer* reader,
       write_reg_addr &= ~0x3;
       write_data = GpuSwap(write_data, endianness);
       memory::store(memory_->TranslatePhysical(write_reg_addr), write_data);
-      trace_writer_.WriteMemoryWrite(CpuToGpu(write_reg_addr), 4);
     } else {
       // Register.
       WriteRegister(write_reg_addr, write_data);
@@ -2326,7 +1367,6 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_SHD(memory::RingBuffer* re
   address &= ~0x3;
   data_value = GpuSwap(data_value, endianness);
   memory::store(memory_->TranslatePhysical(address), data_value);
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), 4);
   return true;
 }
 
@@ -2355,7 +1395,6 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_EXT(memory::RingBuffer* re
   assert_true(endianness == xenos::Endian::k8in16);
   memory::copy_and_swap_16_unaligned(memory_->TranslatePhysical(address), extents,
                                      rex::countof(extents));
-  trace_writer_.WriteMemoryWrite(CpuToGpu(address), sizeof(extents));
   return true;
 }
 
@@ -2381,10 +1420,10 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
     // 0xFFFFFEED is written to this two locations by D3D only on D3DISSUE_END
     // and used to detect a finished query.
     bool is_end_via_z_pass =
-        pSampleCounts->ZPass_A == kQueryFinished && pSampleCounts->ZPass_B == kQueryFinished;
+        pSampleCounts->ZPass_A == kQueryFinished || pSampleCounts->ZPass_B == kQueryFinished;
     // Older versions of D3D also checks for ZFail (4D5307D5).
     bool is_end_via_z_fail =
-        pSampleCounts->ZFail_A == kQueryFinished && pSampleCounts->ZFail_B == kQueryFinished;
+        pSampleCounts->ZFail_A == kQueryFinished || pSampleCounts->ZFail_B == kQueryFinished;
     std::memset(pSampleCounts, 0, sizeof(xe_gpu_depth_sample_counts));
     if (is_end_via_z_pass || is_end_via_z_fail) {
       pSampleCounts->ZPass_A = fake_sample_count;
@@ -2453,7 +1492,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
       index_buffer_info.guest_base = vgt_dma_base & ~(index_size_bytes - 1);
       index_buffer_info.endianness = vgt_dma_size.swap_mode;
       index_buffer_info.format = vgt_draw_initiator.index_size;
-      index_buffer_info.length = size_t(vgt_dma_size.num_words) * index_size_bytes;
+      index_buffer_info.length = vgt_dma_size.num_words * index_size_bytes;
       index_buffer_info.count = vgt_draw_initiator.num_indices;
     } break;
     case xenos::SourceSelect::kImmediate: {
@@ -2491,35 +1530,20 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
 
       bool major_mode_explicit =
           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
-      uint64_t census_draw_start_tick =
-          g_pm4_replay_depth ? rex::chrono::Clock::QueryHostTickCount() : 0;
       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
-      if (g_pm4_replay_depth) {
-        g_pm4_census.replay_draw_ticks +=
-            rex::chrono::Clock::QueryHostTickCount() - census_draw_start_tick;
-      }
       if (!draw_succeeded) {
-        // HAND PATCH: rate-limit this log. This game rejects hundreds of draws
-        // per frame while streaming (invalid vertex fetch constants during
-        // entity load), producing tens of thousands of identical lines in
-        // seconds -- enough I/O to rotate away the useful log context.
-        static std::atomic<uint64_t> draw_failed_count{0};
-        uint64_t n = draw_failed_count.fetch_add(1, std::memory_order_relaxed);
-        if (n < 20 || (n & 1023) == 0) {
-          auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
-          auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
-          auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
-          REXGPU_ERROR(
-              "{}({}, {}, {}): Failed in backend "
-              "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={}) "
-              "[occurrence {}; rate-limited]",
-              opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
-              uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
-              uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
-              uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
-              uint32_t(rb_modecontrol.edram_mode), n + 1);
-        }
+        auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+        auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+        auto rb_modecontrol = register_file_->Get<reg::RB_MODECONTROL>();
+        REXGPU_ERROR(
+            "{}({}, {}, {}): Failed in backend "
+            "(major_mode={}, explicit_major={}, path_select={}, tess_mode={}, edram_mode={})",
+            opcode_name, static_cast<uint32_t>(vgt_draw_initiator.num_indices),
+            uint32_t(vgt_draw_initiator.prim_type), uint32_t(vgt_draw_initiator.source_select),
+            uint32_t(vgt_draw_initiator.major_mode), uint32_t(major_mode_explicit),
+            uint32_t(vgt_output_path_cntl.path_select), uint32_t(vgt_hos_cntl.tess_mode),
+            uint32_t(rb_modecontrol.edram_mode));
       }
     }
   }
@@ -2610,23 +1634,18 @@ bool CommandProcessor::ExecutePacketType3_LOAD_ALU_CONSTANT(memory::RingBuffer* 
   uint32_t* xlat_address = memory_->TranslatePhysical<uint32_t*>(address);
   switch (type) {
     case 0:  // ALU
-      trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       WriteALURangeFromMem(index, xlat_address, size_dwords);
       break;
     case 1:  // FETCH
-      trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       WriteFetchRangeFromMem(index, xlat_address, size_dwords);
       break;
     case 2:  // BOOL
-      trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       WriteBoolRangeFromMem(index, xlat_address, size_dwords);
       break;
     case 3:  // LOOP
-      trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       WriteLoopRangeFromMem(index, xlat_address, size_dwords);
       break;
     case 4:  // REGISTERS
-      trace_writer_.WriteMemoryRead(CpuToGpu(address), size_dwords * 4);
       WriteREGISTERSRangeFromMem(index, xlat_address, size_dwords);
       break;
     default:
@@ -2657,7 +1676,6 @@ bool CommandProcessor::ExecutePacketType3_IM_LOAD(memory::RingBuffer* reader, ui
   uint32_t size_dwords = start_size & 0xFFFF;  // dwords
   assert_true(start == 0);
 
-  trace_writer_.WriteMemoryRead(CpuToGpu(addr), size_dwords * 4);
   auto shader =
       LoadShader(shader_type, addr, memory_->TranslatePhysical<uint32_t*>(addr), size_dwords);
   switch (shader_type) {
@@ -2743,16 +1761,6 @@ bool CommandProcessor::ExecutePacketType3_VIZ_QUERY(memory::RingBuffer* reader, 
   }
 
   return true;
-}
-
-void CommandProcessor::InitializeTrace() {
-  // Write the initial register values, to be loaded directly into the
-  // RegisterFile since all registers, including those that may have side
-  // effects on setting, will be saved.
-  trace_writer_.WriteRegisters(0, register_file_->values, RegisterFile::kRegisterCount, false);
-
-  trace_writer_.WriteGammaRamp(gamma_ramp_256_entry_table(), gamma_ramp_pwl_rgb(),
-                               gamma_ramp_rw_component_);
 }
 
 }  // namespace rex::graphics

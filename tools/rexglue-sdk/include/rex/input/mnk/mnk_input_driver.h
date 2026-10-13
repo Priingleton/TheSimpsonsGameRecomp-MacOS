@@ -11,17 +11,19 @@
 #pragma once
 
 #include <rex/input/input_driver.h>
+#include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <string>
 
 namespace rex::input::mnk {
+
+void SetMouseLookActive(bool active);
+bool IsMouseLookActive();
 
 class MnkInputDriver final : public InputDriver,
                              public rex::ui::WindowInputListener,
@@ -32,12 +34,13 @@ class MnkInputDriver final : public InputDriver,
 
   X_STATUS Setup() override;
 
-  X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags,
-                           X_INPUT_CAPABILITIES* out_caps) override;
-  X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state) override;
-  X_RESULT SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) override;
-  X_RESULT GetKeystroke(uint32_t user_index, uint32_t flags,
-                        X_INPUT_KEYSTROKE* out_keystroke) override;
+  void EnumerateDevices(std::vector<DeviceInfo>& out) override;
+  X_RESULT GetDeviceState(DeviceId id, X_INPUT_STATE* out_state) override;
+  X_RESULT GetDeviceCapabilities(DeviceId id, uint32_t flags,
+                                 X_INPUT_CAPABILITIES* out_caps) override;
+  X_RESULT SetDeviceVibration(DeviceId id, X_INPUT_VIBRATION* vibration) override;
+  X_RESULT GetDeviceKeystroke(DeviceId id, uint32_t flags,
+                              X_INPUT_KEYSTROKE* out_keystroke) override;
 
   void OnWindowAvailable(rex::ui::Window* window) override;
 
@@ -47,8 +50,6 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
-  void OnMouseWheel(rex::ui::MouseEvent& e) override;
-  void OnMouseRelativeMove(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -56,49 +57,46 @@ class MnkInputDriver final : public InputDriver,
   void OnGotFocus(rex::ui::UISetupEvent& e) override;
 
  private:
-  uint32_t UserIndex() const;
   bool IsEnabled() const;
-  void CenterCursor();
-  // From GetState (the game's thread): requests capturing or releasing the
-  // mouse, which the windowing systems only allow on the UI thread.
-  void UpdateMouseCapture();
-  // UI thread.
-  void ApplyMouseCapture(bool capture);
   void SetKeyState(uint16_t vk, bool down);
   void EnqueueKeystroke(uint16_t vk_pad, bool down);
-  // A right stick axis value for mouse movement at the velocity (counts per
-  // second).
-  int32_t MouseVelocityToStick(double velocity) const;
 
+  // Called from the guest thread. The rest of the capture path stays on the UI
+  // thread, since every Window call in it reaches SDL.
+  void QueueMouseCaptureUpdate(bool should_capture);
+  void ApplyMouseCaptureFromUIThread();
+  void ReleaseMouseCaptureFromUIThread(rex::ui::Window* window);
+  void RecenterCursorFromUIThread(int32_t x, int32_t y);
+  // Safe to call from any thread.
+  void DetachFromWindow();
+
+  // Only the UI thread writes it, so only guest thread access needs the lock.
   rex::ui::Window* attached_window_ = nullptr;
-  // Cleared in the destructor, for calls queued for the UI thread.
-  std::shared_ptr<std::atomic<bool>> alive_ = std::make_shared<std::atomic<bool>>(true);
 
   std::mutex state_mutex_;
   bool key_down_[256] = {};
-  // Every press is reported for at least a moment, so taps shorter than the
-  // interval between the game's polls aren't lost.
-  std::chrono::steady_clock::time_point key_hold_until_[256] = {};
-  // Mouse wheel "keys" stay pressed until these times.
-  std::chrono::steady_clock::time_point wheel_up_until_{};
-  std::chrono::steady_clock::time_point wheel_down_until_{};
 
-  // Mouse movement since the right stick was last updated.
-  int32_t mouse_dx_ = 0;
-  int32_t mouse_dy_ = 0;
+  // Mouse delta tracking. Fractional because relative motion arrives in
+  // fractions of a pixel, and truncating each event drops slow movement.
+  // Filled on the UI thread, drained on the guest thread, hence the lock.
+  float mouse_dx_ = 0.0f;
+  float mouse_dy_ = 0.0f;
+
+  // UI thread only.
   int32_t prev_mouse_x_ = 0;
   int32_t prev_mouse_y_ = 0;
-  // The right stick from mouse movement, recomputed at most every few
-  // milliseconds (the game may poll several times per frame), from the
-  // velocity over the last two updates.
-  std::chrono::steady_clock::time_point stick_update_time_{};
-  double prev_velocity_x_ = 0.0;
-  double prev_velocity_y_ = 0.0;
-  int32_t stick_rx_ = 0;
-  int32_t stick_ry_ = 0;
-  // Game thread: the capture state last requested from the UI thread.
-  bool capture_requested_ = false;
-  std::atomic<bool> mouse_captured_{false};
+  bool mouse_captured_ = false;
+  // Whether the window has the pointer locked and is reporting relative motion.
+  bool relative_mouse_mode_ = false;
+  // Cursor visibility to restore on capture release - the window owner may run
+  // an auto-hide policy that capture must not permanently override.
+  rex::ui::Window::CursorVisibility precapture_cursor_visibility_ =
+      rex::ui::Window::CursorVisibility::kVisible;
+
+  // Guest thread to UI thread. The queued flag coalesces the posts.
+  std::atomic<bool> mouse_capture_requested_{false};
+  std::atomic<bool> mouse_capture_update_queued_{false};
+
   std::atomic<bool> has_focus_{true};
 
   // Keystroke queue

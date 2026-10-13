@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
@@ -19,7 +20,6 @@
 #include <utility>
 #include <vector>
 
-#include <rex/chrono/clock.h>
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
@@ -43,6 +43,9 @@
 #if REX_PLATFORM_WIN32
 #include <rex/ui/surface_win.h>
 #endif
+#if REX_PLATFORM_MAC
+#include <rex/ui/surface_mac.h>
+#endif
 
 REXCVAR_DEFINE_BOOL(present_render_pass_clear, true, "UI/Presenter",
                     "Clear render pass during presentation");
@@ -58,8 +61,6 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
 
 namespace rex {
 namespace ui {
-// Defined in presenter.cpp, for the gpu_wait_stats log.
-void RecordPresentTime(uint32_t kind, uint64_t ticks);
 namespace vulkan {
 
 #if defined(REX_HAS_FIDELITYFX_RUNTIME) && REX_HAS_FIDELITYFX_RUNTIME
@@ -109,6 +110,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL FfxVkGetDeviceProcAddrCompat(VkDevice d
 namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_bilinear_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_bilinear_ps.h"
+#if defined(REX_HAS_FIDELITYFX_SDK)
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_resample_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_cas_sharpen_dither_ps.h"
@@ -116,6 +118,7 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_easu_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_dither_ps.h"
 #include "../shaders/vulkan_spirv/guest_output_ffx_fsr_rcas_ps.h"
+#endif
 #include "../shaders/vulkan_spirv/guest_output_triangle_strip_rect_vs.h"
 }  // namespace shaders
 
@@ -427,6 +430,9 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
   }
 #endif
 #if REX_PLATFORM_GNU_LINUX
+  if (instance_extensions.ext_KHR_wayland_surface) {
+    type_flags |= Surface::kTypeFlag_WaylandSurface;
+  }
   if (instance_extensions.ext_KHR_xcb_surface) {
     type_flags |= Surface::kTypeFlag_XcbWindow;
   }
@@ -434,6 +440,11 @@ Surface::TypeFlags VulkanPresenter::GetSurfaceTypesSupportedByInstance(
 #if REX_PLATFORM_WIN32
   if (instance_extensions.ext_KHR_win32_surface) {
     type_flags |= Surface::kTypeFlag_Win32Hwnd;
+  }
+#endif
+#if REX_PLATFORM_MAC
+  if (instance_extensions.ext_EXT_metal_surface) {
+    type_flags |= Surface::kTypeFlag_CAMetalLayer;
   }
 #endif
   return type_flags;
@@ -754,19 +765,29 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
   // awaiting completion of the usage of the swapchain and the surface on the
   // GPU.
   if (paint_context_.vulkan_surface != VK_NULL_HANDLE) {
-    VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
-    bool surface_unusable;
-    paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
-        vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
-        old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
-        paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
-    // Destroy the old swapchain that may be retired now.
-    if (old_swapchain != VK_NULL_HANDLE) {
-      dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
-    }
-    if (paint_context_.swapchain == VK_NULL_HANDLE) {
-      // Couldn't create the swapchain for the existing surface - start over.
+#if REX_PLATFORM_MAC
+    // Never reuse oldSwapchain on Metal. MoltenVK may force-complete pending
+    // presents by setting CAMetalLayer.drawableSize to {1,1}, and if the next
+    // extent matches the previous surface the drawable can stay wrong → black.
+    if (new_surface.GetType() == Surface::kTypeIndex_CAMetalLayer) {
       paint_context_.DestroySwapchainAndVulkanSurface();
+    } else
+#endif
+    {
+      VkSwapchainKHR old_swapchain = paint_context_.PrepareForSwapchainRetirement();
+      bool surface_unusable;
+      paint_context_.swapchain = PaintContext::CreateSwapchainForVulkanSurface(
+          vulkan_device_, paint_context_.vulkan_surface, new_surface_width, new_surface_height,
+          old_swapchain, paint_context_.present_queue_family, new_swapchain_format,
+          paint_context_.swapchain_extent, paint_context_.swapchain_is_fifo, surface_unusable);
+      // Destroy the old swapchain that may be retired now.
+      if (old_swapchain != VK_NULL_HANDLE) {
+        dfn.vkDestroySwapchainKHR(device, old_swapchain, nullptr);
+      }
+      if (paint_context_.swapchain == VK_NULL_HANDLE) {
+        // Couldn't create the swapchain for the existing surface - start over.
+        paint_context_.DestroySwapchainAndVulkanSurface();
+      }
     }
   }
 
@@ -811,6 +832,17 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         vulkan_surface_create_result = ifn.vkCreateXcbSurfaceKHR(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
+      case Surface::kTypeIndex_WaylandSurface: {
+        auto& wayland_surface = static_cast<const WaylandSurface&>(new_surface);
+        VkWaylandSurfaceCreateInfoKHR surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.display = wayland_surface.display();
+        surface_create_info.surface = wayland_surface.surface();
+        vulkan_surface_create_result = ifn.vkCreateWaylandSurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
 #endif
 #if REX_PLATFORM_WIN32
       case Surface::kTypeIndex_Win32Hwnd: {
@@ -822,6 +854,20 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
         surface_create_info.hinstance = win32_hwnd_surface.hinstance();
         surface_create_info.hwnd = win32_hwnd_surface.hwnd();
         vulkan_surface_create_result = ifn.vkCreateWin32SurfaceKHR(
+            instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
+      } break;
+#endif
+#if REX_PLATFORM_MAC
+      case Surface::kTypeIndex_CAMetalLayer: {
+        auto& metal_surface = static_cast<const CAMetalLayerSurface&>(new_surface);
+        metal_surface.ConfigureMetalLayer(new_surface_width, new_surface_height,
+                                          metal_surface.GetBackingScale());
+        VkMetalSurfaceCreateInfoEXT surface_create_info;
+        surface_create_info.sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT;
+        surface_create_info.pNext = nullptr;
+        surface_create_info.flags = 0;
+        surface_create_info.pLayer = metal_surface.layer();
+        vulkan_surface_create_result = ifn.vkCreateMetalSurfaceEXT(
             instance, &surface_create_info, nullptr, &paint_context_.vulkan_surface);
       } break;
 #endif
@@ -849,6 +895,20 @@ VulkanPresenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_su
       return surface_unusable ? SurfacePaintConnectResult::kFailureSurfaceUnusable
                               : SurfacePaintConnectResult::kFailure;
     }
+#if REX_PLATFORM_MAC
+    // Re-apply after swapchain create: MoltenVK may have touched drawableSize
+    // during construction; pin it to the final extent.
+    if (new_surface.GetType() == Surface::kTypeIndex_CAMetalLayer) {
+      auto& metal_surface = static_cast<const CAMetalLayerSurface&>(new_surface);
+      const uint32_t extent_w = paint_context_.swapchain_extent.width
+                                    ? paint_context_.swapchain_extent.width
+                                    : new_surface_width;
+      const uint32_t extent_h = paint_context_.swapchain_extent.height
+                                    ? paint_context_.swapchain_extent.height
+                                    : new_surface_height;
+      metal_surface.ConfigureMetalLayer(extent_w, extent_h, metal_surface.GetBackingScale());
+    }
+#endif
     // Successfully attached (at least for now).
   }
 
@@ -1343,29 +1403,23 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
-  // HAND PATCH: upstream Xenia prioritized IMMEDIATE first here for the
-  // lowest possible latency / VRR passthrough. On this fork that meant every
-  // swapchain defaulted to tearing-permitted presentation, which read as
-  // visible flicker in UI-heavy scenes (the main menu) where sharp-contrast
-  // elements make torn/partial frames obvious. MAILBOX gives up essentially
-  // nothing on latency (it never blocks the GPU command processor -- it just
-  // drops all but the newest complete frame at present time) while removing
-  // the tearing, so it's now tried first; IMMEDIATE stays available as a
-  // fallback (and still user-disable-able via its own cvar) for drivers that
-  // don't expose MAILBOX.
+  // As presentation is usually controlled by the GPU command processor, it's
+  // better to use modes that allow as quick acquisition as possible to avoid
+  // interfering with GPU command processing, and also to allow tearing so
+  // variable refresh rate may be used where it's available.
   // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
-      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+      std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
-    // Allowing dropping frames to reduce latency, but no tearing.
-    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
-  } else if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
-             std::find(present_modes.cbegin(), present_modes.cend(),
-                       VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
     // Allowing tearing to reduce latency, and possibly variable refresh rate
     // (though on Windows with borderless fullscreen, GDI copying is used
     // instead of independent flip, so it's not supported there).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
+  } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
+             std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
+                 present_modes.cend()) {
+    // Allowing dropping frames to reduce latency, but no tearing.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
   } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
@@ -1383,33 +1437,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     REXLOG_ERROR("VulkanPresenter: Failed to create a swapchain");
     return VK_NULL_HANDLE;
   }
-  // Name the mode in the log - "presentation mode 1" kept getting misread
-  // while chasing menu flicker, and whether the driver actually gave us a
-  // tear-free mode is the first thing to check in a flicker report.
-  const char* present_mode_name;
-  switch (swapchain_create_info.presentMode) {
-    case VK_PRESENT_MODE_IMMEDIATE_KHR:
-      present_mode_name = "immediate (tearing permitted)";
-      break;
-    case VK_PRESENT_MODE_MAILBOX_KHR:
-      present_mode_name = "mailbox (tear-free)";
-      break;
-    case VK_PRESENT_MODE_FIFO_KHR:
-      present_mode_name = "fifo (vsync)";
-      break;
-    case VK_PRESENT_MODE_FIFO_RELAXED_KHR:
-      present_mode_name = "fifo relaxed (tearing on late frames)";
-      break;
-    default:
-      present_mode_name = "unknown";
-      break;
-  }
   REXLOG_INFO(
       "VulkanPresenter: Created {}x{} swapchain with format {}, color space "
-      "{}, presentation mode {} ({})",
+      "{}, presentation mode {}",
       swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
       uint32_t(swapchain_create_info.imageFormat), uint32_t(swapchain_create_info.imageColorSpace),
-      uint32_t(swapchain_create_info.presentMode), present_mode_name);
+      uint32_t(swapchain_create_info.presentMode));
 
   present_queue_family_out = queue_family_index_present;
   image_format_out = swapchain_create_info.imageFormat;
@@ -1523,16 +1556,31 @@ bool VulkanPresenter::GuestOutputImage::Initialize() {
 }
 
 Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_drawers) {
+  {
+    // DEVSTATS (local only): host paints per second.
+    static uint64_t rex_paints = 0, rex_last_ns = 0;
+    const uint64_t rex_now =
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                     std::chrono::steady_clock::now().time_since_epoch())
+                     .count());
+    ++rex_paints;
+    if (!rex_last_ns) {
+      rex_last_ns = rex_now;
+    } else if (rex_now - rex_last_ns >= 2000000000ull) {
+      REXLOG_INFO("PERF: host paints {:.1f}/s",
+                  double(rex_paints) * 1e9 / double(rex_now - rex_last_ns));
+      rex_paints = 0;
+      rex_last_ns = rex_now;
+    }
+  }
   // Begin the submission in place of the one not currently potentially used on
   // the GPU.
   uint64_t current_paint_submission_index =
       paint_context_.submission_tracker.GetCurrentSubmission();
   uint64_t paint_submission_count = uint64_t(paint_context_.submissions.size());
   if (current_paint_submission_index >= paint_submission_count) {
-    uint64_t wait_start_tick = rex::chrono::Clock::QueryHostTickCount();
     paint_context_.submission_tracker.AwaitSubmissionCompletion(current_paint_submission_index -
                                                                 paint_submission_count);
-    RecordPresentTime(0, rex::chrono::Clock::QueryHostTickCount() - wait_start_tick);
   }
   const PaintContext::Submission& paint_submission =
       *paint_context_.submissions[current_paint_submission_index % paint_submission_count];
@@ -1565,12 +1613,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
 
   VkSemaphore acquire_semaphore = paint_submission.acquire_semaphore();
   uint32_t swapchain_image_index;
-  uint64_t acquire_start_tick = rex::chrono::Clock::QueryHostTickCount();
   VkResult acquire_result =
       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
                                 VK_NULL_HANDLE, &swapchain_image_index);
-  uint64_t recording_start_tick = rex::chrono::Clock::QueryHostTickCount();
-  RecordPresentTime(1, recording_start_tick - acquire_start_tick);
   switch (acquire_result) {
     case VK_SUCCESS:
     case VK_SUBOPTIMAL_KHR:
@@ -1685,11 +1730,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           }
           // Await the completion of the usage of the old guest output image and
           // its descriptors.
-          uint64_t wait_start_tick = rex::chrono::Clock::QueryHostTickCount();
           paint_context_.submission_tracker.AwaitSubmissionCompletion(
               paint_context_.guest_output_image_paint_refs[guest_output_image_paint_ref_new_index]
                   .first);
-          RecordPresentTime(3, rex::chrono::Clock::QueryHostTickCount() - wait_start_tick);
         }
         guest_output_image_paint_ref_index = guest_output_image_paint_ref_new_index;
         // The actual submission index will be set if the image is actually
@@ -1841,14 +1884,11 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
                 swapchain_effect, paint_context_.swapchain_render_pass);
             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
               guest_output_flow.effect_count = 0;
-            } else {
-              // Without this, the pipeline was taken as made for another format
-              // on every paint - the painting thread waited for the previous
-              // paint to complete on the GPU (the whole previous frame) and
-              // created the pipeline again, every frame.
-              swapchain_effect_pipeline.swapchain_format =
-                  paint_context_.swapchain_render_pass_format;
             }
+            // Record the format the pipeline was built for. Left unset, the
+            // check above saw a mismatch on every paint, so each paint waited
+            // for the GPU to finish the previous one and rebuilt the pipeline.
+            swapchain_effect_pipeline.swapchain_format = paint_context_.swapchain_render_pass_format;
           }
         }
       }
@@ -2035,16 +2075,19 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
           uint32_t effect_constants_size = 0;
           union {
             BilinearConstants bilinear;
+#if defined(REX_HAS_FIDELITYFX_SDK)
             CasSharpenConstants cas_sharpen;
             CasResampleConstants cas_resample;
             FsrEasuConstants fsr_easu;
             FsrRcasConstants fsr_rcas;
+#endif
           } effect_constants;
           switch (guest_output_paint_pipeline_layout_index) {
             case kGuestOutputPaintPipelineLayoutIndexBilinear: {
               effect_constants_size = sizeof(effect_constants.bilinear);
               effect_constants.bilinear.Initialize(guest_output_flow, i);
             } break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
             case kGuestOutputPaintPipelineLayoutIndexCasSharpen: {
               effect_constants_size = sizeof(effect_constants.cas_sharpen);
               effect_constants.cas_sharpen.Initialize(guest_output_flow, i,
@@ -2063,6 +2106,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
               effect_constants_size = sizeof(effect_constants.fsr_rcas);
               effect_constants.fsr_rcas.Initialize(guest_output_flow, i, guest_output_paint_config);
             } break;
+#endif
             default:
               break;
           }
@@ -2190,11 +2234,8 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   submit_info.signalSemaphoreCount = 1;
   submit_info.pSignalSemaphores = &present_semaphore;
   {
-    RecordPresentTime(9, rex::chrono::Clock::QueryHostTickCount() - recording_start_tick);
-    uint64_t fence_start_tick = rex::chrono::Clock::QueryHostTickCount();
     VulkanSubmissionTracker::FenceAcquisition fence_acqusition(
         paint_context_.submission_tracker.AcquireFenceToAdvanceSubmission());
-    RecordPresentTime(6, rex::chrono::Clock::QueryHostTickCount() - fence_start_tick);
     // Also update the submission tracker giving submission indices to UI draw
     // callbacks if submission is successful.
     VulkanSubmissionTracker::FenceAcquisition ui_fence_acquisition;
@@ -2203,14 +2244,10 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
     }
     VkResult submit_result;
     {
-      uint64_t queue_lock_start_tick = rex::chrono::Clock::QueryHostTickCount();
       const VulkanDevice::Queue::Acquisition queue_acquisition =
           vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
-      uint64_t submit_start_tick = rex::chrono::Clock::QueryHostTickCount();
-      RecordPresentTime(7, submit_start_tick - queue_lock_start_tick);
       submit_result =
           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
-      RecordPresentTime(8, rex::chrono::Clock::QueryHostTickCount() - submit_start_tick);
       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
         if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
                               ui_fence_acquisition.fence()) != VK_SUCCESS) {
@@ -2251,9 +2288,7 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
   {
     const VulkanDevice::Queue::Acquisition queue_acquisition =
         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
-    uint64_t present_start_tick = rex::chrono::Clock::QueryHostTickCount();
     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
-    RecordPresentTime(2, rex::chrono::Clock::QueryHostTickCount() - present_start_tick);
   }
   switch (present_result) {
     case VK_SUCCESS:
@@ -2347,6 +2382,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       case kGuestOutputPaintPipelineLayoutIndexBilinear:
         guest_output_paint_push_constant_range_ffx.size = sizeof(BilinearConstants);
         break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
       case kGuestOutputPaintPipelineLayoutIndexCasSharpen:
         guest_output_paint_push_constant_range_ffx.size = sizeof(CasSharpenConstants);
         break;
@@ -2359,6 +2395,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
       case kGuestOutputPaintPipelineLayoutIndexFsrRcas:
         guest_output_paint_push_constant_range_ffx.size = sizeof(FsrRcasConstants);
         break;
+#endif
       default:
         assert_unhandled_case(GuestOutputPaintPipelineLayoutIndex(i));
         continue;
@@ -2400,6 +2437,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_bilinear_dither_ps);
         shader_module_create_info.pCode = shaders::guest_output_bilinear_dither_ps;
         break;
+#if defined(REX_HAS_FIDELITYFX_SDK)
       case GuestOutputPaintEffect::kCasSharpen:
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_cas_sharpen_ps);
         shader_module_create_info.pCode = shaders::guest_output_ffx_cas_sharpen_ps;
@@ -2430,6 +2468,7 @@ bool VulkanPresenter::InitializeSurfaceIndependent() {
         shader_module_create_info.codeSize = sizeof(shaders::guest_output_ffx_fsr_rcas_dither_ps);
         shader_module_create_info.pCode = shaders::guest_output_ffx_fsr_rcas_dither_ps;
         break;
+#endif
       default:
         // Not supported by this implementation.
         continue;

@@ -12,7 +12,6 @@
 #include <vector>
 
 #include <rex/chrono/clock.h>
-#include <rex/perf/event_trace.h>
 #include <rex/stream.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
@@ -213,9 +212,9 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
-  rex::perf::TraceSwapThreadEvent("kwait", guest_object() ? guest_object() : handle());
+  XThread::CheckTitleTermination();
   auto result = rex::thread::Wait(wait_handle, alertable ? true : false, timeout_ms);
-  rex::perf::TraceSwapThreadEvent("kwait_done", uint64_t(result));
+  XThread::CheckTitleTermination();
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       WaitCallback();
@@ -240,13 +239,9 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
-  rex::perf::TraceSwapThreadEvent("ksigwait", wait_object->guest_object()
-                                                  ? wait_object->guest_object()
-                                                  : wait_object->handle());
   auto result =
       rex::thread::SignalAndWait(signal_object->GetWaitHandle(), wait_object->GetWaitHandle(),
                                  alertable ? true : false, timeout_ms);
-  rex::perf::TraceSwapThreadEvent("ksigwait_done", uint64_t(result));
   switch (result) {
     case rex::thread::WaitResult::kSuccess:
       wait_object->WaitCallback();
@@ -277,11 +272,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
                                       TimeoutTicksToMs(*opt_timeout)))
                                 : std::chrono::milliseconds::max();
 
-  rex::perf::TraceSwapThreadEvent("kwaitm", count);
+  XThread::CheckTitleTermination();
   if (wait_type) {
     auto result =
         rex::thread::WaitAny(std::move(wait_handles), alertable ? true : false, timeout_ms);
-    rex::perf::TraceSwapThreadEvent("kwaitm_done", uint64_t(result.first));
+    XThread::CheckTitleTermination();
     switch (result.first) {
       case rex::thread::WaitResult::kSuccess:
         objects[result.second]->WaitCallback();
@@ -302,7 +297,7 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
   } else {
     auto result =
         rex::thread::WaitAll(std::move(wait_handles), alertable ? true : false, timeout_ms);
-    rex::perf::TraceSwapThreadEvent("kwaitm_done", uint64_t(result));
+    XThread::CheckTitleTermination();
     switch (result) {
       case rex::thread::WaitResult::kSuccess:
         for (uint32_t i = 0; i < count; i++) {
@@ -397,13 +392,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
     // Already initialized.
     // TODO: assert if the type of the object != as_type
     uint32_t handle = header->wait_list_blink;
-    // This function holds the global critical region for its whole body (the
-    // AcquireDirect() above), and this lookup runs on every guest
-    // KeSetEvent/wait/semaphore/mutant call that addresses the object by
-    // pointer -- the common case. Skip LookupObject's own redundant
-    // re-acquire of the same recursive mutex.
-    auto object =
-        kernel_state->object_table()->LookupObject<XObject>(handle, /*already_locked=*/true);
+    auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
 
     // TODO(benvanik): assert nothing has been changed in the struct.
     return object;

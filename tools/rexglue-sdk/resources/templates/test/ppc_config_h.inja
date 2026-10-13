@@ -55,12 +55,25 @@
 #endif
 
 #ifndef DEFINE_REX_FUNC
-#define DEFINE_REX_FUNC(name)                                  \
-  __attribute__((alias("__imp__" #name))) REX_WEAK_FUNC(name); \
+#if defined(__APPLE__)
+// Darwin has no overridable alias (see codegen/pch_h.inja): use a weak
+// musttail thunk so `name` stays overridable by hooks and lowers to a `jmp`.
+#define DEFINE_REX_FUNC(name)                                            \
+  extern "C" void __imp__##name(PPCContext& __restrict, uint8_t*);       \
+  __attribute__((weak, noinline)) extern "C" void name(                  \
+      PPCContext& __restrict ctx, uint8_t* base) {                       \
+    [[clang::musttail]] return __imp__##name(ctx, base);                 \
+  }                                                                      \
+  extern "C" void __imp__##name([[maybe_unused]] PPCContext& __restrict ctx, uint8_t* base)
+#else
+#define DEFINE_REX_FUNC(name)                                       \
+  __attribute__((alias("__imp__" #name)))                           \
+  __attribute__((weak, noinline)) extern "C" REX_FUNC(name);        \
   REX_EXTERN(__imp__##name)
 #endif
+#endif
 
-#if REX_PLATFORM_WIN32
+#if REX_PLATFORM_WIN32 || (REX_PLATFORM_MAC && REX_ARCH_ARM64)
 #define REX_PHYS_HOST_OFFSET(addr) (((u32)(addr) >= 0xE0000000u) ? 0x1000u : 0u)
 #else
 #define REX_PHYS_HOST_OFFSET(addr) 0u
@@ -110,25 +123,18 @@
 // Setjmp/Longjmp
 //=============================================================================
 
-// Windows setjmp saves XMM registers with aligned stores. Some toolchains
-// give jmp_buf only 8-byte type alignment, so a map value needs an explicit
-// 16-byte boundary regardless of the guest key that precedes it.
-struct alignas(16) PPCJumpBuffer {
-  jmp_buf value;
-};
-
-inline std::unordered_map<u32, PPCJumpBuffer>& get_jmp_buf_map() {
-  static thread_local std::unordered_map<u32, PPCJumpBuffer> map;
+inline std::unordered_map<u32, jmp_buf>& get_jmp_buf_map() {
+  static thread_local std::unordered_map<u32, jmp_buf> map;
   return map;
 }
 
-#define ppc_setjmp(guest_buf_addr) (setjmp(::get_jmp_buf_map()[(guest_buf_addr)].value))
+#define ppc_setjmp(guest_buf_addr) (setjmp(::get_jmp_buf_map()[(guest_buf_addr)]))
 
 [[noreturn]] inline void ppc_longjmp(u32 guest_buf_addr, int val) {
   auto& map = get_jmp_buf_map();
   auto it = map.find(guest_buf_addr);
   if (it != map.end()) {
-    longjmp(it->second.value, val);
+    longjmp(it->second, val);
   }
   std::abort();
 }
@@ -166,20 +172,26 @@ inline std::atomic<i32>& ppc_global_lock_count_() {
   return count;
 }
 
-#define REX_CHECK_GLOBAL_LOCK()                                        \
-  ([&]() -> u64 {                                                      \
-    auto lock_ = rex::thread::global_critical_region::AcquireDirect(); \
-    return ppc_global_lock_count_().load() ? 0 : 0x8000;               \
-  }())
+// How many interrupt-disabling mtmsrd this thread is inside. mfmsr reports
+// the calling thread's own state, so it needs no lock; taking the global lock
+// here made every interlocked operation lock it twice.
+inline i32& ppc_thread_lock_depth_() {
+  thread_local i32 depth = 0;
+  return depth;
+}
+
+#define REX_CHECK_GLOBAL_LOCK() (ppc_thread_lock_depth_() ? u64(0) : u64(0x8000))
 
 #define REX_ENTER_GLOBAL_LOCK()                          \
   do {                                                   \
     rex::thread::global_critical_region::mutex().lock(); \
     ppc_global_lock_count_().fetch_add(1);               \
+    ++ppc_thread_lock_depth_();                          \
   } while (0)
 
 #define REX_LEAVE_GLOBAL_LOCK()                                                           \
   do {                                                                                    \
+    --ppc_thread_lock_depth_();                                                           \
     auto old_count_ = ppc_global_lock_count_().fetch_sub(1);                              \
     assert(old_count_ >= 1 && "LeaveGlobalLock called without matching EnterGlobalLock"); \
     rex::thread::global_critical_region::mutex().unlock();                                \
