@@ -107,7 +107,17 @@ Never commit game files, ISOs, extracted assets, build products, or personal sav
 
 ## Legal
 
-Unofficial fan project, unaffiliated with Electronic Arts, Fox, Disney, or Microsoft. You must own the game. No ISOs, XEXs, or copyrighted game assets are distributed with this repository or its releases.
+The Simpsons Game is © 2007 Electronic Arts Inc. The Simpsons and all related characters and trademarks belong to their respective owners. Xbox and Xbox 360 are trademarks of Microsoft Corporation.
+
+This is an unofficial, non-commercial fan project. It is not affiliated with, endorsed by or sponsored by Electronic Arts, Fox, Microsoft or any other rights holder.
+
+This repository and its releases contain no game assets: no textures, models, audio, video, scripts or level data. The code in simpsons/generated is produced by recompiling the game's executable code and does not contain the game's data. The game runs only with data installed from an ISO of your own copy, and nothing from your installation is uploaded anywhere.
+
+Please support the original release. Do not use this project with copies of the game you do not own, and do not ask for or share game files in this repository's issues or discussions. You are responsible for complying with the laws that apply to you regarding backups of media you own.
+
+This software is provided as is, without warranty of any kind.
+
+An updated note on AI assistance: most of the early work on this project used little to no AI assistance. As things have become harder, I've used ChatGPT and Claude a handful of times to help with research, bug fixes and improvements, and to get closer to what I want this recomp to be. I'm afraid I may have to use them more as I get further into the project, and I apologize for that. This is still a solo, fan-made effort and a fast-moving hobby project.
 
 ## License
 
