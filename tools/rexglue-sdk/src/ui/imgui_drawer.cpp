@@ -172,6 +172,9 @@ void ImGuiDrawer::Initialize() {
   // Dialogs are shown over a running title, where a controller is often the
   // only input device attached - let ImGui drive focus and buttons from it.
   io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+  // WindowSDL owns show/hide (including idle auto-hide). Without this, ImGui
+  // forces SDL_ShowCursor every frame and the OS cursor never disappears.
+  io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
   io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
 
   // Setup the font glyphs.

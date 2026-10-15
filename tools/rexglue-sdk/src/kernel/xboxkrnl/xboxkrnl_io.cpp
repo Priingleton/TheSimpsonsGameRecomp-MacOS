@@ -13,6 +13,7 @@
 #pragma GCC diagnostic ignored "-Wunused-parameter"
 
 #include <rex/filesystem/device.h>
+#include <rex/filesystem/file_open_listener.h>
 #include <rex/kernel/xboxkrnl/private.h>
 #include <rex/logging.h>
 #include <rex/memory.h>
@@ -168,6 +169,9 @@ u32 NtCreateFile_entry(mapped_u32 handle_out, u32 desired_access,
   }
 
   *handle_out = handle;
+  if (XSUCCEEDED(result)) {
+    rex::filesystem::NotifyFileOpened(target_path);
+  }
   // DEVSTATS: everything off the game disc (saves, caches).
   if (target_path.size() > 2 && !(target_path[0] == 'D' || target_path[0] == 'd') &&
       target_path.rfind("game:", 0) != 0) {

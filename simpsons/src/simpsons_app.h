@@ -12,7 +12,11 @@
 #include <rex/graphics/guest_frame_stats.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
+#include <rex/ui/style.h>
 
+#include <imgui.h>
+
+#include "graphics_options.h"
 #include "test_harness.h"
 
 #include <CoreFoundation/CoreFoundation.h>
@@ -56,6 +60,7 @@ class SimpsonsApp : public rex::ReXApp {
   void OnConfigurePaths(rex::PathConfig& paths) override {
     SetDefaults();
     WriteDefaultConfig(paths.config_path);
+    config_path_ = paths.config_path;
     if (!paths.game_data_root.empty()) {
       SetLanguageDefault(paths.game_data_root);
     }
@@ -66,6 +71,57 @@ class SimpsonsApp : public rex::ReXApp {
     }
   }
 
+  void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
+    InitGraphicsOptions(drawer, window(), config_path_);
+    if (graphics_font_) {
+      SetGraphicsOptionsFont(graphics_font_);
+    }
+  }
+
+  void OnConfigureFonts(ImFontAtlas* atlas) override {
+    if (!atlas) {
+      return;
+    }
+    const char* kName = "Highlander ITC Std Bold.otf";
+    std::vector<std::filesystem::path> candidates;
+    if (const char* root = std::getenv("SIMPSONS_PACKAGE_ROOT"); root && *root) {
+      candidates.emplace_back(std::filesystem::path(root) / "art" / "fonts" / kName);
+    }
+    candidates.emplace_back(std::filesystem::path("art") / "fonts" / kName);
+    candidates.emplace_back(std::filesystem::path("simpsons") / "assets" / "fonts" / kName);
+    candidates.emplace_back(std::filesystem::path("assets") / "fonts" / kName);
+    // Dev tree: binary under out/build/... → repo root art/fonts or assets.
+    candidates.emplace_back(std::filesystem::current_path() / "art" / "fonts" / kName);
+    candidates.emplace_back(std::filesystem::current_path() / "assets" / "fonts" / kName);
+
+    ImFontConfig cfg;
+    cfg.OversampleH = 2;
+    cfg.OversampleV = 2;
+    cfg.PixelSnapH = false;
+    for (const auto& path : candidates) {
+      std::error_code error;
+      if (!std::filesystem::is_regular_file(path, error)) {
+        continue;
+      }
+      graphics_font_ = atlas->AddFontFromFileTTF(path.string().c_str(), 56.0f, &cfg);
+      if (graphics_font_) {
+        REXLOG_INFO("Graphics options font: {}", path.string());
+        return;
+      }
+    }
+    REXLOG_WARN("Graphics options: Highlander font not found (tried art/fonts/{})", kName);
+  }
+
+  void OnConfigureStyle(ImGuiStyle& imgui_style, rex::ui::Style& ui_style) override {
+    // Springfield yellow accents — same family as the Mac launcher.
+    imgui_style.Colors[ImGuiCol_CheckMark] = ImVec4(0.11f, 0.11f, 0.11f, 1.00f);
+    imgui_style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.996f, 0.851f, 0.059f, 1.00f);
+    imgui_style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(0.79f, 0.64f, 0.00f, 1.00f);
+    ui_style.settings.lifecycle_live = ImVec4(0.18f, 0.61f, 0.29f, 1.00f);
+    ui_style.settings.lifecycle_restart = ImVec4(0.91f, 0.19f, 0.19f, 1.00f);
+    ui_style.settings.warning = ImVec4(0.79f, 0.64f, 0.00f, 1.00f);
+  }
+
   void OnPostLoadXexImage() override {
     ApplyInkOutlineOptions(runtime()->memory());
     ApplyEyeShadingOptions(runtime()->memory());
@@ -74,6 +130,9 @@ class SimpsonsApp : public rex::ReXApp {
   void OnPostSetup() override {
     if (auto* w = window()) {
       w->SetTitle("The Simpsons Game");
+      // Hide the macOS pointer after a short idle (YouTube-style), reveal on move/click.
+      w->SetCursorAutoHideDelayMs(2000);
+      w->SetCursorVisibility(rex::ui::Window::CursorVisibility::kAutoHidden);
     }
     rex::ui::Presenter* presenter = nullptr;
     if (auto* graphics = runtime()->graphics_system()) {
@@ -86,6 +145,7 @@ class SimpsonsApp : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    ShutdownGraphicsOptions();
     ShutdownFreecam(window());
     shots_.Stop();
   }
@@ -230,5 +290,7 @@ class SimpsonsApp : public rex::ReXApp {
 
   simpsons::ShotTaker shots_;
   std::filesystem::path shots_dir_;
+  std::filesystem::path config_path_;
+  ImFont* graphics_font_ = nullptr;
   rex::ui::FrameStats stats_{};
 };

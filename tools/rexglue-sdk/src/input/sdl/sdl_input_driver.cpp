@@ -88,6 +88,11 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
           },
           this);
 
+      // Keep receiving pad input when another display/app has keyboard focus
+      // (dual-monitor play). Default SDL behavior is to mute joysticks in the
+      // background.
+      SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+
       // Initialize game controller subsystem
       if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         REXLOG_ERROR("SDL: Failed to init gamecontroller subsystem: {}", SDL_GetError());

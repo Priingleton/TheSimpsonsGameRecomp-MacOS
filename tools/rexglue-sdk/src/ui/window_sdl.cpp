@@ -515,6 +515,12 @@ void WindowSDL::HandleWindowEvent(SDL_Event& event) {
     }
     case SDL_EVENT_WINDOW_FOCUS_GAINED:
       OnFocusUpdate(true, destruction_receiver);
+      if (!destruction_receiver.IsWindowDestroyed() &&
+          GetCursorVisibility() == CursorVisibility::kAutoHidden) {
+        // After a click brings the window forward, hide again once idle.
+        SDL_ShowCursor();
+        RearmCursorAutoHideTimer();
+      }
       break;
     case SDL_EVENT_WINDOW_FOCUS_LOST:
       OnFocusUpdate(false, destruction_receiver);
@@ -606,6 +612,10 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
     }
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
     case SDL_EVENT_MOUSE_BUTTON_UP: {
+      if (GetCursorVisibility() == CursorVisibility::kAutoHidden) {
+        SDL_ShowCursor();
+        RearmCursorAutoHideTimer();
+      }
       MouseEvent e(this, TranslateSDLMouseButton(event.button.button),
                    int32_t(event.button.x * density), int32_t(event.button.y * density));
       if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
@@ -616,6 +626,10 @@ void WindowSDL::HandleMouseEvent(SDL_Event& event) {
       break;
     }
     case SDL_EVENT_MOUSE_WHEEL: {
+      if (GetCursorVisibility() == CursorVisibility::kAutoHidden) {
+        SDL_ShowCursor();
+        RearmCursorAutoHideTimer();
+      }
       MouseEvent e(this, MouseEvent::Button::kNone, int32_t(event.wheel.mouse_x * density),
                    int32_t(event.wheel.mouse_y * density),
                    int32_t(event.wheel.x * float(MouseEvent::kScrollPerDetent)),

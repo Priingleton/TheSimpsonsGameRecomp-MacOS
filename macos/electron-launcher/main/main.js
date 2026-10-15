@@ -4,6 +4,9 @@ const { app, BrowserWindow, ipcMain, dialog, protocol } = require('electron');
 const fs = require('fs');
 const path = require('path');
 
+// Prefer overlay scrollbars when Chromium supports them (before ready).
+app.commandLine.appendSwitch('enable-features', 'OverlayScrollbar,FluentOverlayScrollbar');
+
 protocol.registerSchemesAsPrivileged([
   { scheme: 'art', privileges: { standard: true, secure: true, supportFetchAPI: true, bypassCSP: true, stream: true } },
 ]);
@@ -28,6 +31,7 @@ const { GameService } = require('./game');
 const { generateArt, ffmpegPath } = require('./art');
 const { InstallService } = require('./install');
 const patches = require('./patches');
+const { applyOptionsUiPatches, isOptionsUiPatched } = require('./gamedata_patches');
 const { DiagnosticsService } = require('./diagnostics');
 const { UpdateService } = require('./updates');
 
@@ -44,10 +48,10 @@ function createWindow() {
     height: 720,
     minWidth: 960,
     minHeight: 600,
-    backgroundColor: '#131313',
+    backgroundColor: '#fff6d8',
     title: 'TSG Launcher',
     titleBarStyle: 'hiddenInset',
-    trafficLightPosition: { x: 14, y: 14 },
+    trafficLightPosition: { x: 16, y: 14 },
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
       contextIsolation: true,
@@ -124,6 +128,19 @@ app.whenReady().then(() => {
   });
 
   createWindow();
+
+  // Apply Options › GRAPHICS asset patches if gamedata is present but not stamped.
+  if (looksLikeGameDirectory(paths.gamedata) && !isOptionsUiPatched(paths)) {
+    setImmediate(() => {
+      const r = applyOptionsUiPatches(paths, { force: false });
+      if (!r.skipped) {
+        install.append(r.ok ? r.message : `WARNING: ${r.message}`);
+        for (const line of (r.log || []).slice(-8)) install.append(line);
+        install.emit();
+        broadcast('status', statusPayload());
+      }
+    });
+  }
 
   // Auto-generate art if missing
   if (looksLikeGameDirectory(paths.gamedata) && heroArtFiles(paths).length === 0 && ffmpegPath(paths)) {

@@ -5,7 +5,7 @@
 # with SDL3 + Vulkan via MoltenVK. SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(simpsons VERSION 0.2.4 LANGUAGES CXX)
+project(simpsons VERSION 0.2.0 LANGUAGES CXX)
 
 if(NOT APPLE)
   message(FATAL_ERROR "This fork builds on macOS only (Apple Silicon / MoltenVK).")
@@ -29,6 +29,7 @@ set(SIMPSONS_SOURCES
     src/fps_unlock.cpp
     src/frame_pacing.cpp
     src/freecam.cpp
+    src/graphics_options.cpp
     src/ink_outlines.cpp
     src/overlay_input.cpp
     src/ring_wait.cpp
@@ -51,3 +52,14 @@ set_source_files_properties(
 target_link_libraries(simpsons PRIVATE "-framework CoreFoundation")
 
 rexglue_setup_target(simpsons GPU_PLUGINS xenos)
+
+# Highlander menu font for Options › GRAPHICS (host CRT body).
+add_custom_command(
+  TARGET simpsons
+  POST_BUILD
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:simpsons>/art/fonts"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "${CMAKE_CURRENT_SOURCE_DIR}/assets/fonts/Highlander ITC Std Bold.otf"
+          "$<TARGET_FILE_DIR:simpsons>/art/fonts/Highlander ITC Std Bold.otf"
+  COMMENT "Copy Highlander menu font next to simpsons")
+

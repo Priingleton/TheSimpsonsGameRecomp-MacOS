@@ -2,11 +2,11 @@
 'use strict';
 
 const TABS = [
-  { id: 'play', title: 'Play' },
+  { id: 'play', title: 'Play & Launch' },
   { id: 'install', title: 'Install' },
-  { id: 'settings', title: 'Settings' },
+  { id: 'settings', title: 'Game Settings' },
   { id: 'patches', title: 'Patches' },
-  { id: 'support', title: 'Support' },
+  { id: 'support', title: 'Console & Diagnostics' },
   { id: 'about', title: 'About' },
 ];
 
@@ -20,9 +20,45 @@ const state = {
 const el = {
   nav: document.getElementById('nav'),
   main: document.getElementById('main'),
+  mainShell: document.querySelector('.main-shell'),
+  scrollThumb: document.getElementById('scrollThumb'),
   version: document.getElementById('version'),
   toast: document.getElementById('toast'),
 };
+
+let scrollHideTimer = null;
+
+function syncScrollThumb() {
+  const main = el.main;
+  const thumb = el.scrollThumb;
+  const shell = el.mainShell;
+  if (!main || !thumb || !shell) return;
+
+  const view = main.clientHeight;
+  const total = main.scrollHeight;
+  const maxScroll = Math.max(total - view, 0);
+  if (maxScroll <= 0 || total <= view + 1) {
+    thumb.style.opacity = '0';
+    thumb.style.height = '0px';
+    return;
+  }
+
+  const track = Math.max(shell.clientHeight - 20, 0);
+  const thumbH = Math.max((view / total) * track, 28);
+  const maxTop = Math.max(track - thumbH, 0);
+  const top = maxScroll > 0 ? (main.scrollTop / maxScroll) * maxTop : 0;
+  thumb.style.opacity = '1';
+  thumb.style.height = `${thumbH}px`;
+  thumb.style.transform = `translateY(${top}px)`;
+}
+
+function onMainScroll() {
+  syncScrollThumb();
+  if (!el.mainShell) return;
+  el.mainShell.classList.add('is-scrolling');
+  clearTimeout(scrollHideTimer);
+  scrollHideTimer = setTimeout(() => el.mainShell?.classList.remove('is-scrolling'), 700);
+}
 
 function toast(msg) {
   if (!msg) return;
@@ -91,28 +127,51 @@ function renderPlay() {
     : 'Missing';
   const data = s?.gamedataReady ? 'Installed' : 'Not installed';
   const controls = s?.settings?.mnk_mode ? 'Keyboard & mouse' : 'Controller';
+  const canPlay = !running && !!s?.engineReady && !!s?.gamedataReady;
 
   return `
-    <div class="hero">
-      ${art ? `<img id="heroImg" src="${esc(art)}" alt="" />` : ''}
-      <div class="scrim"></div>
-      <div class="copy">
-        <h1>TSG Launcher</h1>
-        <div class="status" id="playStatus">${esc(statusLine())}</div>
+    <div class="hero-wrap">
+      <div class="hero">
+        ${art ? `<img id="heroImg" src="${esc(art)}" alt="" />` : ''}
+        <div class="scrim"></div>
+        <div class="copy">
+          <div>
+            <div class="hero-kicker">Recompiled</div>
+            <h1>The Simpsons Game</h1>
+            <div class="status" id="playStatus">${esc(statusLine())}</div>
+          </div>
+          <div class="hero-actions">
+            <button type="button" class="btn launch" id="btnPlay" ${canPlay ? '' : 'disabled'}>
+              Play game
+            </button>
+            <button type="button" class="btn chip" id="btnStop" ${running ? '' : 'disabled'}>Stop</button>
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="row">
-      <button type="button" class="btn primary" id="btnPlay" ${running || !s?.engineReady || !s?.gamedataReady ? 'disabled' : ''}>Play</button>
-      <button type="button" class="btn" id="btnStop" ${running ? '' : 'disabled'}>Stop</button>
-      <span class="grow"></span>
-      <button type="button" class="btn" id="btnArt" ${s?.ffmpeg && s?.gamedataReady ? '' : 'disabled'}>Refresh art</button>
+      <div class="hero-bar">
+        <div class="row">
+          <button type="button" class="btn chip" id="btnArt" ${s?.ffmpeg && s?.gamedataReady ? '' : 'disabled'}>Regenerate artwork</button>
+        </div>
+      </div>
     </div>
     <div class="stats">
       <div class="stat"><div class="k">Engine</div><div class="v" id="statEngine">${engine}</div></div>
       <div class="stat"><div class="k">Game data</div><div class="v" id="statData">${data}</div></div>
       <div class="stat"><div class="k">Controls</div><div class="v" id="statControls">${controls}</div></div>
     </div>
-    <div class="log" id="playLog">${esc(playLogText())}</div>
+    <div class="terminal">
+      <div class="terminal-head">
+        <div class="row">
+          <div class="terminal-dots" aria-hidden="true"><span class="c1"></span><span class="c2"></span><span class="c3"></span></div>
+          <div class="terminal-title">Sector 7-G core terminal</div>
+        </div>
+      </div>
+      <div class="log" id="playLog">${esc(playLogText())}</div>
+      <div class="terminal-foot">
+        <span>Core log</span>
+        <span class="ready" id="termReady">${running ? 'GAME RUNNING' : 'READY FOR BOOT COMMAND'}</span>
+      </div>
+    </div>
   `;
 }
 
@@ -129,6 +188,8 @@ function patchPlay() {
   if (stop) stop.disabled = !running;
   const artBtn = document.getElementById('btnArt');
   if (artBtn) artBtn.disabled = !(s?.ffmpeg && s?.gamedataReady);
+  const termReady = document.getElementById('termReady');
+  if (termReady) termReady.textContent = running ? 'GAME RUNNING' : 'READY FOR BOOT COMMAND';
   const engine = document.getElementById('statEngine');
   if (engine) {
     engine.textContent = s?.engineReady
@@ -167,6 +228,7 @@ function renderInstall() {
   return `
     <h1>Install</h1>
     <p class="lead">Extract your own Xbox 360 ISO into this package. Nothing is downloaded for you.</p>
+
     <div class="panel">
       <h2>Disc image</h2>
       <div class="row">
@@ -463,7 +525,7 @@ function renderSettings() {
     </div>`;
 
   return `
-    <h1>Settings</h1>
+    <h1>Game Settings</h1>
     <p class="lead">Changes save as you make them. Restart the game for options that say so.</p>
     ${display}${quality}${ink}${fps}${input}${overlay}${game}${shots}${audio}
   `;
@@ -525,7 +587,7 @@ function renderSupport() {
     ? JSON.stringify(d.lastSummary, null, 2)
     : 'No last session summary yet.';
   return `
-    <h1>Support</h1>
+    <h1>Console &amp; Diagnostics</h1>
     <p class="lead">Optional logging for troubleshooting. Off by default.</p>
     <div class="panel">
       <h2>Diagnostics</h2>
@@ -552,17 +614,8 @@ function renderSupport() {
 
 function renderAbout() {
   const s = state.status;
-  const u = s?.updates || {};
   return `
     <h1>About</h1>
-    <div class="panel">
-      <h2>Updates</h2>
-      <div class="row">
-        <button type="button" class="btn" id="btnCheckUpdates">Check for updates</button>
-        <button type="button" class="btn primary ${u.updateAvailable ? '' : 'hidden'}" id="btnOpenUpdate">Update now</button>
-      </div>
-      <div class="hint">${esc(u.applying ? u.applyMessage : u.message)}</div>
-    </div>
     <div class="panel">
       <h2>TSG Launcher</h2>
       <p><b>TSG</b> = The Simpsons Game. This is the macOS Apple Silicon launcher for the recompiled Xbox 360 game. PowerPC code is statically recompiled to arm64 and runs through ReXGlue, with Vulkan on Metal (MoltenVK) and SDL3. No original game assets ship with this package.</p>
@@ -608,6 +661,7 @@ function renderMain() {
   };
   el.main.innerHTML = (renderers[state.tab] || renderPlay)();
   wireMain();
+  requestAnimationFrame(syncScrollThumb);
 }
 
 function coerce(schema, key, raw) {
@@ -772,15 +826,6 @@ function wireMain() {
   }
 
   if (state.tab === 'about') {
-    document.getElementById('btnCheckUpdates')?.addEventListener('click', async () => {
-      const snap = await launcher.checkUpdates();
-      if (state.status) state.status.updates = snap;
-      toast(snap.message);
-      renderMain();
-    });
-    document.getElementById('btnOpenUpdate')?.addEventListener('click', async () => {
-      await launcher.openUpdate();
-    });
     el.main.querySelectorAll('[data-url]').forEach((a) => {
       a.addEventListener('click', (e) => {
         e.preventDefault();
@@ -792,7 +837,7 @@ function wireMain() {
 
 async function refresh() {
   state.status = await launcher.getStatus();
-  el.version.textContent = state.status.version || '';
+  el.version.textContent = `macOS · v${state.status.version || '0.2.0'}`;
   if (state.tab === 'play') {
     if (!patchPlay()) renderMain();
   } else if (state.tab === 'install' || state.tab === 'about' || state.tab === 'support' || state.tab === 'patches') {
@@ -817,7 +862,9 @@ function startHeroRotate() {
 async function boot() {
   renderNav();
   state.status = await launcher.getStatus();
-  el.version.textContent = state.status.version || '';
+  el.version.textContent = `macOS · v${state.status.version || '0.2.0'}`;
+  el.main?.addEventListener('scroll', onMainScroll, { passive: true });
+  window.addEventListener('resize', syncScrollThumb);
   renderMain();
   startHeroRotate();
 
@@ -835,7 +882,7 @@ async function boot() {
   });
   launcher.on('status', (payload) => {
     state.status = payload;
-    el.version.textContent = payload.version || '';
+    el.version.textContent = `macOS · v${payload.version || '0.2.0'}`;
     if (state.tab === 'play') patchPlay();
     else if (state.tab !== 'settings') renderMain();
   });

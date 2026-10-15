@@ -2,22 +2,37 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' art: data:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <meta
+    http-equiv="Content-Security-Policy"
+    content="default-src 'self'; img-src 'self' art: data:; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; script-src 'self'; connect-src 'self' https://fonts.googleapis.com https://fonts.gstatic.com"
+  />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>TSG Launcher</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Rubik:wght@400;500;600;700&family=Space+Mono:wght@700&display=swap"
+    rel="stylesheet"
+  />
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
+  <header class="titlebar" aria-hidden="true"></header>
   <div class="app">
     <aside class="rail">
       <div class="brand">
-        <div class="brand-title">THE SIMPSONS GAME</div>
-        <div class="brand-sub">Recompiled</div>
+        <div class="brand-title">TSG Launcher</div>
+        <div class="brand-sub" id="version">macOS</div>
       </div>
       <nav id="nav"></nav>
-      <div class="rail-foot" id="version"></div>
+      <div class="rail-foot">The Simpsons Game · Recompiled</div>
     </aside>
-    <main id="main"></main>
+    <div class="main-shell">
+      <main id="main"></main>
+      <div class="scroll-float" aria-hidden="true">
+        <div class="scroll-thumb" id="scrollThumb"></div>
+      </div>
+    </div>
   </div>
   <div id="toast" class="toast hidden"></div>
   <script src="app.js"></script>

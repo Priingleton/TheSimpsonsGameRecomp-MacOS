@@ -23,15 +23,15 @@
 
 REXCVAR_DEFINE_BOOL(unlock_60fps, true, "Game",
                     "Run gameplay at 60 FPS (community 60 FPS patch plus the Havok physics "
-                    "fix); false keeps the original 30 FPS. Applies on the next launch");
+                    "fix); false keeps the original 30 FPS. The options menu can change this "
+                    "while the game is running; the frame wait and the physics step stay in step");
 
 namespace {
 
 bool Enabled() {
-  // Read once: the swap interval is set at startup, and the physics step must
-  // not change mid-session.
-  static const bool enabled = REXCVAR_GET(unlock_60fps);
-  return enabled;
+  // Both the frame wait and the physics step read this, so a change in the
+  // options menu moves them together.
+  return REXCVAR_GET(unlock_60fps);
 }
 
 double FloatBits(uint32_t bits) {

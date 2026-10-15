@@ -31,6 +31,7 @@
 // arrows look, Q/E down/up, 1/3 zoom out/in, 2 resets the zoom, Shift faster,
 // Ctrl slower. Screenshots land in <userdata>/shots as PNG.
 
+#include "graphics_options.h"
 #include "guest_memory.h"
 
 #include <algorithm>
@@ -54,6 +55,7 @@
 #include <rex/ppc.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/overlay_input.h>
+
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
 #include <rex/ui/window_listener.h>
@@ -112,6 +114,8 @@ constexpr uint32_t kDirectorFlags2 = 48;
 constexpr uint32_t kSimEnabled = 0x82CED760;
 constexpr uint32_t kPhotoPauseBit = 0x80000000;
 
+constexpr uint16_t kPadStart = 0x0010;
+constexpr uint16_t kPadBack = 0x0020;
 constexpr uint16_t kPadL3 = 0x0040;
 constexpr uint16_t kPadR3 = 0x0080;
 constexpr uint16_t kPadLB = 0x0100;
@@ -637,6 +641,15 @@ REX_FUNC(sub_82B766A8) {
   pad.ry = LoadBES16(gamepad + 10);
 
   if (user == 0) {
+    uint16_t pass_button = 0;
+    if (GraphicsOptionsConsumePad(ctx, base, pad.buttons, pad.lx, pad.ly, &pass_button)) {
+      g_pad = pad;
+      std::memset(gamepad, 0, 12);
+      if (pass_button) {
+        StoreBE16(gamepad, pass_button);
+      }
+      return;
+    }
     const uint16_t pressed = pad.buttons & ~g_pad.buttons;
     const uint16_t released = g_pad.buttons & ~pad.buttons;
     const bool chord = (pad.buttons & (kPadL3 | kPadR3)) == (kPadL3 | kPadR3);

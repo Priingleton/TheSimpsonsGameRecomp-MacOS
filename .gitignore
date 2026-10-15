@@ -123,3 +123,11 @@ tools/native-renderer/out/
 # Local platform migration backups (not for git)
 simpsons.windows-bak/
 tools/rexglue-sdk.macos-cocoa-bak/
+
+# Local RE / extract scratch (never ship)
+simpsons/tmp_*/
+simpsons/tools/
+index.html
+index_files/
+/Highlander ITC Std Bold.otf
+tools/gamedata-patches/__pycache__/

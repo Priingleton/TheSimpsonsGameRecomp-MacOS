@@ -238,6 +238,26 @@ vulkan_log_debug_messages = false
 EOF
 fi
 
+# Options › GRAPHICS post-install patcher (rewrites player-extracted .str only).
+echo "==> Staging gamedata patch tools"
+mkdir -p "$STAGE/tools/gamedata-patches"
+cp -f "$ROOT/tools/gamedata-patches/apply_options_ui.py" "$STAGE/tools/gamedata-patches/"
+cp -f "$ROOT/tools/gamedata-patches/refpack.py" "$STAGE/tools/gamedata-patches/"
+chmod +x "$STAGE/tools/gamedata-patches/apply_options_ui.py"
+
+# Highlander menu font for the host Graphics page (not game data).
+echo "==> Staging Highlander menu font"
+mkdir -p "$STAGE/art/fonts"
+FONT_SRC="$ROOT/simpsons/assets/fonts/Highlander ITC Std Bold.otf"
+if [ ! -f "$FONT_SRC" ]; then
+  FONT_SRC="$ROOT/Highlander ITC Std Bold.otf"
+fi
+if [ -f "$FONT_SRC" ]; then
+  cp -f "$FONT_SRC" "$STAGE/art/fonts/Highlander ITC Std Bold.otf"
+else
+  echo "warning: Highlander ITC Std Bold.otf missing — Graphics menu will use the default font" >&2
+fi
+
 # Electron launcher (.app)
 echo "==> Packaging Electron launcher"
 (
@@ -258,15 +278,57 @@ export VK_ICD_FILENAMES="$PWD/vulkan/share/vulkan/icd.d/MoltenVK_icd.json"
 exec "$PWD/TSG Launcher.app/Contents/MacOS/TSGLauncher"
 EOF
 chmod +x "$STAGE/Play.command" "$STAGE/simpsons"
-echo "0.1.0" > "$STAGE/VERSION"
+rm -f "$STAGE/Fix Mac Gatekeeper.command"
+
+# Electron ships pre-signed helpers. After repack those signatures no longer match,
+# and macOS reports the app as "damaged". Strip every signature so Gatekeeper treats
+# the package as unsigned (unidentified-developer warning is fine; Open works).
+echo "==> Removing code signatures (prevents Gatekeeper 'damaged' on GitHub downloads)"
+strip_signature() {
+  local target="$1"
+  [ -e "$target" ] || return 0
+  codesign --remove-signature "$target" >/dev/null 2>&1 || true
+}
+strip_machos_under() {
+  local root="$1"
+  [ -e "$root" ] || return 0
+  # Bundles / frameworks first, then leaf binaries and dylibs.
+  find "$root" \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' \) 2>/dev/null \
+    | while IFS= read -r p; do strip_signature "$p"; done
+  find "$root" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -111 \) 2>/dev/null \
+    | while IFS= read -r p; do
+        case "$(/usr/bin/file -b "$p" 2>/dev/null)" in
+          *Mach-O*) strip_signature "$p" ;;
+        esac
+      done
+}
+strip_machos_under "$STAGE/TSG Launcher.app"
+strip_signature "$STAGE/TSG Launcher.app"
+for bin in simpsons extract-xiso ffmpeg; do
+  strip_signature "$STAGE/$bin"
+done
+for dir in "$STAGE" "$STAGE/lib" "$STAGE/vulkan/lib"; do
+  [ -d "$dir" ] || continue
+  find "$dir" -maxdepth 1 -type f \( -name '*.dylib' -o -perm -111 \) 2>/dev/null \
+    | while IFS= read -r p; do
+        case "$(/usr/bin/file -b "$p" 2>/dev/null)" in
+          *Mach-O*) strip_signature "$p" ;;
+        esac
+      done
+done
+
+echo "0.2.0" > "$STAGE/VERSION"
 
 cat > "$STAGE/README.md" <<'EOF'
 # The Simpsons Game Recompiled — macOS arm64
 
 ## First run
-1. Open **TSG Launcher.app**, or double-click **Play.command**.
-2. Use **Install** to pick your own Xbox 360 ISO (not included) and extract it locally.
-3. Display defaults to a windowed 1280x720 window at 60 FPS. Change settings in TSG Launcher, then press **Play**.
+1. Unzip the download.
+2. Open **TSG Launcher.app**, or double-click **Play.command**.
+   First launch: if macOS warns it is from an unidentified developer, right-click → **Open** → **Open**.
+3. Use **Install** to pick your own Xbox 360 ISO (not included) and extract it locally.
+4. The launcher applies Options › GRAPHICS patches to your files (needs python3 once).
+5. Display defaults to a windowed 1280x720 window at 60 FPS. Change settings in TSG Launcher, then press **Play**.
 
 **TSG** = The Simpsons Game. You must own the game. No disc images or game assets are shipped with this build.
 EOF

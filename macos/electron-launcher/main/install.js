@@ -6,6 +6,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 const { looksLikeGameDirectory } = require('./paths');
 const { generateArt } = require('./art');
+const { applyOptionsUiPatches } = require('./gamedata_patches');
 
 class InstallService {
   constructor(paths) {
@@ -174,6 +175,16 @@ class InstallService {
         this.append('(previous game data kept as gamedata_previous)');
       }
       fs.renameSync(gameDir, this.paths.gamedata);
+
+      this.append('Applying Options › GRAPHICS patches…');
+      const patch = applyOptionsUiPatches(this.paths, { force: true });
+      for (const line of patch.log.slice(-12)) this.append(line);
+      if (!patch.ok) {
+        this.append(`WARNING: ${patch.message}`);
+        this.append('Install finished, but Options › GRAPHICS may need: python3 tools/gamedata-patches/apply_options_ui.py gamedata');
+      } else {
+        this.append(patch.message);
+      }
 
       this.append('Generating launcher artwork…');
       this.artRunning = true;
