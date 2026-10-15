@@ -281,18 +281,23 @@ chmod +x "$STAGE/Play.command" "$STAGE/simpsons"
 rm -f "$STAGE/Fix Mac Gatekeeper.command"
 
 # Electron ships pre-signed helpers. After repack those signatures no longer match,
-# and macOS reports the app as "damaged". Strip every signature so Gatekeeper treats
-# the package as unsigned (unidentified-developer warning is fine; Open works).
-echo "==> Removing code signatures (prevents Gatekeeper 'damaged' on GitHub downloads)"
+# and macOS reports the app as "damaged". Apple Silicon also refuses fully unsigned
+# binaries (launch fails). Strip broken signatures, then ad-hoc sign inside-out.
+echo "==> Replacing broken signatures with ad-hoc codesign (Apple Silicon / Gatekeeper)"
 strip_signature() {
   local target="$1"
   [ -e "$target" ] || return 0
   codesign --remove-signature "$target" >/dev/null 2>&1 || true
 }
+sign_adhoc() {
+  local target="$1"
+  [ -e "$target" ] || return 0
+  codesign --force --sign - --timestamp=none "$target" >/dev/null 2>&1 || \
+    codesign --force --sign - "$target" >/dev/null 2>&1 || true
+}
 strip_machos_under() {
   local root="$1"
   [ -e "$root" ] || return 0
-  # Bundles / frameworks first, then leaf binaries and dylibs.
   find "$root" \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' \) 2>/dev/null \
     | while IFS= read -r p; do strip_signature "$p"; done
   find "$root" -type f \( -name '*.dylib' -o -name '*.so' -o -perm -111 \) 2>/dev/null \
@@ -301,6 +306,26 @@ strip_machos_under() {
           *Mach-O*) strip_signature "$p" ;;
         esac
       done
+}
+adhoc_sign_app_bundle() {
+  local app="$1"
+  [ -d "$app" ] || return 0
+  # Apple Silicon requires every Mach-O to be signed, including Electron's
+  # chrome_crashpad_handler. Sign leaf binaries deepest-first, then bundles.
+  find "$app" -type f ! -path '*/.*' 2>/dev/null | while IFS= read -r f; do
+    case "$(/usr/bin/file -b "$f" 2>/dev/null)" in
+      *Mach-O*) printf '%s\n' "$f" ;;
+    esac
+  done | awk '{ print length, $0 }' | sort -nr | cut -d' ' -f2- | while IFS= read -r f; do
+    sign_adhoc "$f"
+  done
+  {
+    find "$app/Contents/Frameworks" -name '*.app' -type d 2>/dev/null || true
+    find "$app/Contents/Frameworks" -name '*.framework' -type d 2>/dev/null || true
+    printf '%s\n' "$app"
+  } | awk '{ print length, $0 }' | sort -nr | cut -d' ' -f2- | while IFS= read -r b; do
+    sign_adhoc "$b"
+  done
 }
 strip_machos_under "$STAGE/TSG Launcher.app"
 strip_signature "$STAGE/TSG Launcher.app"
@@ -316,8 +341,21 @@ for dir in "$STAGE" "$STAGE/lib" "$STAGE/vulkan/lib"; do
         esac
       done
 done
+adhoc_sign_app_bundle "$STAGE/TSG Launcher.app"
+for bin in simpsons extract-xiso ffmpeg; do
+  sign_adhoc "$STAGE/$bin"
+done
+for dir in "$STAGE" "$STAGE/lib" "$STAGE/vulkan/lib"; do
+  [ -d "$dir" ] || continue
+  find "$dir" -maxdepth 1 -type f \( -name '*.dylib' -o -perm -111 \) 2>/dev/null \
+    | while IFS= read -r p; do
+        case "$(/usr/bin/file -b "$p" 2>/dev/null)" in
+          *Mach-O*) sign_adhoc "$p" ;;
+        esac
+      done
+done
 
-echo "0.2.0" > "$STAGE/VERSION"
+echo "0.2.1" > "$STAGE/VERSION"
 
 cat > "$STAGE/README.md" <<'EOF'
 # The Simpsons Game Recompiled — macOS arm64

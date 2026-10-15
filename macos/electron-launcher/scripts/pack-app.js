@@ -15,9 +15,9 @@ const appName = 'TSGLauncher';
 const productName = 'TSG Launcher';
 const version = (() => {
   try {
-    return require(path.join(root, 'package.json')).version || '0.2.0';
+    return require(path.join(root, 'package.json')).version || '0.2.1';
   } catch (_) {
-    return '0.2.0';
+    return '0.2.1';
   }
 })();
 

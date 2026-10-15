@@ -837,7 +837,7 @@ function wireMain() {
 
 async function refresh() {
   state.status = await launcher.getStatus();
-  el.version.textContent = `macOS · v${state.status.version || '0.2.0'}`;
+  el.version.textContent = `macOS · v${state.status.version || '0.2.1'}`;
   if (state.tab === 'play') {
     if (!patchPlay()) renderMain();
   } else if (state.tab === 'install' || state.tab === 'about' || state.tab === 'support' || state.tab === 'patches') {
@@ -862,7 +862,7 @@ function startHeroRotate() {
 async function boot() {
   renderNav();
   state.status = await launcher.getStatus();
-  el.version.textContent = `macOS · v${state.status.version || '0.2.0'}`;
+  el.version.textContent = `macOS · v${state.status.version || '0.2.1'}`;
   el.main?.addEventListener('scroll', onMainScroll, { passive: true });
   window.addEventListener('resize', syncScrollThumb);
   renderMain();
@@ -882,7 +882,7 @@ async function boot() {
   });
   launcher.on('status', (payload) => {
     state.status = payload;
-    el.version.textContent = `macOS · v${payload.version || '0.2.0'}`;
+    el.version.textContent = `macOS · v${payload.version || '0.2.1'}`;
     if (state.tab === 'play') patchPlay();
     else if (state.tab !== 'settings') renderMain();
   });

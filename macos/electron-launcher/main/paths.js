@@ -50,7 +50,7 @@ function versionString(paths) {
     const v = fs.readFileSync(paths.versionFile, 'utf8').trim();
     if (v) return v;
   } catch (_) {}
-  return app.getVersion() || '0.2.0';
+  return app.getVersion() || '0.2.1';
 }
 
 function engineReady(paths) {
