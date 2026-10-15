@@ -5,11 +5,39 @@ const os = require('os');
 const path = require('path');
 const { app } = require('electron');
 
+function isAppTranslocated(filePath = process.execPath) {
+  return String(filePath).includes('/AppTranslocation/');
+}
+
+function packageRootLooksValid(root) {
+  try {
+    return (
+      fs.existsSync(path.join(root, 'simpsons')) ||
+      fs.existsSync(path.join(root, 'VERSION')) ||
+      fs.existsSync(path.join(root, 'extract-xiso'))
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+function packageRootFromExecPath(execPath = process.execPath) {
+  // .../Package/TSG Launcher.app/Contents/MacOS/<bin> → Package
+  const marker = '.app/Contents/MacOS/';
+  const idx = String(execPath).lastIndexOf(marker);
+  if (idx === -1) return null;
+  const appBundle = execPath.slice(0, idx + 4); // includes ".app"
+  return path.dirname(appBundle);
+}
+
 function resolvePackageRoot() {
   if (process.env.SIMPSONS_PACKAGE_ROOT) {
     return path.resolve(process.env.SIMPSONS_PACKAGE_ROOT);
   }
-  // Packaged: .../Package/TSG Launcher.app/Contents/MacOS/<bin>
+  // Always prefer the folder that contains this .app (never a hard-coded repo path).
+  const besideApp = packageRootFromExecPath();
+  if (besideApp) return besideApp;
+
   if (app.isPackaged) {
     const macOS = path.dirname(process.execPath);
     const appBundle = path.dirname(path.dirname(macOS));
@@ -24,9 +52,10 @@ function resolvePackageRoot() {
 
 function createPaths(packageRoot = resolvePackageRoot()) {
   const root = path.resolve(packageRoot);
+  const userData = path.join(os.homedir(), 'Library/Application Support/simpsons');
   const paths = {
     packageRoot: root,
-    userData: path.join(os.homedir(), 'Library/Application Support/simpsons'),
+    userData,
     gameBin: path.join(root, 'simpsons'),
     extractXiso: path.join(root, 'extract-xiso'),
     ffmpeg: path.join(root, 'ffmpeg'),
@@ -38,9 +67,14 @@ function createPaths(packageRoot = resolvePackageRoot()) {
     launcherConfig: path.join(root, 'launcher.json'),
     captureMarker: path.join(root, 'capture-armed'),
     versionFile: path.join(root, 'VERSION'),
+    translocated: isAppTranslocated(),
   };
+  // App Translocation mounts are read-only — never throw on mkdir or the
+  // window never opens (dock icon only, no UI).
   for (const dir of [paths.art, paths.backups, paths.diagnostics, paths.userData]) {
-    fs.mkdirSync(dir, { recursive: true });
+    try {
+      fs.mkdirSync(dir, { recursive: true });
+    } catch (_) {}
   }
   return paths;
 }
@@ -50,7 +84,7 @@ function versionString(paths) {
     const v = fs.readFileSync(paths.versionFile, 'utf8').trim();
     if (v) return v;
   } catch (_) {}
-  return app.getVersion() || '0.2.1';
+  return app.getVersion() || '0.2.2';
 }
 
 function engineReady(paths) {
@@ -97,6 +131,8 @@ function heroArtFiles(paths) {
 module.exports = {
   resolvePackageRoot,
   createPaths,
+  isAppTranslocated,
+  packageRootLooksValid,
   versionString,
   engineReady,
   engineDate,

@@ -27,6 +27,16 @@ if [ -d "$STAGE/gamedata" ]; then
   fi
 fi
 
+# Launcher hero stills are cut from the player's ISO after install — never ship them.
+hero_art="$(
+  find "$STAGE" -type f \( \
+    -iname 'hero*.jpg' -o -iname 'hero*.jpeg' -o -iname 'hero*.png' -o -iname 'hero*.webp' \
+  \) 2>/dev/null || true
+)"
+if [ -n "$hero_art" ]; then
+  bad="${bad}"$'\n'"${hero_art}"
+fi
+
 # Trim empty lines
 bad="$(printf '%s\n' "$bad" | sed '/^$/d')"
 

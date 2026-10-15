@@ -53,11 +53,13 @@ To build from source you also need Xcode command-line tools, CMake 3.25+, Ninja,
 ## Installation
 
 1. Download the latest **macOS arm64** zip from this repository’s [Releases](../../releases) page (once published).
-2. Unzip it anywhere.
-3. Open **TSG Launcher.app**, or double-click **Play.command**. On first launch macOS may warn that the developer is unidentified — right-click → **Open** → **Open** (that is expected for unsigned builds).
+2. Unzip it and move the whole folder out of Downloads (Desktop is fine).
+3. Double-click **Play.command** (preferred — clears macOS quarantine so the app is not isolated from the folder), or right-click **TSG Launcher.app** → **Open**. An unidentified-developer warning is expected for unsigned builds.
 4. In **Install**, select your own Xbox 360 ISO and extract it locally.
 5. The launcher then applies the Options › GRAPHICS patches to your extracted files (needs **python3** once). The Highlander menu font is already in the app under `art/fonts/`.
 6. Adjust settings if you want, then press **Play**.
+
+If you only get a dock icon and no window, run **Play.command** or `xattr -cr` on the unzipped folder, then open the app again.
 
 The release package never includes game data. TSG Launcher only extracts the ISO you choose on your Mac, then patches that copy for the new Graphics menu.
 

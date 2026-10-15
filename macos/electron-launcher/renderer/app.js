@@ -225,9 +225,17 @@ function patchPlay() {
 function renderInstall() {
   const i = state.status?.install || {};
   const backups = i.backups || [];
+  const s = state.status;
   return `
     <h1>Install</h1>
     <p class="lead">Extract your own Xbox 360 ISO into this package. Nothing is downloaded for you.</p>
+
+    <div class="panel">
+      <h2>This package</h2>
+      <div class="hint">Folder · ${esc(s?.packageRoot || '')}</div>
+      <div class="hint">Game data · ${esc(s?.gamedataPath || '')}</div>
+      <div class="hint">Saves · ${esc(s?.userDataPath || '')}</div>
+    </div>
 
     <div class="panel">
       <h2>Disc image</h2>
@@ -625,6 +633,9 @@ function renderAbout() {
       <h2>This build</h2>
       <div class="hint">Platform  ·  macOS Apple Silicon</div>
       <div class="hint">Graphics  ·  Vulkan via MoltenVK</div>
+      <div class="hint">Package  ·  ${esc(s?.packageRoot || '')}</div>
+      <div class="hint">Game data  ·  ${esc(s?.gamedataPath || '')}</div>
+      <div class="hint">Saves  ·  ${esc(s?.userDataPath || '')}</div>
     </div>
     <div class="panel">
       <h2>Lineage</h2>
@@ -837,7 +848,7 @@ function wireMain() {
 
 async function refresh() {
   state.status = await launcher.getStatus();
-  el.version.textContent = `macOS · v${state.status.version || '0.2.1'}`;
+  el.version.textContent = `macOS · v${state.status.version || '0.2.2'}`;
   if (state.tab === 'play') {
     if (!patchPlay()) renderMain();
   } else if (state.tab === 'install' || state.tab === 'about' || state.tab === 'support' || state.tab === 'patches') {
@@ -862,7 +873,7 @@ function startHeroRotate() {
 async function boot() {
   renderNav();
   state.status = await launcher.getStatus();
-  el.version.textContent = `macOS · v${state.status.version || '0.2.1'}`;
+  el.version.textContent = `macOS · v${state.status.version || '0.2.2'}`;
   el.main?.addEventListener('scroll', onMainScroll, { passive: true });
   window.addEventListener('resize', syncScrollThumb);
   renderMain();
@@ -882,7 +893,7 @@ async function boot() {
   });
   launcher.on('status', (payload) => {
     state.status = payload;
-    el.version.textContent = `macOS · v${payload.version || '0.2.1'}`;
+    el.version.textContent = `macOS · v${payload.version || '0.2.2'}`;
     if (state.tab === 'play') patchPlay();
     else if (state.tab !== 'settings') renderMain();
   });

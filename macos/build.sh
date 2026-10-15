@@ -88,14 +88,20 @@ echo "==> Building simpsons ($JOBS jobs)"
 )
 
 STAGE="$ROOT/dist/TheSimpsonsGame-Recompiled-macOS-arm64"
-# Keep installed game data / saves / launcher art across rebuilds. Only refresh binaries and UI.
+# Keep installed game data / saves across rebuilds. Never keep ISO-derived hero
+# stills — those must be generated on the player's machine after they install.
 KEEP="$ROOT/dist/.stage-keep-$$"
 mkdir -p "$KEEP"
-for d in gamedata userdata cache logs art backups mods; do
+for d in gamedata userdata cache logs backups mods; do
   if [ -d "$STAGE/$d" ] && [ -n "$(ls -A "$STAGE/$d" 2>/dev/null || true)" ]; then
     mv "$STAGE/$d" "$KEEP/$d"
   fi
 done
+# Preserve menu fonts only under art/ (not cutscene hero JPGs).
+if [ -d "$STAGE/art/fonts" ]; then
+  mkdir -p "$KEEP/art/fonts"
+  cp -R "$STAGE/art/fonts/." "$KEEP/art/fonts/"
+fi
 # Preserve player config if present (rebuild still writes fresh defaults when missing).
 [ -f "$STAGE/simpsons.toml" ] && cp -f "$STAGE/simpsons.toml" "$KEEP/simpsons.toml" || true
 [ -x "$STAGE/ffmpeg" ] && cp -f "$STAGE/ffmpeg" "$KEEP/ffmpeg" || true
@@ -103,12 +109,16 @@ echo "==> Staging package at $STAGE"
 rm -rf "$STAGE"
 mkdir -p "$STAGE/lib" "$STAGE/gamedata" "$STAGE/userdata" "$STAGE/cache" "$STAGE/logs" \
   "$STAGE/art" "$STAGE/vulkan/lib" "$STAGE/vulkan/share/vulkan/icd.d"
-for d in gamedata userdata cache logs art backups mods; do
+for d in gamedata userdata cache logs backups mods; do
   if [ -d "$KEEP/$d" ]; then
     rm -rf "$STAGE/$d"
     mv "$KEEP/$d" "$STAGE/$d"
   fi
 done
+if [ -d "$KEEP/art/fonts" ]; then
+  mkdir -p "$STAGE/art/fonts"
+  cp -R "$KEEP/art/fonts/." "$STAGE/art/fonts/"
+fi
 [ -x "$KEEP/ffmpeg" ] && mv "$KEEP/ffmpeg" "$STAGE/ffmpeg" || true
 # Keep the player's simpsons.toml aside until after fresh defaults are written.
 SAVED_TOML=""
@@ -257,6 +267,11 @@ if [ -f "$FONT_SRC" ]; then
 else
   echo "warning: Highlander ITC Std Bold.otf missing — Graphics menu will use the default font" >&2
 fi
+# Never ship ISO-derived launcher stills (copyrighted game frames).
+find "$STAGE/art" -maxdepth 1 -type f \( \
+  -iname 'hero*.jpg' -o -iname 'hero*.jpeg' -o -iname 'hero*.png' -o -iname 'hero*.webp' \
+  -o -name '.attempted*' \
+\) -delete 2>/dev/null || true
 
 # Electron launcher (.app)
 echo "==> Packaging Electron launcher"
@@ -272,6 +287,9 @@ echo "==> Packaging Electron launcher"
 cat > "$STAGE/Play.command" <<'EOF'
 #!/bin/zsh
 cd "$(dirname "$0")"
+# Clear quarantine so macOS does not App Translocate the .app away from this folder
+# (that leaves a dock icon with no window). Safe on user-owned downloads.
+xattr -cr "$PWD" >/dev/null 2>&1 || true
 export SIMPSONS_PACKAGE_ROOT="$PWD"
 export DYLD_LIBRARY_PATH="$PWD:$PWD/lib:$PWD/vulkan/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 export VK_ICD_FILENAMES="$PWD/vulkan/share/vulkan/icd.d/MoltenVK_icd.json"
@@ -355,18 +373,22 @@ for dir in "$STAGE" "$STAGE/lib" "$STAGE/vulkan/lib"; do
       done
 done
 
-echo "0.2.1" > "$STAGE/VERSION"
+echo "0.2.2" > "$STAGE/VERSION"
 
 cat > "$STAGE/README.md" <<'EOF'
 # The Simpsons Game Recompiled — macOS arm64
 
 ## First run
 1. Unzip the download.
-2. Open **TSG Launcher.app**, or double-click **Play.command**.
-   First launch: if macOS warns it is from an unidentified developer, right-click → **Open** → **Open**.
-3. Use **Install** to pick your own Xbox 360 ISO (not included) and extract it locally.
-4. The launcher applies Options › GRAPHICS patches to your files (needs python3 once).
-5. Display defaults to a windowed 1280x720 window at 60 FPS. Change settings in TSG Launcher, then press **Play**.
+2. Move the whole folder out of Downloads (Desktop is fine).
+3. Double-click **Play.command** (preferred) — it clears macOS quarantine so the
+   app is not isolated from this folder. Or right-click **TSG Launcher.app** → Open.
+4. Use **Install** to pick your own Xbox 360 ISO (not included) and extract it locally.
+5. The launcher applies Options › GRAPHICS patches to your files (needs python3 once).
+6. Display defaults to a windowed 1280x720 window at 60 FPS. Change settings in TSG Launcher, then press **Play**.
+
+If you only see a dock icon and no window, macOS App Translocation is the cause:
+run Play.command, or `xattr -cr` on this folder, then open the app again.
 
 **TSG** = The Simpsons Game. You must own the game. No disc images or game assets are shipped with this build.
 EOF

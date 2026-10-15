@@ -18,6 +18,8 @@ const {
   engineDate,
   looksLikeGameDirectory,
   heroArtFiles,
+  isAppTranslocated,
+  packageRootLooksValid,
 } = require('./paths');
 const {
   readSettings,
@@ -84,6 +86,9 @@ function statusPayload() {
   const arts = heroArtFiles(paths);
   return {
     version: versionString(paths),
+    packageRoot: paths.packageRoot,
+    gamedataPath: paths.gamedata,
+    userDataPath: paths.userData,
     engineReady: engineReady(paths),
     engineDate: engineDate(paths),
     gamedataReady: looksLikeGameDirectory(paths.gamedata),
@@ -106,6 +111,28 @@ function statusPayload() {
 
 app.whenReady().then(() => {
   paths = createPaths();
+
+  // Quarantined downloads are often App Translocated: macOS runs a copy of the
+  // .app alone on a read-only path, away from simpsons/art/gamedata. That used
+  // to throw during mkdir and leave a dock icon with no window.
+  if (paths.translocated || (app.isPackaged && !packageRootLooksValid(paths.packageRoot))) {
+    dialog.showMessageBoxSync({
+      type: 'error',
+      title: 'TSG Launcher',
+      message: 'macOS isolated this app from its game files',
+      detail:
+        'Gatekeeper moved TSG Launcher.app away from the rest of the download, so the UI cannot start.\n\n' +
+        'Fix:\n' +
+        '1. Quit this dialog.\n' +
+        '2. Move the whole TheSimpsonsGame-Recompiled-macOS-arm64 folder to Desktop (or anywhere outside Downloads).\n' +
+        '3. Double-click Play.command in that folder (it clears the quarantine flag), or run:\n' +
+        '   xattr -cr /path/to/TheSimpsonsGame-Recompiled-macOS-arm64\n' +
+        '4. Open TSG Launcher.app again.',
+    });
+    app.quit();
+    return;
+  }
+
   game = new GameService(paths);
   install = new InstallService(paths);
   diagnostics = new DiagnosticsService(paths);

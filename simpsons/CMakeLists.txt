@@ -5,7 +5,7 @@
 # with SDL3 + Vulkan via MoltenVK. SDK boilerplate lives in generated/rexglue.cmake.
 
 cmake_minimum_required(VERSION 3.25)
-project(simpsons VERSION 0.2.1 LANGUAGES CXX)
+project(simpsons VERSION 0.2.2 LANGUAGES CXX)
 
 if(NOT APPLE)
   message(FATAL_ERROR "This fork builds on macOS only (Apple Silicon / MoltenVK).")
