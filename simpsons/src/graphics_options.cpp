@@ -4,6 +4,7 @@
 
 #include "graphics_options.h"
 
+#include "camera_options.h"
 #include "guest_memory.h"
 
 #include <rex/cvar.h>
@@ -121,7 +122,7 @@ int MatchChoice(const Setting& setting, const std::string& raw) {
         best = i;
       }
     }
-    if (best_distance <= 0.05) {
+    if (best_distance <= 0.06) {
       return best;
     }
   }
@@ -656,7 +657,10 @@ bool GraphicsOptionsConsumePad(PPCContext& ctx, uint8_t* base, uint16_t buttons,
   return true;
 }
 
-void SetGraphicsOptionsFont(ImFont* font) { g_menu_font = font; }
+void SetGraphicsOptionsFont(ImFont* font) {
+  g_menu_font = font;
+  SetCameraOptionsFont(font);
+}
 
 constexpr uint32_t kGraphicsPage = 2;
 
@@ -670,8 +674,10 @@ extern "C" REX_FUNC(sub_823A4C90) {
   }
   const uint32_t page = simpsons::LoadGuestU32(base, kOptionsPage);
   if (page == kGraphicsPage) {
+    HideCameraOptions();
     OpenSettings(base);
   } else {
     CloseAll();
   }
+  CameraOptionsOnPage(page);
 }

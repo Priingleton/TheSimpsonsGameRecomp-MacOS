@@ -25,6 +25,8 @@ include(generated/rexglue.cmake)
 
 set(SIMPSONS_SOURCES
     src/main.cpp
+    src/camera_fov.cpp
+    src/camera_options.cpp
     src/eye_shading.cpp
     src/fps_unlock.cpp
     src/frame_pacing.cpp

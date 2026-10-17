@@ -16,6 +16,7 @@
 
 #include <imgui.h>
 
+#include "camera_options.h"
 #include "graphics_options.h"
 #include "test_harness.h"
 
@@ -73,6 +74,7 @@ class SimpsonsApp : public rex::ReXApp {
 
   void OnCreateDialogs(rex::ui::ImGuiDrawer* drawer) override {
     InitGraphicsOptions(drawer, window(), config_path_);
+    InitCameraOptions(drawer, config_path_);
     if (graphics_font_) {
       SetGraphicsOptionsFont(graphics_font_);
     }
@@ -145,6 +147,7 @@ class SimpsonsApp : public rex::ReXApp {
   }
 
   void OnShutdown() override {
+    ShutdownCameraOptions();
     ShutdownGraphicsOptions();
     ShutdownFreecam(window());
     shots_.Stop();

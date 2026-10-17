@@ -384,6 +384,13 @@ function renderSettings() {
         'Restart needed.'
       )}
       ${field(
+        'Field of view',
+        `<input type="range" min="0.7" max="1.4" step="0.05" data-float="camera_fov" value="${esc(
+          s.camera_fov ?? 1
+        )}" />`,
+        'Also under Options › Camera in-game. Middle is default; left tighter, right wider.'
+      )}
+      ${field(
         'Texture filtering',
         select(
           'anisotropic_override',

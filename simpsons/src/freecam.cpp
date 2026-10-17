@@ -31,6 +31,7 @@
 // arrows look, Q/E down/up, 1/3 zoom out/in, 2 resets the zoom, Shift faster,
 // Ctrl slower. Screenshots land in <userdata>/shots as PNG.
 
+#include "camera_options.h"
 #include "graphics_options.h"
 #include "guest_memory.h"
 
@@ -77,8 +78,9 @@ REX_EXTERN(__imp__sub_8269D8F8);
 REX_EXTERN(sub_8269D8F8);
 // The pose -> RenderWare camera writer: r3 = manager, r4 = viewport, r5 =
 // &position, r6 = &(pitch, yaw, roll), f1 = field of view in radians, r8/r9 =
-// projection flags.
-REX_EXTERN(sub_8269D130);
+// projection flags. Call the import directly so camera_fov's gameplay scale
+// does not also multiply free-camera zoom.
+REX_EXTERN(__imp__sub_8269D130);
 // The XInputGetState thunk (r3 = user, r4 = guest X_INPUT_STATE*), the game's
 // only controller read.
 REX_EXTERN(__imp__sub_82B766A8);
@@ -352,7 +354,7 @@ bool ApplyPose(PPCContext& ctx, uint8_t* base, uint32_t manager, const float pos
   ctx.r8.u64 = flags1;
   ctx.r9.u64 = flags2;
   ctx.f1.f64 = fov;
-  sub_8269D130(ctx, base);
+  __imp__sub_8269D130(ctx, base);
   return true;
 }
 
@@ -642,7 +644,8 @@ REX_FUNC(sub_82B766A8) {
 
   if (user == 0) {
     uint16_t pass_button = 0;
-    if (GraphicsOptionsConsumePad(ctx, base, pad.buttons, pad.lx, pad.ly, &pass_button)) {
+    if (GraphicsOptionsConsumePad(ctx, base, pad.buttons, pad.lx, pad.ly, &pass_button) ||
+        CameraOptionsConsumePad(ctx, base, pad.buttons, pad.lx, pad.ly, &pass_button)) {
       g_pad = pad;
       std::memset(gamepad, 0, 12);
       if (pass_button) {

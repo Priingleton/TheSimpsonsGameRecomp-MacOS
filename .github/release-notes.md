@@ -4,7 +4,7 @@ releases never ship cutscene stills or extracted game data.
 
 ### macOS 0.2.2
 
-- Options › **GRAPHICS** Highlander CRT-style host UI (font shipped; menu patches apply after ISO install).
+- Options › **GRAPHICS** Highlander CRT-style host UI (font shipped; menu patches apply after ISO install — no Python).
 - Fixes Gatekeeper “damaged” / can’t-open downloads: broken Electron signatures are stripped, then
   the app is ad-hoc signed inside-out for Apple Silicon.
 - Fixes dock icon with no window: macOS App Translocation no longer kills startup; **Play.command**

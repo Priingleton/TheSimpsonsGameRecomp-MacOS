@@ -181,7 +181,7 @@ class InstallService {
       for (const line of patch.log.slice(-12)) this.append(line);
       if (!patch.ok) {
         this.append(`WARNING: ${patch.message}`);
-        this.append('Install finished, but Options › GRAPHICS may need: python3 tools/gamedata-patches/apply_options_ui.py gamedata');
+        this.append('Install finished, but Options › GRAPHICS menu may be missing until patches succeed.');
       } else {
         this.append(patch.message);
       }

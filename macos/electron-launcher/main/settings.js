@@ -26,6 +26,7 @@ const SCHEMA = {
   ink_outline_strength: ['float', 0.6, true],
   ink_outline_color: ['str', '000000', true],
   eye_shading: ['str', 'clean', true],
+  camera_fov: ['float', 1.0, false],
   frame_rate: ['int', 60, true],
   menu_frame_rate: ['int', 30, true],
   unlock_60fps: ['bool', true, true],

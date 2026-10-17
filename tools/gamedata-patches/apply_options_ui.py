@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""Apply Options › GRAPHICS UI patches to player-extracted game data.
+"""Apply Options › GRAPHICS / CAMERA UI patches to player-extracted game data.
 
 Safe to run more than once. Does not ship any game assets — only rewrites the
 player's own frontend.str / simpsons_chars_global.str after ISO extract.
 
-Patches (same-size, inside options Apt Data:74):
-  - Relabel Video → Graphics on the Options list
+Minimal boot-safe patches (same-size, inside options Apt Data:74):
+  - Relabel Video → Graphics if still dashed
+  - Relabel Downloads → Camera (list + page title)
+  - Keep DownloadsScreen internal name (renaming it blacks out the game)
   - Keep the Graphics row (stop RemoveItems from dropping Video)
-  - Hide the unused brightness slider / color swatch (alpha 0)
-  - Blank leftover Brightness strings on that page
+  - Do NOT blank marketplace body strings (that has also caused black boots)
+  - Undo a bad CameraMenu retarget if present
 """
 
 from __future__ import annotations
@@ -22,24 +24,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from refpack import compress, decompress  # noqa: E402
 
 APT_SIZE = 50362
-PO_SLIDER = 14884
-PO_REF = 14948
+STAMP_VERSION = "options-ui-v8"
 
-# Apt string / placeobject patches relative to "Apt Data:74" start.
-APT_PATCHES = [
-    # list label "-Video-" → "-Graphics-" (pad)
-    (4853, b"Video-\x00$FE_Video", b"Graphics-\x00\x00\x00\x00\x00\x00\x00"),
-    # edittext "Video" → "Graphics"
-    (5636, b"Video\x00\x00\x00$FE_Video", b"Graphics\x00\x00\x00\x00\x00\x00\x00\x00\x00"),
-    # blank Brightness seed / key (page body is host UI now)
-    (5664, b"Brightness", b"\x00" * 10),
-    (5676, b"$FE_Brightness", b"\x00" * 14),
-]
+DOWNLOADS_LIST = b"-Downloads-\x00$FE_Downloads\x00\x00\x00\x00\x00\x00"
+CAMERA_PAD31 = b"Camera" + b"\x00" * 25
 
-# UIX-relative const pool: item 1276 Lookup(Video=23) → Lookup(Array=9)
+CONST_DOWNLOADS_SCREEN_ITEM = 1135
+CONST_DOWNLOADS_SCREEN = b"DownloadsScreen\x00"
+CONST_CAMERA_MENU = b"CameraMenu\x00\x00\x00\x00\x00\x00"
+
 UIX_CONST_ITEM = 1276
 UIX_CONST_OFF = 50416
 UIX_CONST_ITEM_BASE = UIX_CONST_OFF + 0x20
+
+APT_PATCHES: list[tuple[int, list[bytes], bytes]] = [
+    (
+        4852,
+        [
+            b"-Video-\x00$FE_Video\x00\x00\x00\x00\x00\x00",
+            b"-Graphics-\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+            b"Graphics\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+        ],
+        b"Graphics\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00",
+    ),
+    (
+        4948,
+        [DOWNLOADS_LIST, CAMERA_PAD31],
+        CAMERA_PAD31,
+    ),
+    (
+        5912,
+        [DOWNLOADS_LIST, CAMERA_PAD31],
+        CAMERA_PAD31,
+    ),
+]
 
 
 def find_ci(dir_path: Path, name: str) -> Path | None:
@@ -96,10 +114,6 @@ def find_options_uix(raw: bytes) -> int | None:
         idx = j + 4
 
 
-def options_already_patched(apt: bytes) -> bool:
-    return apt[4853:4862] == b"Graphics-"
-
-
 def apply_apt_patches(apt: bytearray) -> list[str]:
     notes: list[str] = []
     if len(apt) < APT_SIZE:
@@ -107,34 +121,40 @@ def apply_apt_patches(apt: bytearray) -> list[str]:
     if not apt.startswith(b"Apt Data:74"):
         raise ValueError("bad Apt magic")
 
-    for off, expect, repl in APT_PATCHES:
-        cur = bytes(apt[off : off + len(expect)])
+    for off, expects, repl in APT_PATCHES:
+        assert all(len(e) == len(repl) for e in expects)
+        cur = bytes(apt[off : off + len(repl)])
         if cur == repl:
             continue
-        if cur != expect:
-            # Already a different local edit — only hard-fail on the Video labels.
-            if expect.startswith(b"Video"):
+        if cur not in expects:
+            if off in (4852, 4948):
                 raise ValueError(
-                    f"unexpected bytes at apt+{off}: got {cur!r}, want {expect!r}"
+                    f"unexpected bytes at apt+{off}: got {cur!r}, want one of {expects!r}"
                 )
             notes.append(f"skip apt+{off} (already customized)")
             continue
         apt[off : off + len(repl)] = repl
         notes.append(f"patched apt+{off}")
-    if options_already_patched(apt):
-        notes.append("Graphics label present")
-
-    # Hide brightness slider + colorref: keep matrices, alpha 0 + HasColorTransform.
-    for po, label in ((PO_SLIDER, "slider"), (PO_REF, "colorref")):
-        flags = struct.unpack_from(">I", apt, po + 4)[0]
-        m00 = struct.unpack_from(">f", apt, po + 16)[0]
-        if abs(m00) < 0.05:
-            raise ValueError(f"{label} placeobject matrix looks broken (m00={m00})")
-        new_flags = flags | 0x08
-        struct.pack_into(">I", apt, po + 4, new_flags)
-        struct.pack_into(">I", apt, po + 40, 0x00FFFFFF)
-        notes.append(f"hid {label} (flags {flags:#x}->{new_flags:#x})")
+    if apt[4852:4860] == b"Graphics" and apt[4948:4954] == b"Camera":
+        notes.append("Graphics + Camera labels present")
     return notes
+
+
+def restore_downloads_screen_name(raw: bytearray, uix: int) -> str:
+    cf = uix + UIX_CONST_OFF
+    item = uix + UIX_CONST_ITEM_BASE + CONST_DOWNLOADS_SCREEN_ITEM * 8
+    t, v = struct.unpack_from(">II", raw, item)
+    if t != 1:
+        raise ValueError(f"const {CONST_DOWNLOADS_SCREEN_ITEM} type {t}, expected string(1)")
+    s_off = cf + v
+    cur = bytes(raw[s_off : s_off + 16])
+    if cur == CONST_DOWNLOADS_SCREEN:
+        return "const 1135 already DownloadsScreen"
+    if cur == CONST_CAMERA_MENU or cur.startswith(b"CameraMenu\x00"):
+        raw[s_off : s_off + 16] = CONST_DOWNLOADS_SCREEN
+        return "const 1135 CameraMenu→DownloadsScreen (fix black screen)"
+    # Leave other customizations alone.
+    return f"skip const 1135 (got {cur!r})"
 
 
 def apply_const_patch(raw: bytearray, uix: int) -> str:
@@ -145,7 +165,7 @@ def apply_const_patch(raw: bytearray, uix: int) -> str:
     if v == 9:
         return "const 1276 already Array"
     if v != 23:
-        raise ValueError(f"const {UIX_CONST_ITEM} lookup {v}, expected Video(23)")
+        return f"skip const 1276 (lookup {v})"
     struct.pack_into(">I", raw, item + 4, 9)
     return "const 1276 Video→Array (keep Graphics row)"
 
@@ -169,6 +189,7 @@ def patch_str_file(path: Path) -> list[str]:
         apt = bytearray(raw[apt_off : apt_off + APT_SIZE])
         notes.extend(f"{path.name}: {n}" for n in apply_apt_patches(apt))
         raw[apt_off : apt_off + APT_SIZE] = apt
+        notes.append(f"{path.name}: {restore_downloads_screen_name(raw, uix)}")
         notes.append(f"{path.name}: {apply_const_patch(raw, uix)}")
         new_blob = compress(bytes(raw))
         chunk["sz"] = len(raw)
@@ -203,14 +224,18 @@ def patch_gamedata(gamedata: Path) -> list[str]:
         find_str(gamedata, "frontend", "frontend.str"),
         find_str(gamedata, "simpsons_chars", "simpsons_chars_global.str"),
     ]
-    missing = [name for name, p in (("frontend.str", targets[0]), ("simpsons_chars_global.str", targets[1])) if p is None]
+    missing = [
+        name
+        for name, p in (("frontend.str", targets[0]), ("simpsons_chars_global.str", targets[1]))
+        if p is None
+    ]
     if missing:
         raise FileNotFoundError("missing " + ", ".join(missing))
     notes: list[str] = []
     for path in targets:
         notes.extend(patch_str_file(path))
     stamp = gamedata / ".tsg_options_ui_patched"
-    stamp.write_text("options-ui-v1\n", encoding="utf-8")
+    stamp.write_text(f"{STAMP_VERSION}\n", encoding="utf-8")
     notes.append(f"stamp {stamp.name}")
     return notes
 
@@ -233,7 +258,7 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    print("OK: Options › GRAPHICS patches applied")
+    print("OK: Options › GRAPHICS / CAMERA patches applied")
     return 0
 
 

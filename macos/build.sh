@@ -384,7 +384,7 @@ cat > "$STAGE/README.md" <<'EOF'
 3. Double-click **Play.command** (preferred) — it clears macOS quarantine so the
    app is not isolated from this folder. Or right-click **TSG Launcher.app** → Open.
 4. Use **Install** to pick your own Xbox 360 ISO (not included) and extract it locally.
-5. The launcher applies Options › GRAPHICS patches to your files (needs python3 once).
+5. The launcher applies Options › GRAPHICS patches to your files (no Python required).
 6. Display defaults to a windowed 1280x720 window at 60 FPS. Change settings in TSG Launcher, then press **Play**.
 
 If you only see a dock icon and no window, macOS App Translocation is the cause:
